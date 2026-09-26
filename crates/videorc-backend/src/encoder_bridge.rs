@@ -1274,7 +1274,7 @@ pub struct EncoderBridgeOutputProfile {
 fn recording_degraded_message(streaming: bool, produced_fps: f64, target_fps: u32) -> String {
     if streaming {
         format!(
-            "Recording quality is degraded while streaming: the recording leg is producing {produced_fps:.0} fps against the selected {target_fps} fps. The stream continues; the saved file will be choppy."
+            "Recording quality is degraded while streaming: the recording leg is producing {produced_fps:.0} fps against the selected {target_fps} fps. The saved file may be choppy. Check each destination for stream health."
         )
     } else {
         format!(
@@ -7234,10 +7234,24 @@ async fn emit_encoder_bridge_diagnostics(
     }
 
     // L4 (plan 023): announce a degraded recording leg mid-session.
-    if matches!(
-        effective_encoder_bridge_output_role(diagnostics_context),
-        EncoderBridgeOutputRole::Recording | EncoderBridgeOutputRole::Shared
-    ) {
+    // Startup and teardown own this mutex while awaiting bridge tasks. Never
+    // wait for it from diagnostics: missing ownership means no active notice.
+    let active_recording = state.recording.try_lock().ok();
+    if active_recording
+        .as_ref()
+        .and_then(|recording| recording.as_ref())
+        .is_some_and(|active| {
+            active.session_id == session_id
+                && !active.stop_requested
+                && !active.pipeline.status().stages.iter().any(|stage| {
+                    stage.state == crate::protocol::RecordingPipelineStageState::Failed
+                })
+        })
+        && matches!(
+            effective_encoder_bridge_output_role(diagnostics_context),
+            EncoderBridgeOutputRole::Recording | EncoderBridgeOutputRole::Shared
+        )
+    {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis())
@@ -7270,6 +7284,8 @@ async fn emit_encoder_bridge_diagnostics(
             );
         }
     }
+
+    drop(active_recording);
 
     let diagnostic_stats = {
         let mut diagnostics = state.diagnostics.lock().await;
@@ -10068,6 +10084,11 @@ mod tests {
     // Plan 023 L4: the recording-degraded watch fires exactly once per session
     // after the low-fps condition holds for the full 5s window.
     #[test]
+    fn recording_degraded_does_not_claim_provider_delivery() {
+        assert!(!super::recording_degraded_message(true, 16.0, 30).contains("stream continues"));
+    }
+
+    #[test]
     fn recording_fps_watch_fires_once_after_sustained_low_fps() {
         use super::{RecordingFpsWatch, recording_fps_watch_update};
         let mut watch = RecordingFpsWatch::default();
@@ -11507,7 +11528,8 @@ mod recording_degraded_message_tests {
         assert!(record_only.contains("4 fps") && record_only.contains("30 fps"));
         assert!(record_only.contains("Output settings"));
         let streaming = recording_degraded_message(true, 8.0, 30);
-        assert!(streaming.contains("The stream continues"));
+        assert!(!streaming.contains("The stream continues"));
+        assert!(streaming.contains("Check each destination for stream health"));
         for message in [record_only, streaming] {
             assert!(
                 !message.contains("  "),

@@ -3158,33 +3158,16 @@ pub fn probe_hardware_encoder(
             Err(error) => failures.push((topology, error)),
         }
     }
-    let mut failures = failures.into_iter();
-    let (_, primary) = failures.next().expect("the topology ladder is never empty");
-    let others: Vec<String> = failures
-        .map(|(topology, error)| {
-            format!(
-                "{} input also failed: {}",
-                topology.label(),
-                probe_failure_without_encoder(&format!("{error:#}"))
-            )
-        })
-        .collect();
-    if others.is_empty() {
-        Err(primary)
-    } else {
-        // Keep the first topology's stage/HRESULT text first: fallback-reason
-        // parsing and support bundles read it.
-        Err(anyhow!("{primary:#} ({})", others.join("; ")))
-    }
-}
-
-/// A later topology's failure repeats the encoder name and profile the first
-/// one already printed. The session keeps 480 bytes of the combined reason,
-/// so only the stage and HRESULT of the later ones are kept.
-fn probe_failure_without_encoder(text: &str) -> &str {
-    text.split_once(" encoder=")
-        .map_or(text, |(stage, _)| stage)
-        .trim_end()
+    let attempts = failures
+        .into_iter()
+        .map(|(topology, error)| (topology, format!("{error:#}")))
+        .collect::<Vec<_>>();
+    Err(anyhow!(
+        crate::windows_d3d11_encoder_contract::compact_media_foundation_probe_failures(
+            (config.width, config.height, config.fps, config.bitrate_kbps),
+            &attempts
+        )
+    ))
 }
 
 fn probe_hardware_encoder_bitrates(
@@ -3675,7 +3658,7 @@ fn mf_hresult_annotation(hresult: windows::core::HRESULT) -> Option<&'static str
         )
     } else if hresult.0 as u32 == 0x8000FFFF {
         Some(
-            "unexpected encoder failure (E_UNEXPECTED; the hardware encoder rejected this resolution / bitrate profile, most often seen with Intel Quick Sync via WMF; a smaller output size or lower bitrate may be accepted)",
+            "unexpected encoder failure (E_UNEXPECTED; the driver did not report a specific cause)",
         )
     } else {
         None
@@ -3761,20 +3744,6 @@ mod tests {
         assert_ne!(
             CPU_UPLOAD_DEVICE_FLAGS.0 & D3D11_CREATE_DEVICE_BGRA_SUPPORT.0,
             0
-        );
-    }
-
-    #[test]
-    fn a_later_topology_failure_keeps_only_its_stage_and_hresult() {
-        // The 2026-09-26 Iris Xe text, as the system-memory rung would print it.
-        let text = "Media Foundation probe stage=process-output HRESULT=0x8000FFFF (E_UNEXPECTED) encoder=\"Intel® Quick Sync Video H.264 Encoder MFT\" input=NV12 profile=1920x1080@30 5000kbps";
-        assert_eq!(
-            probe_failure_without_encoder(text),
-            "Media Foundation probe stage=process-output HRESULT=0x8000FFFF (E_UNEXPECTED)"
-        );
-        assert_eq!(
-            probe_failure_without_encoder("no hardware encoder"),
-            "no hardware encoder"
         );
     }
 

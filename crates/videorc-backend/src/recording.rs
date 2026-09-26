@@ -250,7 +250,7 @@ fn published_output_startup_failure(
             ffmpeg_output_startup_result.err().map(|error| {
                 (
                     PublishedSessionStartFailureOrigin::FfmpegOutputStartup,
-                    error.context("FFmpeg output startup failed"),
+                    anyhow::anyhow!("FFmpeg output startup failed: {error:#}"),
                 )
             })
         })
@@ -278,6 +278,33 @@ struct PublishedSessionStartTerminal {
 }
 
 impl PublishedSessionStartTerminal {
+    async fn persist_failed_diagnostics(&self) {
+        let reason = sanitized_ffmpeg_diagnostic_line(&self.message, 480);
+        let _ = emit_session_log(
+            &self.state,
+            &self.session_id,
+            HealthLevel::Error,
+            "session-start-failed",
+            &format!("stage={:?} reason={reason}", self.failed_stage),
+            None,
+        );
+        let mut diagnostics = self.state.diagnostics.lock().await.clone();
+        if diagnostics.session_id.as_deref() != Some(&self.session_id) {
+            diagnostics = starting_diagnostics(&self.session_id, 0, "startup-failed");
+        }
+        if let Err(error) = persist_terminal_session_or_recovery(
+            &self.state,
+            &self.session_id,
+            "failed",
+            &Utc::now().to_rfc3339(),
+            None,
+            None,
+            &diagnostics,
+        ) {
+            self.state.emit_log("error", &error);
+        }
+    }
+
     fn set_failure(&mut self, origin: PublishedSessionStartFailureOrigin, message: &str) {
         self.failed_stage = origin.pipeline_stage();
         self.message = message.to_string();
@@ -590,6 +617,9 @@ struct UncommittedCaptureProcess {
     startup_resources: Option<CaptureStartupResources>,
     rejected_start_cleanup: Option<PostSpawnRejectedStartCleanup>,
     rejected_start_terminal: Option<PublishedSessionStartTerminal>,
+    stderr_monitor: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(test)]
+    cleanup_completed: Option<oneshot::Sender<()>>,
 }
 
 impl UncommittedCaptureProcess {
@@ -599,6 +629,9 @@ impl UncommittedCaptureProcess {
             startup_resources: Some(startup_resources),
             rejected_start_cleanup: None,
             rejected_start_terminal: None,
+            stderr_monitor: None,
+            #[cfg(test)]
+            cleanup_completed: None,
         }
     }
 
@@ -651,6 +684,10 @@ impl UncommittedCaptureProcess {
         // closed every read handle. This is especially important on Windows,
         // where deleting a named-pipe registration before reap can let a new
         // session collide with the retiring process.
+        drain_ffmpeg_stderr_monitor(self.stderr_monitor.take(), FFMPEG_STDERR_DRAIN_TIMEOUT).await;
+        if let Some(terminal) = self.rejected_start_terminal.as_ref() {
+            terminal.persist_failed_diagnostics().await;
+        }
         drop(self.startup_resources.take());
         if let Some(cleanup) = self.rejected_start_cleanup.take() {
             cleanup.run().await;
@@ -658,7 +695,13 @@ impl UncommittedCaptureProcess {
         self.publish_rejected_start_terminal();
     }
 
-    fn commit(mut self) -> (tokio::process::Child, SessionStartAdmission) {
+    fn commit(
+        mut self,
+    ) -> (
+        tokio::process::Child,
+        SessionStartAdmission,
+        Option<tokio::task::JoinHandle<()>>,
+    ) {
         self.startup_resources
             .as_mut()
             .expect("uncommitted capture process owns startup resources")
@@ -674,7 +717,7 @@ impl UncommittedCaptureProcess {
             .child
             .take()
             .expect("uncommitted capture process must own its child");
-        (child, session_start_admission)
+        (child, session_start_admission, self.stderr_monitor.take())
     }
 }
 
@@ -691,7 +734,14 @@ impl Drop for UncommittedCaptureProcess {
         let startup_resources = self.startup_resources.take();
         let cleanup = self.rejected_start_cleanup.take();
         let terminal = self.rejected_start_terminal.take();
-        if child.is_none() && startup_resources.is_none() && cleanup.is_none() && terminal.is_none()
+        let stderr_monitor = self.stderr_monitor.take();
+        #[cfg(test)]
+        let cleanup_completed = self.cleanup_completed.take();
+        if child.is_none()
+            && startup_resources.is_none()
+            && cleanup.is_none()
+            && terminal.is_none()
+            && stderr_monitor.is_none()
         {
             return;
         }
@@ -700,12 +750,20 @@ impl Drop for UncommittedCaptureProcess {
                 if let Some(mut child) = child {
                     let _ = child.wait().await;
                 }
+                drain_ffmpeg_stderr_monitor(stderr_monitor, FFMPEG_STDERR_DRAIN_TIMEOUT).await;
+                if let Some(terminal) = terminal.as_ref() {
+                    terminal.persist_failed_diagnostics().await;
+                }
                 drop(startup_resources);
                 if let Some(cleanup) = cleanup {
                     cleanup.run().await;
                 }
                 if let Some(terminal) = terminal {
                     terminal.publish();
+                }
+                #[cfg(test)]
+                if let Some(completed) = cleanup_completed {
+                    let _ = completed.send(());
                 }
             });
         } else if let Some(mut child) = child {
@@ -894,9 +952,33 @@ pub(crate) struct FfmpegProgressBeacon {
     /// Set when Videorc itself sent TERM/KILL. The process monitor reads it so
     /// our own forced stop is never reported as an encoder or FFmpeg crash.
     stop_escalated: Arc<AtomicBool>,
+    first_fatal: Arc<StdMutex<Option<&'static str>>>,
+    evidence: Arc<StdMutex<FfmpegEvidenceSnapshot>>,
 }
 
 impl FfmpegProgressBeacon {
+    fn observe_fatal(&self, line: &str) {
+        // A tee/fifo destination can fail its header while other legs remain
+        // healthy. Only FFmpeg's process-wide terminal marker invalidates an
+        // already acknowledged start; individual failures remain target state.
+        if line.trim() == "Conversion failed!" {
+            let category = "conversion-failed";
+            self.first_fatal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get_or_insert(category);
+        }
+    }
+
+    fn startup_failure(&self) -> Option<anyhow::Error> {
+        self.first_fatal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|category| {
+                anyhow::anyhow!("FFmpeg reported a fatal {category} error during startup")
+            })
+    }
+
     fn observe_media_seconds(&self, seconds: f64) {
         if !seconds.is_finite() || seconds <= 0.0 {
             return;
@@ -921,6 +1003,22 @@ impl FfmpegProgressBeacon {
 const FFMPEG_STDERR_TAIL_LINES: usize = 5;
 const FFMPEG_STDERR_TAIL_LINE_CHARS: usize = 240;
 
+fn sanitized_ffmpeg_diagnostic_line(line: &str, max_chars: usize) -> String {
+    line.split_whitespace()
+        .map(|token| {
+            if token.contains("://") {
+                "<url>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 /// Last few non-progress FFmpeg stderr lines plus the first fatal category.
 /// The in-memory log ring dies with the process, and testers restart before
 /// exporting a bundle; this tail is written to the PERSISTED session log at
@@ -939,21 +1037,7 @@ impl FfmpegStderrTail {
         // FFmpeg quotes output URLs in its errors and an RTMP URL carries the
         // stream key. Bundle redaction only matches whole-string URLs, so the
         // persisted tail never keeps a URL token at all.
-        let scrubbed = line
-            .split_whitespace()
-            .map(|token| {
-                if token.contains("://") {
-                    "<url>"
-                } else {
-                    token
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let bounded: String = scrubbed
-            .chars()
-            .take(FFMPEG_STDERR_TAIL_LINE_CHARS)
-            .collect();
+        let bounded = sanitized_ffmpeg_diagnostic_line(line, FFMPEG_STDERR_TAIL_LINE_CHARS);
         if self.lines.len() == FFMPEG_STDERR_TAIL_LINES {
             self.lines.pop_front();
         }
@@ -975,6 +1059,81 @@ impl FfmpegStderrTail {
             "category={} tail={lines}",
             self.first_fatal_category.unwrap_or("none")
         ))
+    }
+}
+
+#[derive(Debug, Default)]
+struct FfmpegEvidenceSnapshot {
+    tail: FfmpegStderrTail,
+    last_media_seconds: Option<f64>,
+    output_ready: bool,
+}
+
+impl FfmpegEvidenceSnapshot {
+    fn observe(&mut self, line: &str) {
+        if let Some(seconds) = parse_ffmpeg_progress_media_seconds(line) {
+            self.last_media_seconds = Some(seconds);
+        }
+        self.output_ready |= ffmpeg_output_startup_media_seconds(line).is_some();
+        if !is_ffmpeg_progress_noise(line) {
+            self.tail.observe(line);
+        }
+    }
+}
+
+// One persistence owner, transferred with the monitor. The relay updates its
+// bounded snapshot before queueing each line, so a stalled consumer cannot
+// lose the first fatal category or last clock even when the queue is full.
+struct SessionFfmpegEvidence {
+    state: AppState,
+    session_id: String,
+    snapshot: Arc<StdMutex<FfmpegEvidenceSnapshot>>,
+}
+
+impl SessionFfmpegEvidence {
+    fn new(state: AppState, session_id: &str, progress: &FfmpegProgressBeacon) -> Self {
+        Self {
+            state,
+            session_id: session_id.to_string(),
+            snapshot: progress.evidence.clone(),
+        }
+    }
+}
+
+impl Drop for SessionFfmpegEvidence {
+    fn drop(&mut self) {
+        let evidence = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = emit_session_log(
+            &self.state,
+            &self.session_id,
+            HealthLevel::Info,
+            "ffmpeg-startup-evidence",
+            &format!(
+                "outputReady={} lastMediaSeconds={} audioPcm=unknown",
+                evidence.output_ready,
+                evidence
+                    .last_media_seconds
+                    .map_or_else(|| "unknown".to_string(), |seconds| format!("{seconds:.6}"))
+            ),
+            None,
+        );
+        if let Some(summary) = evidence.tail.summary() {
+            let _ = emit_session_log(
+                &self.state,
+                &self.session_id,
+                if evidence.tail.first_fatal_category.is_some() {
+                    HealthLevel::Error
+                } else {
+                    HealthLevel::Info
+                },
+                "ffmpeg-stderr-tail",
+                &summary,
+                None,
+            );
+        }
     }
 }
 
@@ -1015,7 +1174,8 @@ enum FfmpegStderrEvent {
 fn spawn_ffmpeg_stderr_reader(
     stderr: Option<ChildStderr>,
     mut startup_ready: Option<oneshot::Sender<std::result::Result<(), String>>>,
-) -> Option<mpsc::UnboundedReceiver<FfmpegStderrEvent>> {
+    progress: FfmpegProgressBeacon,
+) -> Option<mpsc::Receiver<FfmpegStderrEvent>> {
     let Some(stderr) = stderr else {
         if let Some(sender) = startup_ready.take() {
             let _ = sender.send(Err(
@@ -1025,25 +1185,58 @@ fn spawn_ffmpeg_stderr_reader(
         }
         return None;
     };
-    let (sender, receiver) = mpsc::unbounded_channel();
+    let (sender, receiver) = mpsc::channel(256);
     tokio::spawn(relay_ffmpeg_stderr(
-        BufReader::new(stderr).lines(),
+        BufReader::new(stderr),
         sender,
         startup_ready,
+        progress,
     ));
     Some(receiver)
 }
 
+// Bound bytes as well as event count. Oversize driver output is drained up to
+// its newline without allocation, so it cannot back up the child's stderr.
+async fn read_bounded_ffmpeg_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<String>> {
+    const MAX_BYTES: usize = 8192;
+    let mut line = Vec::new();
+    let mut seen = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(seen.then(|| String::from_utf8_lossy(&line).into_owned()));
+        }
+        seen = true;
+        let end = available.iter().position(|byte| *byte == b'\n');
+        let count = end.unwrap_or(available.len());
+        let keep = count.min(MAX_BYTES.saturating_sub(line.len()));
+        line.extend_from_slice(&available[..keep]);
+        reader.consume(count + usize::from(end.is_some()));
+        if end.is_some() {
+            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        }
+    }
+}
+
 async fn relay_ffmpeg_stderr<R>(
-    mut lines: tokio::io::Lines<R>,
-    sender: mpsc::UnboundedSender<FfmpegStderrEvent>,
+    mut reader: R,
+    sender: mpsc::Sender<FfmpegStderrEvent>,
     mut startup_ready: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    progress: FfmpegProgressBeacon,
 ) where
     R: AsyncBufRead + Unpin,
 {
     loop {
-        match lines.next_line().await {
+        match read_bounded_ffmpeg_line(&mut reader).await {
             Ok(Some(line)) => {
+                progress
+                    .evidence
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .observe(&line);
+                progress.observe_fatal(&line);
                 if let Some(category) = classify_ffmpeg_fatal_line(&line)
                     && let Some(ready) = startup_ready.take()
                 {
@@ -1055,7 +1248,7 @@ async fn relay_ffmpeg_stderr<R>(
                 {
                     let _ = ready.send(Ok(()));
                 }
-                if sender.send(FfmpegStderrEvent::Line(line)).is_err() {
+                if sender.send(FfmpegStderrEvent::Line(line)).await.is_err() {
                     break;
                 }
             }
@@ -1065,7 +1258,7 @@ async fn relay_ffmpeg_stderr<R>(
                         "FFmpeg stopped before confirming its first output media clock".to_string(),
                     ));
                 }
-                let _ = sender.send(FfmpegStderrEvent::Eof);
+                let _ = sender.send(FfmpegStderrEvent::Eof).await;
                 break;
             }
             Err(_) => {
@@ -1074,7 +1267,7 @@ async fn relay_ffmpeg_stderr<R>(
                         "FFmpeg diagnostics failed before output startup was confirmed".to_string(),
                     ));
                 }
-                let _ = sender.send(FfmpegStderrEvent::ReadFailed);
+                let _ = sender.send(FfmpegStderrEvent::ReadFailed).await;
                 break;
             }
         }
@@ -4308,6 +4501,7 @@ async fn start_session_with_timeline(
                                 output_path.clone(),
                             )
                             .with_rejected_start_terminal(published_session_start.take_terminal());
+                    session_row_guard.disarm();
                     uncommitted_capture_process
                         .terminate_and_reap_before_fifo_writer_join()
                         .await;
@@ -4364,6 +4558,7 @@ async fn start_session_with_timeline(
     let mut uncommitted_capture_process = UncommittedCaptureProcess::new(child, startup_resources)
         .with_rejected_start_cleanup(state.clone(), &session_id, output_path.clone())
         .with_rejected_start_terminal(published_session_start.take_terminal());
+    session_row_guard.disarm();
     let ffmpeg_output_startup_started_at = Instant::now();
     let (ffmpeg_output_startup_sender, mut ffmpeg_output_startup_receiver) = if use_encoder_bridge {
         let (sender, receiver) = oneshot::channel();
@@ -4371,8 +4566,237 @@ async fn start_session_with_timeline(
     } else {
         (None, None)
     };
-    let mut ffmpeg_stderr_events = spawn_ffmpeg_stderr_reader(stderr, ffmpeg_output_startup_sender);
     let ffmpeg_progress = FfmpegProgressBeacon::default();
+    let mut ffmpeg_stderr_events = spawn_ffmpeg_stderr_reader(
+        stderr,
+        ffmpeg_output_startup_sender,
+        ffmpeg_progress.clone(),
+    );
+    let stream_tee_has_recording_leg =
+        output_path.is_some() && !(use_encoder_bridge && encoder_bridge_stream_profile.is_some());
+    let (stream_runtime, slave_positions, stream_url_positions) = build_stream_runtime(
+        &stream_targets,
+        &skipped_targets,
+        stream_tee_has_recording_leg,
+    );
+    let stream_targets_snapshot = Arc::new(StdMutex::new(StreamTargetsSnapshot {
+        session_id: session_id.clone(),
+        targets: stream_runtime,
+    }));
+    let ffmpeg_stderr_monitor = if let Some(mut stderr_events) = ffmpeg_stderr_events.take() {
+        let log_state = state.clone();
+        let log_session_id = session_id.clone();
+        let target_fps = params.output.video.fps;
+        let stream_targets_snapshot = stream_targets_snapshot.clone();
+        let ffmpeg_audio_reply_sender = ffmpeg_audio_reply_sender;
+        let ffmpeg_live_audio_session = ffmpeg_live_audio_stderr_session;
+        let progress_beacon = ffmpeg_progress.clone();
+        let evidence_owner =
+            SessionFfmpegEvidence::new(log_state.clone(), &log_session_id, &progress_beacon);
+        Some(tokio::spawn(async move {
+            let _evidence = evidence_owner;
+            let mut capture_media_clock_logged = false;
+            let mut first_fatal_ffmpeg_line_logged = false;
+            // This monitor owns exactly one FFmpeg process generation. A replacement
+            // process creates a fresh monitor/accumulator, while the explicit generation
+            // remains testable so future in-place restarts cannot inherit counters.
+            let process_generation = 0_u64;
+            let mut stream_health_accumulator =
+                StreamHealthAccumulator::new(&log_session_id, process_generation);
+            let mut pending_stream_health = ParsedStreamHealthDelta::default();
+            let mut last_stream_health_published_at = Instant::now();
+            let stderr_reached_eof = loop {
+                let line = match stderr_events.recv().await {
+                    Some(FfmpegStderrEvent::Line(line)) => line,
+                    Some(FfmpegStderrEvent::Eof) | None => break true,
+                    Some(FfmpegStderrEvent::ReadFailed) => {
+                        let _ = emit_session_log(
+                            &log_state,
+                            &log_session_id,
+                            HealthLevel::Warn,
+                            "ffmpeg-stderr-read-failed",
+                            "diagnosticStream=stderr terminalState=process-monitor-pending",
+                            None,
+                        );
+                        break false;
+                    }
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                if let Some(seconds) = parse_ffmpeg_progress_media_seconds(trimmed) {
+                    progress_beacon.observe_media_seconds(seconds);
+                }
+
+                if !capture_media_clock_logged
+                    && let Some(seconds) = ffmpeg_output_startup_media_seconds(trimmed)
+                {
+                    capture_media_clock_logged = true;
+                    let _ = emit_session_log(
+                        &log_state,
+                        &log_session_id,
+                        HealthLevel::Info,
+                        "capture-media-clock-ready",
+                        &format!("mediaSeconds={seconds:.3}"),
+                        None,
+                    );
+                }
+
+                if !first_fatal_ffmpeg_line_logged
+                    && let Some(category) = classify_ffmpeg_fatal_line(trimmed)
+                {
+                    first_fatal_ffmpeg_line_logged = true;
+                    let _ = emit_session_log(
+                        &log_state,
+                        &log_session_id,
+                        HealthLevel::Error,
+                        "ffmpeg-first-fatal-line",
+                        &format!("category={category}"),
+                        None,
+                    );
+                }
+
+                if is_ffmpeg_live_audio_command_ready_evidence(trimmed)
+                    && let Some(session) = ffmpeg_live_audio_session.as_ref()
+                    && session.mark_command_ready()
+                {
+                    let _ = emit_session_log(
+                        &log_state,
+                        &log_session_id,
+                        HealthLevel::Info,
+                        "live-audio-command-ready",
+                        &format!("expectedReplies={}", session.expected_replies()),
+                        None,
+                    );
+                }
+
+                if let Some(reply) = parse_ffmpeg_filter_command_reply(trimmed) {
+                    if let Some(sender) = ffmpeg_audio_reply_sender.as_ref() {
+                        let _ = sender.send(reply);
+                    }
+                    if reply.return_code == 0 {
+                        tracing::debug!("{trimmed}");
+                    } else {
+                        log_state.emit_log("warn", trimmed);
+                    }
+                    continue;
+                }
+                if is_ffmpeg_filter_command_prompt(trimmed) {
+                    tracing::debug!("{trimmed}");
+                    continue;
+                }
+
+                // Progress/stat spam must not reach the bounded log ring —
+                // it evicted every useful entry within ~60s during the
+                // 2026-07-08 X incident. Stats still feed stream health.
+                if is_ffmpeg_progress_noise(trimmed) {
+                    tracing::debug!("{trimmed}");
+                } else {
+                    log_state.emit_log("warn", trimmed);
+                }
+                if let Some(delta) = parse_ffmpeg_stream_health(trimmed) {
+                    pending_stream_health.merge(delta);
+                }
+                let progress_report_ended = is_ffmpeg_progress_report_boundary(trimmed);
+                let publish_stream_health = progress_report_ended
+                    && (trimmed == "progress=end"
+                        || last_stream_health_published_at.elapsed()
+                            >= FFMPEG_DIAGNOSTICS_PUBLISH_PERIOD);
+                if publish_stream_health
+                    && publish_pending_ffmpeg_stream_health(
+                        &log_state,
+                        &log_session_id,
+                        process_generation,
+                        target_fps,
+                        &mut stream_health_accumulator,
+                        &mut pending_stream_health,
+                    )
+                    .await
+                {
+                    last_stream_health_published_at = Instant::now();
+                }
+                if looks_like_ffmpeg_health_event(trimmed) {
+                    publish_ffmpeg_health_event_if_active(&log_state, &log_session_id, trimmed)
+                        .await;
+                }
+                // A `tee` slave dropping mid-session (onfail=ignore keeps the rest
+                // running) — attribute it to the specific target and re-emit the
+                // per-target snapshot so the UI can flag exactly which platform fell.
+                // Per-target fifo-muxer legs (plan 023): attribute by URL.
+                if let Some(failure) = parse_fifo_output_failure(trimmed)
+                    && let Some(position) = stream_url_positions
+                        .iter()
+                        .find(|(url, _)| *url == failure.url)
+                        .map(|(_, position)| *position)
+                {
+                    let reason = if failure.reason.is_empty() {
+                        "Stream connection failed".to_string()
+                    } else {
+                        failure.reason.clone()
+                    };
+                    publish_stream_target_failure_if_active(
+                        &log_state,
+                        &log_session_id,
+                        &stream_targets_snapshot,
+                        position,
+                        reason,
+                    )
+                    .await;
+                }
+                if let Some(failure) = parse_tee_slave_failure(trimmed)
+                    && let Some(Some(position)) = slave_positions.get(failure.slave_index).copied()
+                {
+                    let reason = if failure.reason.is_empty() {
+                        "Stream connection failed".to_string()
+                    } else {
+                        failure.reason.clone()
+                    };
+                    publish_stream_target_failure_if_active(
+                        &log_state,
+                        &log_session_id,
+                        &stream_targets_snapshot,
+                        position,
+                        reason,
+                    )
+                    .await;
+                }
+            };
+            // A short capture or abrupt stderr end may not include a final
+            // `progress=end` boundary. Publish the last finite sample instead
+            // of silently losing it when the diagnostics cadence is throttled.
+            let _ = publish_pending_ffmpeg_stream_health(
+                &log_state,
+                &log_session_id,
+                process_generation,
+                target_fps,
+                &mut stream_health_accumulator,
+                &mut pending_stream_health,
+            )
+            .await;
+            if stderr_reached_eof
+                && let Some(session) = ffmpeg_live_audio_session.as_ref()
+                && session.mark_terminal()
+            {
+                let _ = emit_session_log(
+                    &log_state,
+                    &log_session_id,
+                    HealthLevel::Info,
+                    "live-audio-command-terminal",
+                    "terminalSource=stderr-eof",
+                    None,
+                );
+            }
+        }))
+    } else if let Some(session) = ffmpeg_live_audio_stderr_session.as_ref() {
+        session.mark_terminal();
+        None
+    } else {
+        None
+    };
+
+    uncommitted_capture_process.stderr_monitor = ffmpeg_stderr_monitor;
     #[cfg(target_os = "windows")]
     let windows_d3d11_primary_input = windows_d3d11_media
         .as_ref()
@@ -4573,7 +4997,8 @@ async fn start_session_with_timeline(
         });
     let startup_failure = published_output_startup_failure(
         encoder_bridge_terminal_failure,
-        ffmpeg_output_startup_result,
+        ffmpeg_output_startup_result
+            .and_then(|()| ffmpeg_progress.startup_failure().map_or(Ok(()), Err)),
     );
     if let Some((origin, error)) = startup_failure {
         let message = format!("{error:#}");
@@ -4635,17 +5060,6 @@ async fn start_session_with_timeline(
     let gate_expect_audio = !audio_tracks.is_empty();
     let gate_intended_fps = (params.output.video.fps > 0).then_some(params.output.video.fps as f64);
     let (stop_intent_sender, stop_intent_receiver) = oneshot::channel();
-    let stream_tee_has_recording_leg =
-        output_path.is_some() && !(use_encoder_bridge && encoder_bridge_stream_profile.is_some());
-    let (stream_runtime, slave_positions, stream_url_positions) = build_stream_runtime(
-        &stream_targets,
-        &skipped_targets,
-        stream_tee_has_recording_leg,
-    );
-    let stream_targets_snapshot = Arc::new(StdMutex::new(StreamTargetsSnapshot {
-        session_id: session_id.clone(),
-        targets: stream_runtime,
-    }));
     #[cfg(target_os = "windows")]
     let windows_d3d11_monitor = windows_d3d11_media.as_ref().map(|pump| {
         WindowsD3d11SessionMonitorTask::spawn(
@@ -4819,7 +5233,18 @@ async fn start_session_with_timeline(
             .snapshot(&session_id)
             .expect("new session source snapshot")
     };
-    let (child, session_start_admission) = uncommitted_capture_process.commit();
+    if let Some(error) = ffmpeg_progress.startup_failure() {
+        uncommitted_capture_process.set_failure(
+            PublishedSessionStartFailureOrigin::FfmpegOutputStartup,
+            &format!("{error:#}"),
+        );
+        uncommitted_capture_process
+            .terminate_and_reap_before_fifo_writer_join()
+            .await;
+        return Err(error);
+    }
+    let (child, session_start_admission, ffmpeg_stderr_monitor) =
+        uncommitted_capture_process.commit();
     let watchdog_pid = pending_active.pid;
     *recording = Some(pending_active);
     session_start_admission.commit();
@@ -4929,233 +5354,6 @@ async fn start_session_with_timeline(
     if !initial_stream_targets_snapshot.targets.is_empty() {
         state.emit_event("stream.targets", initial_stream_targets_snapshot);
     }
-
-    let ffmpeg_stderr_monitor = if let Some(mut stderr_events) = ffmpeg_stderr_events.take() {
-        let log_state = state.clone();
-        let log_session_id = session_id.clone();
-        let target_fps = params.output.video.fps;
-        let ffmpeg_audio_reply_sender = ffmpeg_audio_reply_sender;
-        let ffmpeg_live_audio_session = ffmpeg_live_audio_stderr_session;
-        let progress_beacon = ffmpeg_progress.clone();
-        Some(tokio::spawn(async move {
-            let mut capture_media_clock_logged = false;
-            let mut first_fatal_ffmpeg_line_logged = false;
-            let mut stderr_tail = FfmpegStderrTail::default();
-            // This monitor owns exactly one FFmpeg process generation. A replacement
-            // process creates a fresh monitor/accumulator, while the explicit generation
-            // remains testable so future in-place restarts cannot inherit counters.
-            let process_generation = 0_u64;
-            let mut stream_health_accumulator =
-                StreamHealthAccumulator::new(&log_session_id, process_generation);
-            let mut pending_stream_health = ParsedStreamHealthDelta::default();
-            let mut last_stream_health_published_at = Instant::now();
-            let stderr_reached_eof = loop {
-                let line = match stderr_events.recv().await {
-                    Some(FfmpegStderrEvent::Line(line)) => line,
-                    Some(FfmpegStderrEvent::Eof) | None => break true,
-                    Some(FfmpegStderrEvent::ReadFailed) => {
-                        let _ = emit_session_log(
-                            &log_state,
-                            &log_session_id,
-                            HealthLevel::Warn,
-                            "ffmpeg-stderr-read-failed",
-                            "diagnosticStream=stderr terminalState=process-monitor-pending",
-                            None,
-                        );
-                        break false;
-                    }
-                };
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                if let Some(seconds) = parse_ffmpeg_progress_media_seconds(trimmed) {
-                    progress_beacon.observe_media_seconds(seconds);
-                }
-
-                if !capture_media_clock_logged
-                    && let Some(seconds) = ffmpeg_output_startup_media_seconds(trimmed)
-                {
-                    capture_media_clock_logged = true;
-                    let _ = emit_session_log(
-                        &log_state,
-                        &log_session_id,
-                        HealthLevel::Info,
-                        "capture-media-clock-ready",
-                        &format!("mediaSeconds={seconds:.3}"),
-                        None,
-                    );
-                }
-
-                if !first_fatal_ffmpeg_line_logged
-                    && let Some(category) = classify_ffmpeg_fatal_line(trimmed)
-                {
-                    first_fatal_ffmpeg_line_logged = true;
-                    let _ = emit_session_log(
-                        &log_state,
-                        &log_session_id,
-                        HealthLevel::Error,
-                        "ffmpeg-first-fatal-line",
-                        &format!("category={category}"),
-                        None,
-                    );
-                }
-
-                if is_ffmpeg_live_audio_command_ready_evidence(trimmed)
-                    && let Some(session) = ffmpeg_live_audio_session.as_ref()
-                    && session.mark_command_ready()
-                {
-                    let _ = emit_session_log(
-                        &log_state,
-                        &log_session_id,
-                        HealthLevel::Info,
-                        "live-audio-command-ready",
-                        &format!("expectedReplies={}", session.expected_replies()),
-                        None,
-                    );
-                }
-
-                if let Some(reply) = parse_ffmpeg_filter_command_reply(trimmed) {
-                    if let Some(sender) = ffmpeg_audio_reply_sender.as_ref() {
-                        let _ = sender.send(reply);
-                    }
-                    if reply.return_code == 0 {
-                        tracing::debug!("{trimmed}");
-                    } else {
-                        log_state.emit_log("warn", trimmed);
-                    }
-                    continue;
-                }
-                if is_ffmpeg_filter_command_prompt(trimmed) {
-                    tracing::debug!("{trimmed}");
-                    continue;
-                }
-
-                // Progress/stat spam must not reach the bounded log ring —
-                // it evicted every useful entry within ~60s during the
-                // 2026-07-08 X incident. Stats still feed stream health.
-                if is_ffmpeg_progress_noise(trimmed) {
-                    tracing::debug!("{trimmed}");
-                } else {
-                    stderr_tail.observe(trimmed);
-                    log_state.emit_log("warn", trimmed);
-                }
-                if let Some(delta) = parse_ffmpeg_stream_health(trimmed) {
-                    pending_stream_health.merge(delta);
-                }
-                let progress_report_ended = is_ffmpeg_progress_report_boundary(trimmed);
-                let publish_stream_health = progress_report_ended
-                    && (trimmed == "progress=end"
-                        || last_stream_health_published_at.elapsed()
-                            >= FFMPEG_DIAGNOSTICS_PUBLISH_PERIOD);
-                if publish_stream_health
-                    && publish_pending_ffmpeg_stream_health(
-                        &log_state,
-                        &log_session_id,
-                        process_generation,
-                        target_fps,
-                        &mut stream_health_accumulator,
-                        &mut pending_stream_health,
-                    )
-                    .await
-                {
-                    last_stream_health_published_at = Instant::now();
-                }
-                if looks_like_ffmpeg_health_event(trimmed) {
-                    publish_ffmpeg_health_event_if_active(&log_state, &log_session_id, trimmed)
-                        .await;
-                }
-                // A `tee` slave dropping mid-session (onfail=ignore keeps the rest
-                // running) — attribute it to the specific target and re-emit the
-                // per-target snapshot so the UI can flag exactly which platform fell.
-                // Per-target fifo-muxer legs (plan 023): attribute by URL.
-                if let Some(failure) = parse_fifo_output_failure(trimmed)
-                    && let Some(position) = stream_url_positions
-                        .iter()
-                        .find(|(url, _)| *url == failure.url)
-                        .map(|(_, position)| *position)
-                {
-                    let reason = if failure.reason.is_empty() {
-                        "Stream connection failed".to_string()
-                    } else {
-                        failure.reason.clone()
-                    };
-                    publish_stream_target_failure_if_active(
-                        &log_state,
-                        &log_session_id,
-                        &stream_targets_snapshot,
-                        position,
-                        reason,
-                    )
-                    .await;
-                }
-                if let Some(failure) = parse_tee_slave_failure(trimmed)
-                    && let Some(Some(position)) = slave_positions.get(failure.slave_index).copied()
-                {
-                    let reason = if failure.reason.is_empty() {
-                        "Stream connection failed".to_string()
-                    } else {
-                        failure.reason.clone()
-                    };
-                    publish_stream_target_failure_if_active(
-                        &log_state,
-                        &log_session_id,
-                        &stream_targets_snapshot,
-                        position,
-                        reason,
-                    )
-                    .await;
-                }
-            };
-            // A short capture or abrupt stderr end may not include a final
-            // `progress=end` boundary. Publish the last finite sample instead
-            // of silently losing it when the diagnostics cadence is throttled.
-            let _ = publish_pending_ffmpeg_stream_health(
-                &log_state,
-                &log_session_id,
-                process_generation,
-                target_fps,
-                &mut stream_health_accumulator,
-                &mut pending_stream_health,
-            )
-            .await;
-            // URL tokens are already scrubbed by the tail; paths and device
-            // ids are redacted at support-bundle export like every session log.
-            if let Some(summary) = stderr_tail.summary() {
-                let _ = emit_session_log(
-                    &log_state,
-                    &log_session_id,
-                    if stderr_tail.first_fatal_category.is_some() {
-                        HealthLevel::Error
-                    } else {
-                        HealthLevel::Info
-                    },
-                    "ffmpeg-stderr-tail",
-                    &summary,
-                    None,
-                );
-            }
-            if stderr_reached_eof
-                && let Some(session) = ffmpeg_live_audio_session.as_ref()
-                && session.mark_terminal()
-            {
-                let _ = emit_session_log(
-                    &log_state,
-                    &log_session_id,
-                    HealthLevel::Info,
-                    "live-audio-command-terminal",
-                    "terminalSource=stderr-eof",
-                    None,
-                );
-            }
-        }))
-    } else if let Some(session) = ffmpeg_live_audio_stderr_session.as_ref() {
-        session.mark_terminal();
-        None
-    } else {
-        None
-    };
 
     // Transfer the child, diagnostic reader, and database row to the
     // production monitor in one cancellation-free publication edge. The
@@ -19324,17 +19522,20 @@ async fn publish_stream_target_failure_if_active(
     position: usize,
     reason: String,
 ) {
-    // Hold session ownership across mutation + synchronous broadcasts. A
-    // timed-out, aborted stderr consumer can never publish its old target
-    // generation after the process monitor admits a replacement session.
-    let recording = state.recording.lock().await;
+    // Keep evidence in this process's private snapshot even before commit.
+    // Only the exact active owner may broadcast it: a retired consumer cannot
+    // publish its old target generation into a replacement session.
+    let failed_target = mark_stream_target_failed(targets, position, reason.clone());
+    let Ok(recording) = state.recording.try_lock() else {
+        return;
+    };
     if !recording
         .as_ref()
         .is_some_and(|active| active.session_id == session_id)
     {
         return;
     }
-    if let Some((label, snapshot)) = mark_stream_target_failed(targets, position, reason.clone()) {
+    if let Some((label, snapshot)) = failed_target {
         let _ = emit_health_event(
             state,
             Some(session_id),
@@ -19350,7 +19551,9 @@ async fn publish_ffmpeg_health_event_if_active(state: &AppState, session_id: &st
     // The stderr consumer has a bounded abort join. Keep its final persistent
     // health write and broadcast behind exact-session ownership in case an
     // uncooperative task outlives that bound.
-    let recording = state.recording.lock().await;
+    let Ok(recording) = state.recording.try_lock() else {
+        return;
+    };
     if !recording
         .as_ref()
         .is_some_and(|active| active.session_id == session_id)
@@ -19950,7 +20153,9 @@ async fn publish_pending_ffmpeg_stream_health(
     // Serialize the final global diagnostics/health publication with session
     // retirement. If an aborted stderr task outlives its bounded join, it can
     // neither mutate the next generation nor emit a stale global snapshot.
-    let recording = state.recording.lock().await;
+    let Ok(recording) = state.recording.try_lock() else {
+        return false;
+    };
     if !recording
         .as_ref()
         .is_some_and(|active| active.session_id == session_id)
@@ -28152,14 +28357,317 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ffmpeg_evidence_persists_when_monitor_is_aborted_before_first_poll() {
+        let state = test_state();
+        state
+            .database
+            .ensure_fake_live_chat_session("unpolled-monitor")
+            .unwrap();
+        let progress = FfmpegProgressBeacon::default();
+        progress
+            .evidence
+            .lock()
+            .unwrap()
+            .observe("startup warning before consumer poll");
+        let owner = SessionFfmpegEvidence::new(state.clone(), "unpolled-monitor", &progress);
+        let (polled_sender, mut polled) = oneshot::channel();
+        let monitor = tokio::spawn(async move {
+            let _owner = owner;
+            polled_sender.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        monitor.abort();
+        assert!(monitor.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            polled.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        let logs = state
+            .database
+            .list_session_logs_page("unpolled-monitor", None, 120)
+            .unwrap();
+        assert!(
+            serde_json::to_string(&logs)
+                .unwrap()
+                .contains("startup warning before consumer poll")
+        );
+    }
+
+    #[tokio::test]
+    async fn published_start_evidence_transfers_once_on_success_or_explicit_rejection() {
+        for committed in [false, true] {
+            let state = test_state();
+            let session_id = if committed {
+                "committed-evidence"
+            } else {
+                "rejected-evidence"
+            };
+            state
+                .database
+                .ensure_fake_live_chat_session(session_id)
+                .unwrap();
+            *state.diagnostics.lock().await = starting_diagnostics(session_id, 30, "record");
+            let (child, stdin) = spawn_test_stdin_sink().await;
+            let mut terminal = PublishedSessionStartGuard::unarmed();
+            terminal.arm(
+                state.clone(),
+                session_id,
+                None,
+                &RecordingPipeline::new(true, false, &[]),
+                state
+                    .capture_interruption
+                    .try_begin_session_start()
+                    .unwrap(),
+            );
+            let mut process =
+                UncommittedCaptureProcess::new(child, CaptureStartupResources::default())
+                    .with_rejected_start_terminal(terminal.take_terminal());
+            let (release_sender, release) = oneshot::channel();
+            let (ready_sender, ready) = oneshot::channel();
+            let log_state = state.clone();
+            process.stderr_monitor = Some(tokio::spawn(async move {
+                let progress = FfmpegProgressBeacon::default();
+                let _evidence = SessionFfmpegEvidence::new(log_state, session_id, &progress);
+                progress
+                    .evidence
+                    .lock()
+                    .unwrap()
+                    .observe("synthetic startup diagnostic");
+                ready_sender.send(()).unwrap();
+                let _ = release.await;
+            }));
+            ready.await.unwrap();
+            release_sender.send(()).unwrap();
+            if committed {
+                let (mut child, admission, monitor) = process.commit();
+                assert!(monitor.is_some());
+                assert!(drain_ffmpeg_stderr_monitor(monitor, Duration::from_secs(1)).await);
+                drop(stdin);
+                wait_for_test_stdin_sink(&mut child).await;
+                drop(admission);
+                assert_ne!(
+                    state
+                        .database
+                        .session_finalization_snapshot(session_id)
+                        .unwrap()
+                        .status,
+                    "failed"
+                );
+            } else {
+                process.set_failure(
+                    PublishedSessionStartFailureOrigin::FfmpegOutputStartup,
+                    "original startup timeout rtmp://private.example/live/secret-key",
+                );
+                process.terminate_and_reap_before_fifo_writer_join().await;
+                drop(stdin);
+                assert_eq!(
+                    state
+                        .database
+                        .session_finalization_snapshot(session_id)
+                        .unwrap()
+                        .status,
+                    "failed"
+                );
+            }
+            let logs = state
+                .database
+                .list_session_logs_page(session_id, None, 120)
+                .unwrap();
+            let text = serde_json::to_string(&logs).unwrap();
+            assert_eq!(text.matches("ffmpeg-stderr-tail").count(), 1);
+            assert_eq!(
+                text.matches("session-start-failed").count(),
+                usize::from(!committed)
+            );
+            if !committed {
+                assert!(text.contains("stage=Muxer reason=original startup timeout"));
+                assert!(!text.contains("private.example"));
+                assert!(!text.contains("secret-key"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_queue_saturation_preserves_evidence_and_target_errors_are_not_terminal() {
+        let progress = FfmpegProgressBeacon::default();
+        let (sender, mut events) = mpsc::channel(1);
+        let (ready_sender, ready) = oneshot::channel();
+        let relay_progress = progress.clone();
+        let relay = tokio::spawn(relay_ffmpeg_stderr(
+            BufReader::new(&b"out_time_us=1\n[fifo @ 123] Could not write header: rtmp://host/live/secret\nConversion failed!\n"[..]),
+            sender, Some(ready_sender), relay_progress));
+        assert_eq!(ready.await.unwrap(), Ok(()));
+        assert!(progress.startup_failure().is_none());
+        while events.recv().await.is_some() {}
+        relay.await.unwrap();
+        let evidence = progress.evidence.lock().unwrap();
+        assert_eq!(
+            evidence.tail.first_fatal_category,
+            Some("output-open-failed")
+        );
+        assert_eq!(evidence.last_media_seconds, Some(0.000001));
+        assert!(!evidence.tail.summary().unwrap().contains("secret"));
+        assert!(
+            progress
+                .startup_failure()
+                .unwrap()
+                .to_string()
+                .contains("conversion-failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_bounded_reader_drains_oversize_lines_and_keeps_next_progress() {
+        let input = format!("{}\nout_time_us=12\n", "界".repeat(20_000));
+        let mut reader = BufReader::new(input.as_bytes());
+        let line = read_bounded_ffmpeg_line(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(line.len() <= 8194); // lossy UTF-8 may replace the last partial codepoint
+        assert_eq!(
+            read_bounded_ffmpeg_line(&mut reader)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("out_time_us=12")
+        );
+        assert!(
+            read_bounded_ffmpeg_line(&mut reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_fatal_after_readiness_remains_visible_at_commit() {
+        let (sender, _events) = mpsc::channel(256);
+        let (ready_sender, ready) = oneshot::channel();
+        let progress = FfmpegProgressBeacon::default();
+        relay_ffmpeg_stderr(
+            BufReader::new(&b"out_time_us=1\nConversion failed!\n"[..]),
+            sender,
+            Some(ready_sender),
+            progress.clone(),
+        )
+        .await;
+        assert_eq!(ready.await.unwrap(), Ok(()));
+        assert!(
+            progress
+                .startup_failure()
+                .unwrap()
+                .to_string()
+                .contains("conversion-failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn published_cancelled_start_drains_evidence_before_persist_and_replacement() {
+        let directory =
+            std::env::temp_dir().join(format!("videorc-startup-evidence-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let state = test_state_with_file_database(&directory);
+        let session_id = "startup-evidence";
+        state
+            .database
+            .ensure_fake_live_chat_session(session_id)
+            .unwrap();
+        *state.diagnostics.lock().await = starting_diagnostics(session_id, 30, "record-and-stream");
+        let mut events = state.events.subscribe();
+        let mut terminal = PublishedSessionStartGuard::unarmed();
+        terminal.arm(
+            state.clone(),
+            session_id,
+            None,
+            &RecordingPipeline::new(true, true, &[]),
+            state
+                .capture_interruption
+                .try_begin_session_start()
+                .unwrap(),
+        );
+        let mut row_guard = SessionStartRowGuard::new(state.database.clone(), session_id);
+        let log_state = state.clone();
+        let (observed_sender, observed) = oneshot::channel();
+        let monitor = tokio::spawn(async move {
+            let progress = FfmpegProgressBeacon::default();
+            let _evidence = SessionFfmpegEvidence::new(log_state, session_id, &progress);
+            {
+                let mut evidence = progress.evidence.lock().unwrap();
+                evidence.observe("warning opening rtmp://private.example/live/secret-key");
+                evidence.observe("out_time_us=0");
+            }
+            observed_sender.send(()).unwrap();
+            // Cancellation forces the bounded drain to abort this monitor;
+            // Drop must persist even without EOF or a successful Running edge.
+            std::future::pending::<()>().await;
+        });
+        observed.await.unwrap();
+        let (completed_sender, completed) = oneshot::channel();
+        let process = UncommittedCaptureProcess {
+            child: None,
+            startup_resources: None,
+            rejected_start_cleanup: None,
+            rejected_start_terminal: terminal.take_terminal(),
+            stderr_monitor: Some(monitor),
+            cleanup_completed: Some(completed_sender),
+        };
+        row_guard.disarm();
+        drop(row_guard);
+        drop(process);
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if events.recv().await.unwrap().event == "recording.status" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // Reload the persisted session using a fresh database handle, as a
+        // support bundle after an app restart does.
+        timeout(Duration::from_secs(1), completed)
+            .await
+            .unwrap()
+            .unwrap();
+        let reloaded = Database::open_file_for_tests(&directory.join("videorc.sqlite3"));
+        let snapshot = reloaded.session_finalization_snapshot(session_id).unwrap();
+        assert_eq!(snapshot.status, "failed");
+        assert!(snapshot.diagnostics_json.contains("record-and-stream"));
+        assert!(snapshot.diagnostics_json.contains(session_id));
+        let logs = reloaded
+            .list_session_logs_page(session_id, None, 120)
+            .unwrap();
+        let text = serde_json::to_string(&logs).unwrap();
+        assert!(text.contains("ffmpeg-stderr-tail"));
+        assert_eq!(text.matches("session-start-failed").count(), 1);
+        assert!(text.contains("Session start did not reach a running capture pipeline."));
+        assert!(text.contains("lastMediaSeconds=0.000000"));
+        assert!(!text.contains("private.example"));
+        assert!(!text.contains("secret-key"));
+        drop(
+            state
+                .capture_interruption
+                .try_begin_session_start()
+                .unwrap(),
+        );
+        drop(reloaded);
+        drop(events);
+        drop(terminal);
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn ffmpeg_stderr_relay_waits_for_strictly_positive_media_progress() {
         let (mut writer, reader) = tokio::io::duplex(256);
-        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (event_sender, mut events) = mpsc::channel(256);
         let (ready_sender, mut ready) = oneshot::channel();
         let relay = tokio::spawn(relay_ffmpeg_stderr(
-            BufReader::new(reader).lines(),
+            BufReader::new(reader),
             event_sender,
             Some(ready_sender),
+            FfmpegProgressBeacon::default(),
         ));
 
         writer
@@ -28196,12 +28704,13 @@ mod tests {
 
     #[tokio::test]
     async fn ffmpeg_stderr_relay_nacks_eof_without_positive_media_progress() {
-        let (event_sender, _events) = mpsc::unbounded_channel();
+        let (event_sender, _events) = mpsc::channel(256);
         let (ready_sender, ready) = oneshot::channel();
         relay_ffmpeg_stderr(
-            BufReader::new(&b"out_time_us=0\nprogress=end\n"[..]).lines(),
+            BufReader::new(&b"out_time_us=0\nprogress=end\n"[..]),
             event_sender,
             Some(ready_sender),
+            FfmpegProgressBeacon::default(),
         )
         .await;
 
@@ -28211,12 +28720,13 @@ mod tests {
 
     #[tokio::test]
     async fn ffmpeg_stderr_relay_preserves_the_first_startup_fatal_category() {
-        let (event_sender, mut events) = mpsc::unbounded_channel();
+        let (event_sender, mut events) = mpsc::channel(256);
         let (ready_sender, ready) = oneshot::channel();
         relay_ffmpeg_stderr(
-            BufReader::new(&b"Could not write header for output file #0\n"[..]).lines(),
+            BufReader::new(&b"Could not write header for output file #0\n"[..]),
             event_sender,
             Some(ready_sender),
+            FfmpegProgressBeacon::default(),
         )
         .await;
 
@@ -28329,6 +28839,10 @@ mod tests {
             PublishedSessionStartFailureOrigin::FfmpegOutputStartup
         );
         assert!(format!("{error:#}").contains("Could not write header"));
+        assert!(
+            error.to_string().contains("Could not write header"),
+            "RPC must retain the cause through Display"
+        );
     }
 
     #[tokio::test]
@@ -28539,6 +29053,16 @@ mod tests {
                 redacted_url: Some("rtmp://example.invalid/live/REDACTED".to_string()),
             }],
         }));
+        let replacement_targets = state
+            .recording
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .stream_targets_snapshot
+            .clone();
+        let replacement_before =
+            serde_json::to_value(stream_targets_snapshot_value(&replacement_targets)).unwrap();
         let mut events = state.events.subscribe();
 
         publish_stream_target_failure_if_active(
@@ -28552,7 +29076,11 @@ mod tests {
 
         assert_eq!(
             stream_targets_snapshot_value(&targets).targets[0].state,
-            StreamTargetState::Live
+            StreamTargetState::Failed
+        );
+        assert_eq!(
+            serde_json::to_value(stream_targets_snapshot_value(&replacement_targets)).unwrap(),
+            replacement_before
         );
         assert!(matches!(
             events.try_recv(),
