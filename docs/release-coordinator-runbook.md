@@ -80,3 +80,51 @@ Announcement defaults to a preview; sending requires its explicit authorization 
 ## Verification evidence in this PR
 
 Local Node logic, conditional transport adapters, authority-denial tests, state/fault tests and workflow syntax are executable without signing. Hosted cold/warm timings, actual provider rehearsal, real signing, physical acceptance, live environment provisioning and cutover remain external rollout gates. The feature flag remains disabled until those gates pass.
+
+## Supervise the local watcher
+
+On the authorized macOS operator host, use a per-request user LaunchAgent so closing the chat or terminal does not stop approvals. First verify `gh auth status` and the foreground `release:status` command in the same user account. Save the following as `~/Library/LaunchAgents/com.videorc.release-0.9.999.plist`, substituting the request and **absolute** checkout/log paths. Create the log directory first. Do not put tokens, webhook URLs, cookies or storage credentials in this file; `gh` uses the operator's existing credential store.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.videorc.release-0.9.999</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/opt/node@24/bin/node</string>
+    <string>/Users/orcdev/projects/videorc/scripts/release.mjs</string>
+    <string>watch</string><string>--request</string><string>release-0.9.999</string>
+    <string>--cache</string><string>warm</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/orcdev/projects/videorc</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/opt/node@24/bin:/opt/homebrew/bin:/usr/bin:/bin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/Users/orcdev/projects/videorc/dist/release-watch/release-0.9.999.stdout.log</string>
+  <key>StandardErrorPath</key><string>/Users/orcdev/projects/videorc/dist/release-watch/release-0.9.999.stderr.log</string>
+</dict>
+</plist>
+```
+
+Validate and load it:
+
+```sh
+mkdir -p /Users/orcdev/projects/videorc/dist/release-watch
+plutil -lint "$HOME/Library/LaunchAgents/com.videorc.release-0.9.999.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.videorc.release-0.9.999.plist"
+launchctl print "gui/$(id -u)/com.videorc.release-0.9.999"
+```
+
+The watcher exits successfully when every requested platform is live or superseded; successful exit does not restart it. Errors restart at most once per 60 seconds. Watch the stderr log and durable `release:status`: repeated terminal build failures require unsigned retry or reconciliation, not indefinite unattended retries. On expired GitHub credentials, unload the agent, renew `gh auth login`, verify exact status, then bootstrap again. It resumes the same durable request and signing identity.
+
+Unload on completion or when taking over manually:
+
+```sh
+launchctl bootout "gui/$(id -u)/com.videorc.release-0.9.999"
+```
+
+The plist syntax is tested as part of implementation review. No LaunchAgent is installed by repository commands or this PR.

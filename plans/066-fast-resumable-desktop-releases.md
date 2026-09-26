@@ -9,7 +9,7 @@
 ## Status and baseline
 
 - **Status:** IMPLEMENTED and locally reviewed on
-  `feat/066-fast-resumable-releases`; PR delivery is pending. Production cutover
+  `feat/066-fast-resumable-releases`; ready for PR review. Production cutover
   remains disabled. Protected-main rehearsals and infrastructure readiness are
   outstanding rollout gates, not completed implementation evidence.
 - **Priority:** P1. **Effort:** L overall; S0 is a small independently useful fix.
