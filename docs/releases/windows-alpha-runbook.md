@@ -1,5 +1,7 @@
 # Releasing Videorc Windows Alpha
 
+> When `VIDEORC_RELEASE_CONTROLLER_ENABLED=true`, follow [the resumable coordinator runbook](../release-coordinator-runbook.md). The instructions below remain the legacy path before cutover.
+
 This runbook promotes one signed, tested Windows 11 x64 candidate without a
 rebuild between physical acceptance and release. macOS Beta storage and updater
 keys are separate and must remain unchanged.

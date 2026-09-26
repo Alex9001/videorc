@@ -241,7 +241,22 @@
     "backend:clippy": "cargo clippy -- -D warnings",
     "smoke:scheduled-streams": "node scripts/smoke-scheduled-streams-app.mjs",
     "ffmpeg:build:capture:windows": "node scripts/build-ffmpeg-capture-windows.mjs",
-    "probe:ffmpeg-capture:windows": "node scripts/ffmpeg-capture-windows.mjs"
+    "probe:ffmpeg-capture:windows": "node scripts/ffmpeg-capture-windows.mjs",
+    "release:start": "node scripts/release.mjs start",
+    "release:status": "node scripts/release.mjs status",
+    "release:watch": "node scripts/release.mjs watch",
+    "release:resume": "node scripts/release.mjs resume",
+    "release:cancel": "node scripts/release.mjs cancel",
+    "release:accept": "node scripts/release.mjs accept",
+    "release:retry-build": "node scripts/release.mjs retry-build",
+    "release:record": "node scripts/release.mjs record",
+    "release:build:macos": "node scripts/release-build-macos.mjs",
+    "release:verify:production": "node scripts/release-verify-production.mjs",
+    "release:announce": "node scripts/release-announce.mjs",
+    "release:provision": "node scripts/release-provision.mjs",
+    "release:rehearse": "node scripts/release-rehearse.mjs",
+    "release:sync:controlled": "gh workflow run release-sync-origins.yml --ref main",
+    "release:recover": "gh workflow run release-recover-publication.yml --ref main"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

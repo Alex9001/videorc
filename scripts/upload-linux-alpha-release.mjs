@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+import { releaseControllerEnabled } from './lib/release-coordinator.mjs'
 
 import { createReadStream } from 'node:fs'
 import { readFile } from 'node:fs/promises'
@@ -19,6 +19,10 @@ const releaseDir = resolve(
 )
 
 async function main() {
+  if (await releaseControllerEnabled())
+    throw new Error(
+      'Linux public publication requires a controller finalizer before cutover. Its private candidate workflow remains supported.'
+    )
   const manifestPath = resolve(
     process.env.VIDEORC_RELEASE_MANIFEST_PATH ?? join(releaseDir, 'release.json')
   )

@@ -172,7 +172,9 @@ export function mergeChangelogDocuments({
   localEntries: allLocalEntries,
   remoteDocument = null,
   generatedAt,
-  publishingPlatform = null
+  publishingPlatform = null,
+  publishingReleaseId = null,
+  publicationPlatforms = null
 }) {
   const withheld = new Set(
     changelogEntriesWithheldFrom({
@@ -181,7 +183,15 @@ export function mergeChangelogDocuments({
       remoteDocument
     }).map((entry) => entry.version)
   )
-  const localEntries = allLocalEntries.filter((entry) => !withheld.has(entry.version))
+  const localEntries = allLocalEntries.filter(
+    (entry) =>
+      !withheld.has(entry.version) &&
+      (!publishingReleaseId || entry.version === publishingReleaseId)
+  )
+  if (publishingReleaseId)
+    requireChangelogEntryForRelease(allLocalEntries, publishingReleaseId, {
+      requiredPlatform: publishingPlatform
+    })
   const merged = new Map()
   const remoteEntries = remoteDocument ? validatePublishedChangelogDocument(remoteDocument) : []
 
@@ -193,8 +203,38 @@ export function mergeChangelogDocuments({
   }
 
   for (const rawEntry of localEntries) {
-    const entry = normalizePublishedChangelogEntry(rawEntry)
+    let entry = normalizePublishedChangelogEntry(rawEntry)
     const published = merged.get(entry.version)
+    if (publicationPlatforms) {
+      const platforms = publicationPlatforms[entry.version]
+      if (
+        !Array.isArray(platforms) ||
+        platforms.length === 0 ||
+        new Set(platforms).size !== platforms.length ||
+        platforms.some((platform) => !entry.platforms.includes(platform)) ||
+        !platforms.includes(publishingPlatform)
+      ) {
+        throw new Error(`Invalid verified publication platforms for ${entry.version}.`)
+      }
+      if (published && published.platforms.some((platform) => !platforms.includes(platform)))
+        throw new Error(`Published platforms cannot be removed from ${entry.version}.`)
+      if (
+        published &&
+        JSON.stringify({ ...published, platforms: [] }) !==
+          JSON.stringify({ ...entry, platforms: [] })
+      )
+        throw new Error(
+          `Published changelog entry ${entry.version} conflicts with the trusted repository entry.`
+        )
+      entry = {
+        ...entry,
+        platforms: entry.platforms.filter((platform) => platforms.includes(platform))
+      }
+      if (published) {
+        merged.set(entry.version, entry)
+        continue
+      }
+    }
     if (published && JSON.stringify(published) !== JSON.stringify(entry)) {
       throw new Error(
         `Published changelog entry ${entry.version} conflicts with the trusted repository entry.`

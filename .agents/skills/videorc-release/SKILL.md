@@ -3,6 +3,12 @@ name: videorc-release
 description: Execute Videorc desktop releases when the user says "release new version", "ship an update", or asks to cut or publish a release. Coordinates signed macOS Beta and Windows Alpha builds, acceptance, storage publication, updater verification, and release records. Defaults to both platforms; supports explicitly scoped platform-only releases.
 ---
 
+## Resumable controller (Plan 066)
+
+Before a release, inspect the repository variable `VIDEORC_RELEASE_CONTROLLER_ENABLED`. If true, use `docs/release-coordinator-runbook.md` as the technical release path: one preparation PR with both exact changelog entries, one frozen source, Windows watcher and maintained local macOS build in parallel. Use `release:status/watch/resume/accept/verify:production/announce/record`; do not call legacy direct upload/sync/Discord commands. The authorized agent's `gh` session may approve eligible Windows environment deployments after deterministic checks. Keep real physical acceptance and the existing owner waiver policy unchanged. Never repeat signing after an ambiguous result. Publication recovery resumes the existing durable generation. Announcements require exact production receipts and explicit sending authorization.
+
+If the variable is absent or false, follow the legacy instructions below. Provisioning and enabling the controller are separate rollout work; do not silently enable it during an ordinary release. The new controller is not ready merely because a config plan prints successfully. Preserve D3's maintained special path and quiescence requirement.
+
 # Videorc release
 
 Ship one new numeric desktop version on both supported tracks:

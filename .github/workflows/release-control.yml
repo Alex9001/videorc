@@ -1,0 +1,133 @@
+name: Release control
+run-name: ${{ inputs.correlation || 'release-control-reconcile' }}
+'on':
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Sanitized JSON operation; empty reads state
+        type: string
+        required: false
+      correlation:
+        type: string
+        required: false
+      probe:
+        description: Verify private store conditional writes before cutover
+        type: boolean
+        default: false
+  schedule:
+    - cron: '*/5 * * * *'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  submit:
+    if: >-
+      ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' &&
+      inputs.operation != '' && vars.VIDEORC_RELEASE_CONTROLLER_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    environment: release-control-submit
+    timeout-minutes: 5
+    env:
+      VIDEORC_RELEASE_CONTROL_PREFIX: ${{ vars.VIDEORC_RELEASE_CONTROL_PREFIX }}
+      VIDEORC_RELEASE_CONTROL_S3_BUCKET: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_BUCKET }}
+      VIDEORC_RELEASE_CONTROL_S3_REGION: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_REGION }}
+      VIDEORC_RELEASE_CONTROL_S3_ENDPOINT_URL: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_ENDPOINT_URL }}
+      VIDEORC_RELEASE_CONTROL_S3_FORCE_PATH_STYLE: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_FORCE_PATH_STYLE }}
+      RELEASE_OPERATION_JSON: ${{ inputs.operation }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_BUCKET: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_BUCKET }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_REGION: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_REGION }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_ENDPOINT_URL: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_ENDPOINT_URL }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_FORCE_PATH_STYLE: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_FORCE_PATH_STYLE }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.6.0
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
+        with:
+          version: 11.0.9
+          run_install: false
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: node scripts/release-control.mjs submit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEORC_RELEASE_CONTROL_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_SUBMIT_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_SUBMIT_S3_SECRET_ACCESS_KEY }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_SUBMIT_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_SUBMIT_S3_SECRET_ACCESS_KEY }}
+  apply:
+    if: >-
+      ${{ always() && github.ref == 'refs/heads/main' && (vars.VIDEORC_RELEASE_CONTROLLER_ENABLED ==
+      'true' || inputs.probe) && (needs.submit.result == 'success' || needs.submit.result ==
+      'skipped') }}
+    needs: submit
+    runs-on: ubuntu-latest
+    environment: release-control
+    timeout-minutes: 10
+    concurrency:
+      group: release-control
+      cancel-in-progress: false
+    env:
+      VIDEORC_RELEASE_CONTROL_PREFIX: ${{ vars.VIDEORC_RELEASE_CONTROL_PREFIX }}
+      VIDEORC_RELEASE_CONTROL_S3_BUCKET: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_BUCKET }}
+      VIDEORC_RELEASE_CONTROL_S3_REGION: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_REGION }}
+      VIDEORC_RELEASE_CONTROL_S3_ENDPOINT_URL: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_ENDPOINT_URL }}
+      VIDEORC_RELEASE_CONTROL_S3_FORCE_PATH_STYLE: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_FORCE_PATH_STYLE }}
+      VIDEORC_DOWNLOAD_STORAGE_PRIMARY: ${{ vars.VIDEORC_DOWNLOAD_STORAGE_PRIMARY }}
+      VIDEORC_RELEASE_UPLOAD_S3_BUCKET: ${{ vars.VIDEORC_RELEASE_UPLOAD_S3_BUCKET }}
+      VIDEORC_RELEASE_UPLOAD_S3_REGION: ${{ vars.VIDEORC_RELEASE_UPLOAD_S3_REGION }}
+      VIDEORC_RELEASE_UPLOAD_S3_ENDPOINT_URL: ${{ vars.VIDEORC_RELEASE_UPLOAD_S3_ENDPOINT_URL }}
+      VIDEORC_RELEASE_UPLOAD_S3_FORCE_PATH_STYLE: ${{ vars.VIDEORC_RELEASE_UPLOAD_S3_FORCE_PATH_STYLE }}
+      VIDEORC_RELEASE_UPLOAD_NEON_S3_BUCKET: ${{ vars.VIDEORC_RELEASE_UPLOAD_NEON_S3_BUCKET }}
+      VIDEORC_RELEASE_UPLOAD_NEON_S3_REGION: ${{ vars.VIDEORC_RELEASE_UPLOAD_NEON_S3_REGION }}
+      VIDEORC_RELEASE_UPLOAD_NEON_S3_ENDPOINT_URL: ${{ vars.VIDEORC_RELEASE_UPLOAD_NEON_S3_ENDPOINT_URL }}
+      VIDEORC_RELEASE_UPLOAD_NEON_S3_FORCE_PATH_STYLE: ${{ vars.VIDEORC_RELEASE_UPLOAD_NEON_S3_FORCE_PATH_STYLE }}
+      VIDEORC_RELEASE_UPLOAD_HETZNER_S3_BUCKET: ${{ vars.VIDEORC_RELEASE_UPLOAD_HETZNER_S3_BUCKET }}
+      VIDEORC_RELEASE_UPLOAD_HETZNER_S3_REGION: ${{ vars.VIDEORC_RELEASE_UPLOAD_HETZNER_S3_REGION }}
+      VIDEORC_RELEASE_UPLOAD_HETZNER_S3_ENDPOINT_URL: ${{ vars.VIDEORC_RELEASE_UPLOAD_HETZNER_S3_ENDPOINT_URL }}
+      VIDEORC_RELEASE_UPLOAD_HETZNER_S3_FORCE_PATH_STYLE: ${{ vars.VIDEORC_RELEASE_UPLOAD_HETZNER_S3_FORCE_PATH_STYLE }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_BUCKET: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_BUCKET }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_REGION: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_REGION }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_ENDPOINT_URL: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_ENDPOINT_URL }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_FORCE_PATH_STYLE: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_FORCE_PATH_STYLE }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24.6.0
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
+        with:
+          version: 11.0.9
+          run_install: false
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Probe conditional storage semantics
+        if: ${{ inputs.probe }}
+        run: node scripts/release-control.mjs probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEORC_RELEASE_CONTROL_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_WRITE_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_WRITE_S3_SECRET_ACCESS_KEY }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_WRITE_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_WRITE_S3_SECRET_ACCESS_KEY }}
+      - name: Reconcile every durable unapplied intent
+        run: node scripts/release-control.mjs apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEORC_RELEASE_CONTROL_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_WRITE_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_WRITE_S3_SECRET_ACCESS_KEY }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_WRITE_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_WRITE_S3_SECRET_ACCESS_KEY }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-state-${{ github.run_id }}
+          path: ${{ runner.temp }}/release-state.json
+          if-no-files-found: error
+          retention-days: 1

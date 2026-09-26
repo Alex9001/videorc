@@ -32,6 +32,7 @@ env:
 
 jobs:
   macos:
+    if: ${{ vars.VIDEORC_RELEASE_CONTROLLER_ENABLED != 'true' }}
     name: Build signed macOS artifact
     runs-on: macos-15
     # smoke:local-gates intentionally includes a 60m idle soak plus a 15m

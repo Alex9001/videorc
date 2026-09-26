@@ -1,4 +1,6 @@
-#!/usr/bin/env node
+import { canonicalJson } from './lib/release-state.mjs'
+import { releaseControllerEnabled } from './lib/release-coordinator.mjs'
+import { assertMonotonicPointer } from './lib/release-publication.mjs'
 // Copies release objects from one storage origin to another, byte-exact.
 //
 //   pnpm release:sync:origins -- --pending
@@ -21,7 +23,7 @@
 
 import { createHash } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -161,28 +163,39 @@ async function downloadSourceObject({ config, objectKey, tempDir, transport }) {
   }
 }
 
-async function copyObjects({ expected = new Map(), from, objectKeys, to }) {
+export async function copyObjects({
+  expected = new Map(),
+  immutableKeys = new Set(),
+  from,
+  objectKeys,
+  to,
+  strict = false,
+  download = downloadSourceObject,
+  publish = publishReleaseUploadArtifact,
+  createTransport = createReleaseUploadS3Transport
+}) {
   const tempDir = await mkdtemp(join(tmpdir(), 'videorc-origin-sync-'))
-  const sourceTransport = createReleaseUploadS3Transport({ config: from.config })
-  const destinationTransport = createReleaseUploadS3Transport({ config: to.config })
+  const sourceTransport = createTransport({ config: from.config })
+  const destinationTransport = createTransport({ config: to.config })
   const summary = { copied: 0, missing: 0, unchanged: 0 }
   try {
     for (const objectKey of orderForCopy(objectKeys)) {
-      const source = await downloadSourceObject({
+      const source = await download({
         config: from.config,
         objectKey,
         tempDir,
         transport: sourceTransport
       })
       if (source === null) {
+        if (strict) throw new Error(`A referenced source object is missing: ${objectKey}`)
         summary.missing += 1
         console.log(`release-sync-origins: absent on ${from.name}, skipped ${objectKey}`)
         continue
       }
-      const immutable = isImmutableReleaseObjectKey(objectKey)
+      const immutable = immutableKeys.has(objectKey) || isImmutableReleaseObjectKey(objectKey)
       const expectedSha256 = expected.get(objectKey)
       if (expectedSha256 && expectedSha256 !== source.sha256) {
-        if (immutable) {
+        if (immutable || strict) {
           throw new Error(
             `${from.name} holds different bytes for immutable ${objectKey} than the release that was published`
           )
@@ -191,7 +204,40 @@ async function copyObjects({ expected = new Map(), from, objectKeys, to }) {
           `release-sync-origins: WARNING pointer ${objectKey} moved on since the pending record; copying the current ${from.name} value`
         )
       }
-      const result = await publishReleaseUploadArtifact({
+      if (!immutable && /(?:release\.json|\.yml)$/.test(objectKey)) {
+        const current = await readRemoteTextObject({
+          config: to.config,
+          objectKey,
+          transport: destinationTransport
+        })
+        assertMonotonicPointer({ current, next: await readFile(source.path), objectKey })
+      }
+      if (objectKey === 'changelog/changelog.json') {
+        const current = await readRemoteTextObject({
+          config: to.config,
+          objectKey,
+          transport: destinationTransport
+        })
+        if (current) {
+          const before = JSON.parse(current)
+          const after = JSON.parse(await readFile(source.path, 'utf8'))
+          for (const oldEntry of before.entries) {
+            const next = after.entries.find((entry) => entry.version === oldEntry.version)
+            if (
+              !next ||
+              (oldEntry.platforms ?? ['macos']).some(
+                (platform) => !(next.platforms ?? ['macos']).includes(platform)
+              ) ||
+              canonicalJson({ ...oldEntry, platforms: [] }) !==
+                canonicalJson({ ...next, platforms: [] })
+            )
+              throw new Error(
+                'Mirror changelog is ahead or conflicts; explicit reconciliation is required.'
+              )
+          }
+        }
+      }
+      const result = await publish({
         artifact: { ...source, immutable, label: 'origin-sync', objectKey },
         config: to.config,
         transport: destinationTransport
@@ -239,6 +285,10 @@ function requireOrigin(origins, name, flag) {
 }
 
 async function main() {
+  if (await releaseControllerEnabled())
+    throw new Error(
+      'Controlled origin catch-up must use release:sync:controlled through the shared publication workflow; local pointer writes are disabled.'
+    )
   const args = parseArguments(process.argv.slice(2))
   const { origins } = resolveReleaseUploadOrigins()
 
