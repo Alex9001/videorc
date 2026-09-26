@@ -1149,6 +1149,12 @@ pub struct AppState {
     /// (plan 060 S3). A std mutex on purpose: the caption coordinator appends
     /// without ever waiting on the engine's async lock.
     pub cohost_transcript: crate::cohost::CohostTranscriptSlot,
+    /// The last five minutes of transcript finals from either caption intent
+    /// (plan 068 S3). Std mutex: the caption task appends and returns.
+    pub cohost_recent_speech: crate::cohost::CohostRecentSpeechSlot,
+    /// Voice activity the caption task computed from the frames it received
+    /// (plan 068 D9). Never touched by the audio thread.
+    pub cohost_voice: crate::cohost::CohostVoiceSlot,
 }
 
 /// Masks the path of every `rtmp://` / `rtmps://` URL in a log line. FFmpeg
@@ -1331,6 +1337,8 @@ impl AppState {
             comment_highlight_commit: Arc::new(tokio::sync::Mutex::new(())),
             cohost: crate::cohost::new_cohost_slot(cohost_settings),
             cohost_transcript: crate::cohost::new_cohost_transcript_slot(),
+            cohost_recent_speech: crate::cohost::new_cohost_recent_speech_slot(),
+            cohost_voice: crate::cohost::new_cohost_voice_slot(),
         }
     }
 

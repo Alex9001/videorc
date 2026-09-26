@@ -406,7 +406,8 @@
       "notes": "Keyboard: Keychron Q1",
       "autoHighlight": false,
       "voiceHighlight": true,
-      "rules": ["No spoilers", "English only"]
+      "rules": ["No spoilers", "English only"],
+      "listen": true
     },
     "settings": {
       "enabled": true,
@@ -414,7 +415,8 @@
       "notes": "",
       "autoHighlight": false,
       "voiceHighlight": false,
-      "rules": []
+      "rules": [],
+      "listen": false
     },
     "state": {
       "sessionId": "session-fixture",
@@ -602,7 +604,13 @@
           "reason": "voice",
           "resolvedAt": "2026-08-22T10:00:20Z"
         }
-      ]
+      ],
+      "listening": {
+        "state": "blocked",
+        "reasonCode": "listen-monthly-quota-exhausted",
+        "message": "Orcle's listening allowance for this month is used up.",
+        "remainingSeconds": 0
+      }
     },
     "legacyState": {
       "sessionId": null,

@@ -1821,7 +1821,9 @@ const cohostSettingsSchema = objectSchema(
     notes: cohostNotesSchema,
     autoHighlight: booleanSchema,
     voiceHighlight: booleanSchema,
-    rules: cohostRulesSchema
+    rules: cohostRulesSchema,
+    // Plan 068: Orcle hears the microphone while live.
+    listen: booleanSchema
   },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostSettings>
@@ -1833,7 +1835,8 @@ const cohostSettingsPatchSchema = objectSchema(
     autoHighlight: optionalSchema(booleanSchema),
     voiceHighlight: optionalSchema(booleanSchema),
     // The patch is what the streamer typed; the backend trims and caps it.
-    rules: optionalSchema(arraySchema(stringSchema({ maxLength: 2000 }), { maxLength: 100 }))
+    rules: optionalSchema(arraySchema(stringSchema({ maxLength: 2000 }), { maxLength: 100 })),
+    listen: optionalSchema(booleanSchema)
   },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostSettingsPatch>
@@ -1948,6 +1951,17 @@ const cohostErrorDetailSchema = objectSchema(
   },
   { allowUnknown: false }
 )
+// Plan 068: whether Orcle hears the streamer. Every optional field is omitted
+// by the backend when absent (never null).
+const cohostListeningSchema = objectSchema(
+  {
+    state: enumSchema(['off', 'starting', 'on', 'blocked']),
+    reasonCode: optionalSchema(stringSchema({ minLength: 1, maxLength: 128 })),
+    message: optionalSchema(stringSchema({ maxLength: 2000 })),
+    remainingSeconds: optionalSchema(nonNegativeInteger)
+  },
+  { allowUnknown: false }
+)
 const cohostStateSchema = objectSchema(
   {
     sessionId: nullableSchema(boundedString),
@@ -1987,7 +2001,9 @@ const cohostStateSchema = objectSchema(
     autoHighlight: optionalSchema(cohostAutoHighlightSchema),
     // Plan 060 S3: absent while there is no spotlight / nothing resolved.
     spotlight: optionalSchema(cohostSpotlightSchema),
-    recentlyResolved: optionalSchema(arraySchema(cohostRecentlyResolvedSchema, { maxLength: 3 }))
+    recentlyResolved: optionalSchema(arraySchema(cohostRecentlyResolvedSchema, { maxLength: 3 })),
+    // Plan 068: absent without a session or from a backend before the field.
+    listening: optionalSchema(cohostListeningSchema)
   },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostState>

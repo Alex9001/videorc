@@ -4242,6 +4242,11 @@ export interface CohostSettings {
   voiceHighlight: boolean
   /** Plain-language chat rules the co-host flags against; ≤ 10 × 120 chars. */
   rules: string[]
+  /**
+   * Orcle hears the microphone for the whole live stream, as text, even with
+   * live captions off (plan 068; default off).
+   */
+  listen: boolean
 }
 
 /** `cohost.settings.set`: absent fields are unchanged. */
@@ -4253,6 +4258,19 @@ export interface CohostSettingsPatch {
   voiceHighlight?: boolean
   /** Replaces the whole list; the backend trims, drops empties and caps it. */
   rules?: string[]
+  listen?: boolean
+}
+
+/** Whether Orcle hears the streamer right now (plan 068). */
+export type CohostListeningState = 'off' | 'starting' | 'on' | 'blocked'
+
+export interface CohostListening {
+  state: CohostListeningState
+  /** Present while `blocked`: `no-microphone`, `no-capture`, `signed-out`, `consent-required`, `listen-monthly-quota-exhausted`, `listen-disabled`, … */
+  reasonCode?: string
+  message?: string
+  /** Listen allowance left this month, when the server reported it. */
+  remainingSeconds?: number
 }
 
 /** One open viewer question grouped across platforms and askers. */
@@ -4431,6 +4449,11 @@ export interface CohostState {
    * at most three; absent while empty (never null).
    */
   recentlyResolved?: CohostRecentlyResolved[]
+  /**
+   * Whether Orcle hears the streamer (plan 068); absent without a session or
+   * from a backend before the field (never null).
+   */
+  listening?: CohostListening
 }
 
 /**

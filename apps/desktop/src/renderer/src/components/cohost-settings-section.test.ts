@@ -26,6 +26,7 @@ function settings(overrides: Partial<CohostSettings> = {}): CohostSettings {
     autoHighlight: false,
     voiceHighlight: false,
     rules: [],
+    listen: false,
     ...overrides
   }
 }

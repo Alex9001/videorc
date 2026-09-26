@@ -1830,9 +1830,13 @@ describe('backend RPC contract', () => {
       notes: 'Keychron Q1',
       autoHighlight: false,
       voiceHighlight: false,
-      rules: ['No spoilers']
+      rules: ['No spoilers'],
+      listen: false
     }
     expect(validateBackendRpcResult('cohost.settings.get', settings)).toEqual(settings)
+    expect(validateBackendRpcParams('cohost.settings.set', { listen: true })).toEqual({
+      listen: true
+    })
     expect(validateBackendRpcParams('cohost.settings.set', { rules: [' English only '] })).toEqual({
       rules: [' English only ']
     })

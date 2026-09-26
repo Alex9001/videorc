@@ -4102,6 +4102,9 @@ pub struct CohostSettingsPatch {
     /// Replaces the whole list; the engine normalises it (trim, <= 10 x 120).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<String>>,
+    /// Orcle hears the microphone while live (plan 068 D2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5563,7 +5566,7 @@ mod tests {
         );
         assert_eq!(v2.recently_resolved[0].question.id, "q_fixture");
         assert_eq!(v2.recently_resolved[0].resolved_at, "2026-08-22T10:00:20Z");
-        assert_eq!(serde_json::to_value(v2).unwrap(), v2_wire);
+        assert_eq!(serde_json::to_value(&v2).unwrap(), v2_wire);
         // `voiceHighlight` (plan 060) defaults off on a settings row or patch
         // from before the field.
         assert!(settings_wire.get("voiceHighlight").is_some());
@@ -5574,6 +5577,19 @@ mod tests {
         assert!(legacy_settings.auto_highlight);
         assert!(!legacy_settings.voice_highlight);
         assert_eq!(patch.voice_highlight, Some(true));
+        // `listen` (plan 068) defaults off on a settings row from before the
+        // field; the patch carries it explicitly.
+        assert!(!legacy_settings.listen);
+        assert_eq!(patch.listen, Some(true));
+        assert_eq!(
+            v2.listening,
+            Some(crate::cohost::CohostListening {
+                state: crate::cohost::CohostListeningState::Blocked,
+                reason_code: Some("listen-monthly-quota-exhausted".to_string()),
+                message: Some("Orcle's listening allowance for this month is used up.".to_string()),
+                remaining_seconds: Some(0),
+            })
+        );
 
         // A payload from before `detail` and the presence fields existed still
         // parses (serde defaults).

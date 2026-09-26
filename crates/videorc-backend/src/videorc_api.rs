@@ -903,6 +903,7 @@ impl VideorcApiClient {
         session_client_id: &str,
         wav: Vec<u8>,
         language: Option<&str>,
+        purpose: CaptionChunkPurpose,
     ) -> std::result::Result<CaptionChunkResponse, CaptionChunkFailure> {
         let file_part = multipart::Part::bytes(wav)
             .file_name("videorc-caption-chunk.wav")
@@ -913,6 +914,7 @@ impl VideorcApiClient {
             })?;
         let mut form = multipart::Form::new()
             .text("sessionClientId", session_client_id.to_string())
+            .text("purpose", purpose.as_str())
             .part("audio", file_part);
         if let Some(language) = language {
             form = form.text("language", language.to_string());
@@ -1118,6 +1120,31 @@ pub struct CaptionRealtimeToken {
     pub remaining_seconds: Option<u64>,
 }
 
+/// Which allowance one transcription chunk is metered against (plan 068 D5).
+/// `Captions` wins while captions present: one upload, one charge. `Listen`
+/// is Orcle's own bucket and an old chunk route ignores the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptionChunkPurpose {
+    Captions,
+    Listen,
+}
+
+impl CaptionChunkPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Captions => "captions",
+            Self::Listen => "listen",
+        }
+    }
+}
+
+/// Terminal codes that end only Orcle's listen intent (plan 068 D5): the
+/// listen allowance is separate from captions, so a presenting caption
+/// session keeps going when one of these arrives.
+pub fn is_listen_block_code(code: &str) -> bool {
+    matches!(code, "listen-monthly-quota-exhausted" | "listen-disabled")
+}
+
 #[derive(Debug, Clone)]
 pub enum CaptionChunkFailure {
     /// Stop the caption session and surface the reason (premium required,
@@ -1135,6 +1162,8 @@ fn classify_caption_failure(status: u16, code: String, message: String) -> Capti
         code.as_str(),
         "cloud-ai-premium-required"
             | "captions-monthly-quota-exhausted"
+            | "listen-monthly-quota-exhausted"
+            | "listen-disabled"
             | "ai-user-disabled"
             | "ai-disabled"
             | "ai-transcription-not-configured"
@@ -1506,6 +1535,25 @@ mod tests {
             CaptionChunkFailure::Transient { code: Some(code), .. }
                 if code == "captions-realtime-disabled"
         ));
+    }
+
+    #[test]
+    fn listen_allowance_failures_are_terminal_and_listen_scoped() {
+        for (status, code) in [
+            (429, "listen-monthly-quota-exhausted"),
+            (503, "listen-disabled"),
+        ] {
+            let failure = classify_caption_failure(status, code.to_string(), "no".to_string());
+            assert!(
+                matches!(&failure, CaptionChunkFailure::Terminal { code: got, .. } if got == code),
+                "{code} must end the listen intent instead of retrying forever"
+            );
+            assert!(is_listen_block_code(code));
+        }
+        assert!(!is_listen_block_code("captions-monthly-quota-exhausted"));
+        assert!(!is_listen_block_code("cloud-ai-premium-required"));
+        assert_eq!(CaptionChunkPurpose::Captions.as_str(), "captions");
+        assert_eq!(CaptionChunkPurpose::Listen.as_str(), "listen");
     }
 
     #[test]

@@ -273,12 +273,37 @@ describe('shared high-risk protocol fixture', () => {
       resolvedAt: '2026-08-22T10:00:20Z',
       question: fixtures.cohost.state.questions[0]
     })
-    for (const key of ['spotlight', 'recentlyResolved'] as const) {
+    for (const key of ['spotlight', 'recentlyResolved', 'listening'] as const) {
       expect(() =>
         validateBackendEventPayload('cohost.state', { ...fixtures.cohost.stateV2, [key]: null })
       ).toThrow('cohost.state')
       expect(fixtures.cohost.legacyState).not.toHaveProperty(key)
     }
+    // Plan 068: `listening` rides the state while a session runs; its optional
+    // fields are omitted (never null) and `state` is a closed enum.
+    expect(fixtures.cohost.stateV2.listening).toStrictEqual({
+      state: 'blocked',
+      reasonCode: 'listen-monthly-quota-exhausted',
+      message: "Orcle's listening allowance for this month is used up.",
+      remainingSeconds: 0
+    })
+    expect(fixtures.cohost.state).not.toHaveProperty('listening')
+    const listeningOn = { ...fixtures.cohost.stateV2, listening: { state: 'on' } }
+    expect(validateBackendEventPayload('cohost.state', listeningOn)).toStrictEqual(listeningOn)
+    expect(() =>
+      validateBackendEventPayload('cohost.state', {
+        ...fixtures.cohost.stateV2,
+        listening: { state: 'on', reasonCode: null }
+      })
+    ).toThrow('cohost.state')
+    expect(() =>
+      validateBackendEventPayload('cohost.state', {
+        ...fixtures.cohost.stateV2,
+        listening: { state: 'humming' }
+      })
+    ).toThrow('cohost.state')
+    expect(fixtures.cohost.settings.listen).toBe(false)
+    expect(fixtures.cohost.settingsPatch.listen).toBe(true)
     const futureReason = {
       ...fixtures.cohost.stateV2,
       recentlyResolved: [

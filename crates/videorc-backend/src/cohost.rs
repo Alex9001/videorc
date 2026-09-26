@@ -332,6 +332,70 @@ pub struct CohostRecentlyResolved {
     pub resolved_at: String,
 }
 
+// --- Listening (plan 068) -------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CohostListeningState {
+    Off,
+    Starting,
+    On,
+    Blocked,
+}
+
+/// Whether Orcle hears the streamer right now (plan 068 D2). Owned by the
+/// caption coordinator's listen intent; every optional field is omitted when
+/// absent because the renderer contract rejects `null`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostListening {
+    pub state: CohostListeningState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_seconds: Option<u64>,
+}
+
+impl CohostListening {
+    pub fn off() -> Self {
+        Self {
+            state: CohostListeningState::Off,
+            reason_code: None,
+            message: None,
+            remaining_seconds: None,
+        }
+    }
+
+    pub fn starting() -> Self {
+        Self {
+            state: CohostListeningState::Starting,
+            reason_code: None,
+            message: None,
+            remaining_seconds: None,
+        }
+    }
+
+    pub fn on(remaining_seconds: Option<u64>) -> Self {
+        Self {
+            state: CohostListeningState::On,
+            reason_code: None,
+            message: None,
+            remaining_seconds,
+        }
+    }
+
+    pub fn blocked(reason_code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            state: CohostListeningState::Blocked,
+            reason_code: Some(reason_code.into()),
+            message: Some(message.into()),
+            remaining_seconds: None,
+        }
+    }
+}
+
 // --- Settings ----------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -351,6 +415,11 @@ pub struct CohostSettings {
     /// so a settings row from before the field still loads.
     #[serde(default)]
     pub rules: Vec<String>,
+    /// Orcle hears the microphone for the whole live stream, as text, even
+    /// with live captions off (plan 068 D2). `default` so a settings row from
+    /// before the field still loads.
+    #[serde(default)]
+    pub listen: bool,
 }
 
 impl Default for CohostSettings {
@@ -362,6 +431,7 @@ impl Default for CohostSettings {
             auto_highlight: false,
             voice_highlight: false,
             rules: Vec::new(),
+            listen: false,
         }
     }
 }
@@ -391,6 +461,9 @@ impl CohostSettings {
         }
         if let Some(rules) = patch.rules {
             self.rules = normalize_rules(rules);
+        }
+        if let Some(listen) = patch.listen {
+            self.listen = listen;
         }
     }
 }
@@ -587,6 +660,10 @@ pub struct CohostState {
     /// first, at most three. Omitted while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recently_resolved: Vec<CohostRecentlyResolved>,
+    /// Whether Orcle hears the streamer (plan 068). Omitted without a session
+    /// or by a backend from before the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listening: Option<CohostListening>,
 }
 
 impl CohostState {
@@ -613,6 +690,7 @@ impl CohostState {
             auto_highlight: None,
             spotlight: None,
             recently_resolved: Vec::new(),
+            listening: None,
         }
     }
 }
@@ -756,6 +834,161 @@ pub fn new_cohost_transcript_slot() -> CohostTranscriptSlot {
     Arc::new(std::sync::Mutex::new(TranscriptWindow::default()))
 }
 
+// --- Recent speech (plan 068 S3) ----------------------------------------------------
+
+/// How long a transcript final stays readable by the later slices (Clip
+/// that, the tick transcript, greeting by voice).
+pub const RECENT_SPEECH_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// One settled transcript final with its file-time window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentSpeechFinal {
+    /// Monotonic arrival time; the window is trimmed against it.
+    pub at: Instant,
+    /// Seconds from the capture epoch (file time) to the final's first sample.
+    pub offset_seconds: f64,
+    pub duration_seconds: f64,
+    pub text: String,
+    /// Word timing relative to `offset_seconds` (empty on the realtime path
+    /// and older web deploys).
+    pub segments: Vec<crate::captions::CaptionSegment>,
+    /// Captions were presenting when this final landed.
+    pub presented: bool,
+}
+
+/// The last five minutes of transcript finals, in memory, in arrival order.
+/// Both caption intents feed it (plan 068 D1); a session boundary clears it
+/// with the spotlight transcript. Behind a std mutex on `AppState`: the caption
+/// task appends and returns, and never waits on the engine.
+#[derive(Debug, Default)]
+pub struct RecentSpeech {
+    finals: VecDeque<RecentSpeechFinal>,
+    /// Bumped per append and per clear; readers poll with it.
+    version: u64,
+}
+
+/// What a reader gets when the buffer changed since the version it saw.
+/// Read by the later plan 068 slices (tick transcript, Clip that, greeting by
+/// voice); nothing in S3 consumes it yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentSpeechSnapshot {
+    pub finals: Vec<RecentSpeechFinal>,
+    pub version: u64,
+}
+
+impl RecentSpeech {
+    pub(crate) fn push(&mut self, final_: RecentSpeechFinal) {
+        let now = final_.at;
+        self.trim_older_than(now);
+        self.finals.push_back(final_);
+        self.version = self.version.wrapping_add(1);
+    }
+
+    fn trim_older_than(&mut self, now: Instant) {
+        while self
+            .finals
+            .front()
+            .is_some_and(|oldest| now.saturating_duration_since(oldest.at) >= RECENT_SPEECH_WINDOW)
+        {
+            self.finals.pop_front();
+        }
+    }
+
+    /// `None` when nothing changed since `seen_version`; otherwise every final
+    /// still inside the window at `now`, oldest first, with the new version.
+    #[allow(dead_code)]
+    pub(crate) fn since(
+        &self,
+        seen_version: Option<u64>,
+        now: Instant,
+    ) -> Option<RecentSpeechSnapshot> {
+        if seen_version == Some(self.version) {
+            return None;
+        }
+        Some(RecentSpeechSnapshot {
+            finals: self
+                .finals
+                .iter()
+                .filter(|final_| now.saturating_duration_since(final_.at) < RECENT_SPEECH_WINDOW)
+                .cloned()
+                .collect(),
+            version: self.version,
+        })
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.finals.clear();
+        self.version = self.version.wrapping_add(1);
+    }
+
+    #[allow(dead_code)]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+pub type CohostRecentSpeechSlot = Arc<std::sync::Mutex<RecentSpeech>>;
+
+pub fn new_cohost_recent_speech_slot() -> CohostRecentSpeechSlot {
+    Arc::new(std::sync::Mutex::new(RecentSpeech::default()))
+}
+
+// --- Voice activity (plan 068 D9) ---------------------------------------------------
+
+/// What the caption task observed on the microphone frames it received.
+/// Computed on the caption task, never on the audio thread. The tap is
+/// post-mute, so a muted microphone reads as silence here; mute itself is not
+/// known at frame level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VoiceActivity {
+    /// Last monotonic instant a frame carried speech-level energy.
+    pub last_voice_at: Option<Instant>,
+    /// Last monotonic instant any frame reached the caption task.
+    pub last_frame_at: Option<Instant>,
+}
+
+pub type CohostVoiceSlot = Arc<std::sync::Mutex<VoiceActivity>>;
+
+pub fn new_cohost_voice_slot() -> CohostVoiceSlot {
+    Arc::new(std::sync::Mutex::new(VoiceActivity::default()))
+}
+
+/// Caption-task hook: one received frame, already downmixed to 16 kHz mono.
+pub(crate) fn note_voice_frame(state: &AppState, samples: &[i16], now: Instant) {
+    let voiced = crate::captions::pcm_has_voice(samples);
+    if let Ok(mut voice) = state.cohost_voice.lock() {
+        voice.last_frame_at = Some(now);
+        if voiced {
+            voice.last_voice_at = Some(now);
+        }
+    }
+}
+
+/// The latest voice-activity observation (S6 reads it for the dead-air nudge).
+#[allow(dead_code)]
+pub fn voice_activity(state: &AppState) -> VoiceActivity {
+    state
+        .cohost_voice
+        .lock()
+        .map(|voice| *voice)
+        .unwrap_or_default()
+}
+
+/// The recent-speech buffer if it changed since `seen_version` (`None` to
+/// read unconditionally). Later slices poll this from their own passes.
+#[allow(dead_code)]
+pub fn recent_speech_since(
+    state: &AppState,
+    seen_version: Option<u64>,
+) -> Option<RecentSpeechSnapshot> {
+    state
+        .cohost_recent_speech
+        .lock()
+        .ok()
+        .and_then(|speech| speech.since(seen_version, Instant::now()))
+}
+
 /// Why the scheduler did not send a request on this pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TickGate {
@@ -816,6 +1049,8 @@ struct CohostSession {
     session_id: String,
     generation: u64,
     consent: bool,
+    /// Whether Orcle hears the streamer this session (plan 068).
+    listening: Option<CohostListening>,
     stream_title: Option<String>,
     status: CohostStatus,
     reason: Option<CohostReason>,
@@ -1015,6 +1250,7 @@ impl CohostSession {
             auto: AutoHighlightLedger::default(),
             spotlight: SpotlightLane::default(),
             recently_resolved: Vec::new(),
+            listening: None,
         }
     }
 
@@ -1053,6 +1289,7 @@ impl CohostSession {
             auto_highlight: self.auto.latest.clone(),
             spotlight: self.spotlight_at(now),
             recently_resolved: self.recently_resolved_at(now),
+            listening: self.listening.clone(),
         }
     }
 
@@ -2862,12 +3099,81 @@ pub(crate) fn note_caption_final(state: &AppState, update: &CaptionsUpdate) {
     }
 }
 
+/// Every transcript final, from either caption intent and either transport
+/// (plan 068 S3): the spotlight window and the five-minute recent-speech
+/// buffer both learn it. Lock, append, return.
+pub(crate) fn note_transcript_final(
+    state: &AppState,
+    update: &CaptionsUpdate,
+    final_: RecentSpeechFinal,
+) {
+    note_caption_final(state, update);
+    if final_.text.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut speech) = state.cohost_recent_speech.lock() {
+        speech.push(final_);
+    }
+}
+
 /// A session boundary forgets what was said: the next session's spotlight
 /// never sees the previous stream's words.
 fn clear_transcript(state: &AppState) {
     if let Ok(mut window) = state.cohost_transcript.lock() {
         window.clear();
     }
+    if let Ok(mut speech) = state.cohost_recent_speech.lock() {
+        speech.clear();
+    }
+}
+
+/// Caption-coordinator hook: the listen intent changed state on its own
+/// (provider confirmed, allowance exhausted, audio path lost). Publishes the
+/// session snapshot when a session is running; never called under the
+/// lifecycle fence.
+pub(crate) async fn publish_listening(state: &AppState, listening: CohostListening) {
+    let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
+    let snapshot = {
+        let mut engine = state.cohost.lock().await;
+        let Some(session) = engine.session.as_mut() else {
+            return;
+        };
+        if session.listening.as_ref() == Some(&listening) {
+            return;
+        }
+        session.listening = Some(listening);
+        engine.snapshot()
+    };
+    emit_state(state, &snapshot, &lifecycle_delivery);
+}
+
+/// Record the listen intent's admission result on the running session. The
+/// caller is under the lifecycle fence and emits the snapshot itself.
+async fn record_listening(state: &AppState, session_id: &str, listening: CohostListening) {
+    let mut engine = state.cohost.lock().await;
+    if let Some(session) = engine
+        .session
+        .as_mut()
+        .filter(|session| session.session_id == session_id)
+    {
+        session.listening = Some(listening);
+    }
+}
+
+/// Start the listen intent for a running session when the setting and the
+/// per-session consent both allow it (plan 068 D2). Never fails the session.
+async fn start_listen_if_wanted(state: &AppState, session_id: &str, consent: bool, listen: bool) {
+    let listening = if !listen {
+        CohostListening::off()
+    } else if !consent {
+        CohostListening::blocked(
+            "consent-required",
+            "Orcle can hear you once cloud AI consent is on.",
+        )
+    } else {
+        crate::captions::start_listen_for_cohost(state, session_id).await
+    };
+    record_listening(state, session_id, listening).await;
 }
 
 pub async fn cohost_status(state: &AppState) -> CohostState {
@@ -2892,13 +3198,29 @@ pub async fn set_cohost_settings(
         .database
         .save_setting(COHOST_SETTINGS_KEY, &next)
         .map_err(|error| CohostError::Storage(error.to_string()))?;
+    let listen_changed = engine.settings.listen != next.listen;
     engine.settings = next.clone();
     let stopped = !next.enabled && engine.session.is_some() && engine.stop_session();
+    let running = engine
+        .session
+        .as_ref()
+        .map(|session| (session.session_id.clone(), session.consent));
     let snapshot = engine.snapshot();
     drop(engine);
     if stopped {
         clear_transcript(state);
+        crate::captions::stop_listen(state).await;
         state.emit_log("info", "Orcle stopped: turned off in Settings.");
+        emit_state(state, &snapshot, &lifecycle_delivery);
+        return Ok(next);
+    }
+    // Toggling listening mid-session starts or stops the intent in place.
+    if listen_changed && let Some((session_id, consent)) = running {
+        if !next.listen {
+            crate::captions::stop_listen(state).await;
+        }
+        start_listen_if_wanted(state, &session_id, consent, next.listen).await;
+        let snapshot = state.cohost.lock().await.snapshot();
         emit_state(state, &snapshot, &lifecycle_delivery);
     }
     Ok(next)
@@ -2935,6 +3257,7 @@ where
     if session_id.is_empty() {
         return Err(CohostError::InvalidParams);
     }
+    let consent = params.consent_to_process_chat;
     // Chat replacement/retirement and co-host admission are one session
     // lifecycle transaction. Keep this fence from validation through the
     // authoritative state publication, but never hold the chat coordinator
@@ -2970,9 +3293,14 @@ where
     );
     engine.scheduler = Some(spawn_scheduler(state.clone(), generation));
     engine.spotlight_scheduler = Some(spawn_spotlight_scheduler(state.clone(), generation));
-    let snapshot = engine.snapshot();
+    let listen = engine.settings.listen;
     drop(engine);
     clear_transcript(state);
+    // The listen intent joins after the session exists (it reports into the
+    // session) and before the first state emit (so the renderer sees it at
+    // once). It never fails or delays the session.
+    start_listen_if_wanted(state, &session_id, consent, listen).await;
+    let snapshot = state.cohost.lock().await.snapshot();
     before_state_emit.await;
     state.emit_log("info", format!("Orcle listening for session {session_id}."));
     emit_state(state, &snapshot, &lifecycle_delivery);
@@ -2999,6 +3327,7 @@ where
     drop(engine);
     if stopped {
         clear_transcript(state);
+        crate::captions::stop_listen(state).await;
     }
     before_state_emit.await;
     if stopped {
@@ -3054,6 +3383,7 @@ async fn stop_cohost_for_session_end_if_matching_impl<F>(
     drop(engine);
     if stopped {
         clear_transcript(state);
+        crate::captions::stop_listen(state).await;
     }
     before_state_emit.await;
     if stopped {
@@ -3519,6 +3849,7 @@ mod tests {
             auto_highlight: false,
             voice_highlight: false,
             rules: Vec::new(),
+            listen: false,
         }
     }
 
@@ -6412,6 +6743,7 @@ mod tests {
             auto_highlight: Some(true),
             voice_highlight: None,
             rules: Some(vec!["  No spoilers ".to_string(), "   ".to_string()]),
+            listen: None,
         });
         assert_eq!(settings.notes.chars().count(), COHOST_NOTES_MAX_CHARS);
         assert_eq!(settings.rules, vec!["No spoilers".to_string()]);
@@ -6709,6 +7041,7 @@ mod tests {
                 auto_highlight: None,
                 voice_highlight: None,
                 rules: None,
+                listen: None,
             },
         )
         .await
@@ -6778,6 +7111,7 @@ mod tests {
                 auto_highlight: None,
                 voice_highlight: None,
                 rules: None,
+                listen: None,
             },
         )
         .await
@@ -7092,6 +7426,7 @@ mod tests {
                 auto_highlight: None,
                 voice_highlight: None,
                 rules: None,
+                listen: None,
             },
         )
         .await
@@ -7109,5 +7444,295 @@ mod tests {
         crate::live_chat::stop_live_chat(&state).await;
         assert_eq!(cohost_status(&state).await, CohostState::off());
         assert!(state.cohost.lock().await.scheduler.is_none());
+    }
+
+    // --- Plan 068 S3: listen setting, listening state, recent speech --------
+
+    #[tokio::test]
+    async fn listen_setting_round_trips_and_defaults_off() {
+        let state = test_state();
+        let settings = set_cohost_settings(
+            &state,
+            CohostSettingsPatch {
+                listen: Some(true),
+                ..CohostSettingsPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(settings.listen);
+        assert_eq!(load_cohost_settings(&state.database), settings);
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["listen"],
+            serde_json::Value::Bool(true)
+        );
+        let legacy: CohostSettings = serde_json::from_value(serde_json::json!({
+            "enabled": true, "tone": "short", "notes": "", "autoHighlight": false
+        }))
+        .unwrap();
+        assert!(!legacy.listen);
+        assert!(!CohostSettings::default().listen);
+    }
+
+    #[test]
+    fn state_serialization_omits_listening_when_none_and_never_writes_null() {
+        let off = serde_json::to_value(CohostState::off()).unwrap();
+        assert!(off.get("listening").is_none());
+        let mut state = CohostState::off();
+        state.listening = Some(CohostListening::on(None));
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["listening"], serde_json::json!({ "state": "on" }));
+        state.listening = Some(CohostListening::blocked(
+            "no-microphone",
+            "Select a microphone.",
+        ));
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            wire["listening"],
+            serde_json::json!({
+                "state": "blocked",
+                "reasonCode": "no-microphone",
+                "message": "Select a microphone."
+            })
+        );
+        let parsed: CohostState = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed, state);
+        let starting = serde_json::to_value(CohostListening::starting()).unwrap();
+        assert_eq!(starting, serde_json::json!({ "state": "starting" }));
+    }
+
+    #[test]
+    fn recent_speech_keeps_five_minutes_and_reports_versions() {
+        let mut speech = RecentSpeech::default();
+        let now = Instant::now();
+        let final_at = |at: Instant, text: &str, offset: f64| RecentSpeechFinal {
+            at,
+            offset_seconds: offset,
+            duration_seconds: 3.0,
+            text: text.to_string(),
+            segments: Vec::new(),
+            presented: false,
+        };
+        assert!(speech.since(None, now).is_some());
+        assert!(speech.since(Some(speech.version()), now).is_none());
+        let old = now
+            .checked_sub(RECENT_SPEECH_WINDOW + Duration::from_secs(1))
+            .expect("monotonic clock has room");
+        speech.push(final_at(old, "too old", 0.0));
+        speech.push(final_at(now, "fresh", 30.0));
+        let snapshot = speech.since(None, now).unwrap();
+        assert_eq!(
+            snapshot
+                .finals
+                .iter()
+                .map(|f| f.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh"]
+        );
+        assert_eq!(snapshot.finals[0].offset_seconds, 30.0);
+        assert!(speech.since(Some(snapshot.version), now).is_none());
+        speech.push(final_at(now, "later", 33.0));
+        let next = speech.since(Some(snapshot.version), now).unwrap();
+        assert_eq!(next.finals.len(), 2);
+        assert_ne!(next.version, snapshot.version);
+        speech.clear();
+        let cleared = speech.since(Some(next.version), now).unwrap();
+        assert!(cleared.finals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcript_final_feeds_both_buffers_and_a_session_boundary_clears_them() {
+        let state = test_state();
+        let update = CaptionsUpdate {
+            session_client_id: "captions-test".to_string(),
+            seq: 1,
+            kind: CaptionUpdateKind::Final,
+            text: "clip that".to_string(),
+            chunk_seconds: 3,
+            remaining_seconds: None,
+        };
+        note_transcript_final(
+            &state,
+            &update,
+            RecentSpeechFinal {
+                at: Instant::now(),
+                offset_seconds: 12.0,
+                duration_seconds: 3.0,
+                text: "clip that".to_string(),
+                segments: Vec::new(),
+                presented: false,
+            },
+        );
+        assert_eq!(
+            state
+                .cohost_transcript
+                .lock()
+                .unwrap()
+                .snapshot(Instant::now())
+                .text,
+            "clip that"
+        );
+        let speech = recent_speech_since(&state, None).unwrap();
+        assert_eq!(speech.finals.len(), 1);
+        assert_eq!(speech.finals[0].offset_seconds, 12.0);
+        clear_transcript(&state);
+        assert!(recent_speech_since(&state, None).unwrap().finals.is_empty());
+        assert!(
+            state
+                .cohost_transcript
+                .lock()
+                .unwrap()
+                .snapshot(Instant::now())
+                .text
+                .is_empty()
+        );
+
+        // Voice activity: a quiet frame is a frame, a loud one is a voice.
+        let before = voice_activity(&state);
+        assert_eq!(before, VoiceActivity::default());
+        let t0 = Instant::now();
+        note_voice_frame(&state, &vec![0i16; 320], t0);
+        assert_eq!(voice_activity(&state).last_frame_at, Some(t0));
+        assert_eq!(voice_activity(&state).last_voice_at, None);
+        let loud: Vec<i16> = (0..320)
+            .map(|i| if i % 2 == 0 { 3_000 } else { -3_000 })
+            .collect();
+        let t1 = t0 + Duration::from_millis(20);
+        note_voice_frame(&state, &loud, t1);
+        assert_eq!(voice_activity(&state).last_voice_at, Some(t1));
+    }
+
+    #[tokio::test]
+    async fn start_with_listen_reports_a_quiet_block_and_stop_ends_the_intent() {
+        let state = test_state();
+        let mut events = state.events.subscribe();
+        let drain_states = |events: &mut broadcast::Receiver<crate::protocol::ServerEvent>| {
+            let mut states = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if event.event == COHOST_STATE_EVENT {
+                    states.push(event.payload);
+                }
+            }
+            states
+        };
+        state
+            .live_chat
+            .lock()
+            .await
+            .start_session("session-1".to_string(), Vec::new());
+        set_cohost_settings(
+            &state,
+            CohostSettingsPatch {
+                enabled: Some(true),
+                listen: Some(true),
+                ..CohostSettingsPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // No consent: Orcle never starts the intent.
+        let started = start_cohost(
+            &state,
+            CohostStartParams {
+                session_id: "session-1".to_string(),
+                consent_to_process_chat: false,
+                stream_title: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            started.listening.as_ref().map(|listening| listening.state),
+            Some(CohostListeningState::Blocked)
+        );
+        assert_eq!(
+            started
+                .listening
+                .as_ref()
+                .and_then(|listening| listening.reason_code.as_deref()),
+            Some("consent-required")
+        );
+        assert!(!crate::captions::listen_wanted_for_test(&state).await);
+        stop_cohost(&state).await;
+
+        // Consent, no capture: the intent is wanted and quietly blocked.
+        drain_states(&mut events);
+        let started = start_cohost(
+            &state,
+            CohostStartParams {
+                session_id: "session-1".to_string(),
+                consent_to_process_chat: true,
+                stream_title: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            started
+                .listening
+                .as_ref()
+                .and_then(|listening| listening.reason_code.as_deref()),
+            Some("no-capture")
+        );
+        assert!(crate::captions::listen_wanted_for_test(&state).await);
+        let states = drain_states(&mut events);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0]["listening"]["state"], "blocked");
+        assert_eq!(states[0]["listening"]["reasonCode"], "no-capture");
+
+        // Toggling the setting mid-session stops and restarts the intent.
+        set_cohost_settings(
+            &state,
+            CohostSettingsPatch {
+                listen: Some(false),
+                ..CohostSettingsPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!crate::captions::listen_wanted_for_test(&state).await);
+        let states = drain_states(&mut events);
+        assert_eq!(states.len(), 1);
+        assert_eq!(
+            states[0]["listening"],
+            serde_json::json!({ "state": "off" })
+        );
+        set_cohost_settings(
+            &state,
+            CohostSettingsPatch {
+                listen: Some(true),
+                ..CohostSettingsPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(crate::captions::listen_wanted_for_test(&state).await);
+        let states = drain_states(&mut events);
+        assert_eq!(states[0]["listening"]["reasonCode"], "no-capture");
+
+        // A task-side change publishes into the running session only.
+        publish_listening(&state, CohostListening::on(Some(120))).await;
+        let states = drain_states(&mut events);
+        assert_eq!(
+            states[0]["listening"],
+            serde_json::json!({ "state": "on", "remainingSeconds": 120 })
+        );
+        publish_listening(&state, CohostListening::on(Some(120))).await;
+        assert!(
+            drain_states(&mut events).is_empty(),
+            "no emit without a change"
+        );
+
+        // Every Orcle stop ends the intent.
+        stop_cohost(&state).await;
+        assert!(!crate::captions::listen_wanted_for_test(&state).await);
+        assert_eq!(cohost_status(&state).await.listening, None);
+        publish_listening(&state, CohostListening::on(None)).await;
+        assert!(
+            drain_states(&mut events)
+                .iter()
+                .all(|s| s["listening"].is_null())
+        );
     }
 }
