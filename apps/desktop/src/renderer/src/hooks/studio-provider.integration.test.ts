@@ -2630,6 +2630,7 @@ describe('real StudioProvider lifecycle', () => {
   it('shows one persistent recovery error when an active recording fails', async () => {
     const backend = new StudioBackend()
     backend.recordingState = 'recording'
+    backend.recordingSessionId = 'session-failed'
     TestWebSocket.backend = backend
     vi.stubGlobal('WebSocket', TestWebSocket)
 
@@ -2684,6 +2685,21 @@ describe('real StudioProvider lifecycle', () => {
       permissionPane: null,
       createdAt: '2026-08-25T09:55:26.585Z'
     }
+    const degraded: HealthEvent = {
+      ...encoderFailure,
+      id: 'degraded-before-failure',
+      level: 'warn',
+      code: 'recording-degraded',
+      message: 'Recording is falling behind.'
+    }
+    await act(async () => {
+      backend.sockets[0]?.onmessage?.({
+        data: JSON.stringify({ event: 'health.event', payload: degraded })
+      })
+    })
+    await waitForObservation(() => toastSpies.warning.mock.calls.length === 1)
+    toastSpies.warning.mockClear()
+
     const failedStatus = {
       state: 'failed' as const,
       sessionId: 'session-failed',
@@ -2691,6 +2707,10 @@ describe('real StudioProvider lifecycle', () => {
       message: 'Encoder FIFO write exceeded the complete-frame delivery budget.'
     }
     await act(async () => {
+      // The lazy module continuation resumes only after the terminal push.
+      backend.sockets[0]?.onmessage?.({
+        data: JSON.stringify({ event: 'health.event', payload: degraded })
+      })
       backend.sockets[0]?.onmessage?.({
         data: JSON.stringify({ event: 'health.event', payload: encoderFailure })
       })
@@ -2709,6 +2729,26 @@ describe('real StudioProvider lifecycle', () => {
     })
     await waitForObservation(() => latest()?.recording.recording.state === 'failed')
 
+    await waitForObservation(() => toastSpies.error.mock.calls.length === 1)
+    await act(async () => {
+      backend.sockets[0]?.onmessage?.({
+        data: JSON.stringify({
+          event: 'health.event',
+          payload: {
+            ...degraded,
+            id: 'late-degradation',
+            createdAt: '2026-08-25T09:55:27.033Z'
+          }
+        })
+      })
+      await Promise.resolve()
+    })
+    expect(toastSpies.warning).not.toHaveBeenCalledWith(
+      'Recording is falling behind',
+      expect.anything()
+    )
+
+    expect(toastSpies.dismiss).toHaveBeenCalledWith('recording-degraded')
     expect(toastSpies.error).toHaveBeenCalledTimes(1)
     expect(toastSpies.error).toHaveBeenCalledWith(
       'Recording stopped unexpectedly',
@@ -2741,6 +2781,33 @@ describe('real StudioProvider lifecycle', () => {
     await act(async () => latest()!.core.dismissSessionRuntimeNotice())
     expect(latest()?.core.sessionRuntimeNotice).toBeNull()
     expect(toastSpies.dismiss).toHaveBeenCalledWith('recording-stopped-unexpectedly')
+    await act(async () => {
+      backend.sockets[0]?.onmessage?.({
+        data: JSON.stringify({
+          event: 'recording.status',
+          payload: {
+            state: 'recording',
+            sessionId: 'retry-session',
+            message: 'Running recording.'
+          }
+        })
+      })
+      backend.sockets[0]?.onmessage?.({
+        data: JSON.stringify({
+          event: 'health.event',
+          payload: {
+            ...degraded,
+            id: 'new-session-degradation',
+            sessionId: 'retry-session'
+          }
+        })
+      })
+    })
+    await waitForObservation(() => toastSpies.warning.mock.calls.length === 1)
+    expect(toastSpies.warning).toHaveBeenLastCalledWith(
+      'Recording is falling behind',
+      expect.objectContaining({ id: 'recording-degraded' })
+    )
   })
 
   it('publishes a terminal recording failure that races initial bootstrap', async () => {

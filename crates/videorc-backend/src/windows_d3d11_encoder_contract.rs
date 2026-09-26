@@ -33,6 +33,117 @@ impl MediaFoundationInputTopology {
     }
 }
 
+/// Human fallback summary shared by the native probe and support diagnostics.
+/// All topology/profile evidence precedes bounded driver names, so the 480-byte
+/// UI field never loses the second attempt's stage or HRESULT.
+pub(crate) fn compact_media_foundation_probe_failures(
+    requested: (u32, u32, u32, u32),
+    attempts: &[(MediaFoundationInputTopology, String)],
+) -> String {
+    let mut fields = Vec::new();
+    let mut identities = Vec::new();
+    for (topology, text) in attempts {
+        let detail = text
+            .split_whitespace()
+            .filter(|word| {
+                word.starts_with("stage=")
+                    || word.starts_with("HRESULT=")
+                    || word.starts_with("input=")
+                    || word.starts_with("profile=")
+                    || word.ends_with("kbps")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detail = if detail.is_empty() {
+            format!(
+                "stage=unknown HRESULT=unknown reason={}",
+                text.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(48)
+                    .collect::<String>()
+            )
+        } else {
+            detail
+        };
+        fields.push(format!("{} {detail}", topology.label()));
+        let identity = text
+            .split_once("encoder=\"")
+            .and_then(|(_, rest)| rest.split_once('"').map(|(identity, _)| identity))
+            .unwrap_or("unknown")
+            .chars()
+            .take(18)
+            .collect::<String>();
+        identities.push(format!("{}Encoder={identity}", topology.label()));
+    }
+    let mut summary = format!(
+        "Media Foundation probe requested={}x{}@{} {}kbps; {}; {}",
+        requested.0,
+        requested.1,
+        requested.2,
+        requested.3,
+        fields.join("; "),
+        identities.join("; ")
+    );
+    if summary.len() > 480 {
+        let mut end = 477;
+        while !summary.is_char_boundary(end) {
+            end -= 1;
+        }
+        summary.truncate(end);
+        summary.push_str("...");
+    }
+    summary
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::*;
+
+    #[test]
+    fn mf_unstructured_probe_failure_retains_its_reason() {
+        let summary = compact_media_foundation_probe_failures(
+            (1920, 1080, 30, 6000),
+            &[(
+                MediaFoundationInputTopology::Auto,
+                "no hardware encoder available".to_string(),
+            )],
+        );
+        assert!(summary.contains("reason=no hardware encoder available"));
+    }
+
+    #[test]
+    fn mf_both_topology_failures_survive_long_multibyte_identity() {
+        let driver = "界🙂".repeat(300);
+        let attempt = |stage: &str, hr: &str| {
+            format!(
+                "Media Foundation probe stage={stage} HRESULT={hr} (long unexplained driver failure) encoder=\"{driver}\" input=NV12 profile=1920x1080@30 5000kbps"
+            )
+        };
+        let summary = compact_media_foundation_probe_failures(
+            (1920, 1080, 30, 6000),
+            &[
+                (
+                    MediaFoundationInputTopology::Auto,
+                    attempt("process-output", "0x8000FFFF"),
+                ),
+                (
+                    MediaFoundationInputTopology::SystemMemory,
+                    attempt("set-input-type", "0xC00D36B4"),
+                ),
+            ],
+        );
+        assert!(summary.len() <= 480);
+        assert!(summary.contains("requested=1920x1080@30 6000kbps"));
+        assert!(summary.contains("auto stage=process-output HRESULT=0x8000FFFF"));
+        assert!(summary.contains("system-memory stage=set-input-type HRESULT=0xC00D36B4"));
+        assert_eq!(summary.matches("profile=1920x1080@30 5000kbps").count(), 2);
+        assert!(summary.contains("autoEncoder="));
+        assert!(summary.contains("system-memoryEncoder="));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum WindowsD3d11EncoderRole {
     Record,

@@ -4224,6 +4224,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         lastSessionActivityRef.current = status.state === 'streaming' ? 'live-stream' : 'recording'
       }
       recordingRef.current = status
+      if (!['recording', 'streaming'].includes(status.state)) {
+        toast.dismiss('recording-degraded')
+      }
       sourceStatusUnknownRef.current = false
       setSourceStatusKnown(true)
       sourceSelectionController.setSession(status.sessionId, status.state)
@@ -6019,6 +6022,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             ) {
               return
             }
+            // A last-session ID is useful for terminal quality notices, but
+            // never proves a delayed active-only warning still belongs on screen.
+            if (
+              event.code === 'recording-degraded' &&
+              (!['recording', 'streaming'].includes(recordingRef.current.state) ||
+                event.sessionId !== recordingRef.current.sessionId)
+            )
+              return
             const shownKey = runtime.showSessionHealthEvent(
               event,
               qualityToastSessionsRef.current.has(qualityDedupeKey)
