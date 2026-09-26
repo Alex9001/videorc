@@ -1,6 +1,5 @@
-#!/usr/bin/env node
+import { stageCoordinatedPlan, releaseControllerEnabled } from './lib/release-coordinator.mjs'
 
-import { createReadStream } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
@@ -16,10 +15,7 @@ import {
   planReleaseUploadOrigins,
   writeReleaseOriginPending
 } from './lib/release-upload-origins.mjs'
-import {
-  buildSignedS3Request,
-  releaseArtifactDispositionHeaders
-} from './lib/release-upload-s3.mjs'
+import { publishReleaseUploadArtifact } from './lib/release-upload-s3.mjs'
 import { loadValidatedWindowsAcceptanceHistory } from './lib/windows-acceptance-history.mjs'
 import { buildWindowsReleaseUploadPlan } from './lib/windows-release-upload.mjs'
 import {
@@ -39,13 +35,23 @@ async function main() {
   )
   validateArtifactImmediatelyBeforeUpload({ manifestPath })
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
-  const trustedDesktopPackage = JSON.parse(
-    await readFile(join(repoRoot, 'apps', 'desktop', 'package.json'), 'utf8')
-  )
+  const controlled = await releaseControllerEnabled()
+  if (controlled && process.env.VIDEORC_RELEASE_COORDINATED_PHASE !== 'stage')
+    throw new Error(
+      'Controlled Windows publication must use the protected staging/finalization workflow.'
+    )
+  const sourcePackage = controlled
+    ? JSON.parse(
+        spawnSync('git', ['show', `${manifest.sourceCommit}:apps/desktop/package.json`], {
+          cwd: repoRoot,
+          encoding: 'utf8'
+        }).stdout
+      )
+    : JSON.parse(await readFile(join(repoRoot, 'apps', 'desktop', 'package.json'), 'utf8'))
   const acceptedReleaseIds = await loadValidatedWindowsAcceptanceHistory(
     join(repoRoot, 'docs', 'acceptance', 'windows-alpha')
   )
-  await assertNoReleaseOriginPending(repoRoot)
+  if (!controlled) await assertNoReleaseOriginPending(repoRoot)
   const originPlan = await planReleaseUploadOrigins({
     allowMirrorOnly: ['1', 'true', 'yes', 'on'].includes(
       process.env.VIDEORC_RELEASE_ALLOW_MIRROR_ONLY?.trim().toLowerCase() ?? ''
@@ -87,13 +93,29 @@ async function main() {
     currentFeedYml,
     nextFeedYml,
     stage: plan.stage,
-    trustedCurrentVersion: trustedDesktopPackage.version
+    trustedCurrentVersion: sourcePackage.version
   })
 
+  if (controlled) {
+    await stageCoordinatedPlan({ repoRoot, platform: 'windows', plan, originPlan })
+    console.log('windows-alpha-release-upload: immutable staging verified; finalization pending')
+    return
+  }
   for (const target of originPlan.reachable) {
     console.log(
       `windows-alpha-release-upload: ${plan.stage} ${plan.releaseId} (${transition.kind}) to ${target.name} s3://${target.config.bucket}/${plan.prefix}`
     )
+    const targetFeed = await readRemoteTextObject({
+      config: target.config,
+      objectKey: `${plan.updatesPrefix}/latest.yml`
+    })
+    assertWindowsFeedTransition({
+      acceptedReleaseIds,
+      currentFeedYml: targetFeed,
+      nextFeedYml,
+      stage: plan.stage,
+      trustedCurrentVersion: sourcePackage.version
+    })
     for (const artifact of plan.artifacts) {
       const result = artifact.immutable
         ? await inspectRemoteArtifact({ artifact, config: target.config })
@@ -108,7 +130,6 @@ async function main() {
           `windows-alpha-release-upload: [${target.name}] uploaded ${artifact.label} -> ${artifact.objectKey}`
         )
       }
-      await inspectRemoteArtifact({ artifact, config: target.config })
       console.log(
         `windows-alpha-release-upload: [${target.name}] verified SHA-256 ${artifact.objectKey}`
       )
@@ -139,6 +160,7 @@ async function prepareChangelog(releaseId, config) {
   })
   const remoteDocument = parseRemoteChangelog(remoteText)
   const document = mergeChangelogDocuments({
+    publishingReleaseId: releaseId,
     publishingPlatform: 'windows',
     generatedAt: new Date().toISOString(),
     localEntries: entries,
@@ -159,28 +181,7 @@ function parseRemoteChangelog(text) {
 }
 
 async function uploadArtifact({ artifact, config }) {
-  // Signed, stored attachment disposition for the installer (see
-  // releaseArtifactContentDisposition).
-  const signed = buildSignedS3Request({
-    additionalHeaders: releaseArtifactDispositionHeaders(artifact.objectKey),
-    config,
-    method: 'PUT',
-    objectKey: artifact.objectKey
-  })
-  const response = await fetch(signed.url, {
-    body: createReadStream(artifact.path),
-    duplex: 'half',
-    headers: {
-      ...signed.headers,
-      'Content-Length': String(artifact.sizeBytes),
-      'Content-Type': artifact.contentType,
-      ...(artifact.immutable ? { 'If-None-Match': '*' } : {})
-    },
-    method: 'PUT'
-  })
-  if (!response.ok) {
-    throw new Error(`upload failed for ${artifact.objectKey}: HTTP ${response.status}`)
-  }
+  return publishReleaseUploadArtifact({ artifact, config })
 }
 
 function validateArtifactImmediatelyBeforeUpload({ manifestPath }) {

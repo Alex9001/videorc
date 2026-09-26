@@ -1,4 +1,5 @@
-#!/usr/bin/env node
+import { releaseControllerEnabled } from './lib/release-coordinator.mjs'
+import { execFileSync } from 'node:child_process'
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -53,6 +54,20 @@ const defaultReleaseDir = join(repoRoot, 'apps', 'desktop', 'release')
 
 async function main() {
   const exactPromotion = envFlag(process.env.VIDEORC_CAPTURE_DECAY_D3_EXACT_PROMOTION)
+  if (exactPromotion && (await releaseControllerEnabled()))
+    execFileSync(process.execPath, [join(repoRoot, 'scripts/release-legacy-guard.mjs')], {
+      cwd: repoRoot,
+      env: process.env,
+      stdio: 'inherit'
+    })
+  if (!exactPromotion && (await releaseControllerEnabled())) {
+    execFileSync(process.execPath, [join(repoRoot, 'scripts/release-stage-macos.mjs')], {
+      cwd: repoRoot,
+      env: process.env,
+      stdio: 'inherit'
+    })
+    return
+  }
   // Regular beta publication is never blocked by the D3 machinery: the
   // protected-Actions ref requirement, the pending freeze, and drift throws
   // apply only to the one-time exact sealed-candidate promotion (owner
@@ -323,6 +338,7 @@ async function prepareChangelogUpload(
     )
   }
   const document = mergeChangelogDocuments({
+    publishingReleaseId: releaseId,
     generatedAt,
     localEntries: entries,
     publishingPlatform: 'macos',

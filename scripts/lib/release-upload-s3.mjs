@@ -397,10 +397,25 @@ export function buildSignedS3Request({
   config,
   method,
   objectKey,
-  payloadSha256 = S3_PAYLOAD_HASH
+  payloadSha256 = S3_PAYLOAD_HASH,
+  listPrefix = null,
+  continuationToken = null
 }) {
   const date = new Date()
   const url = buildS3ObjectUrl(config, objectKey)
+  if (listPrefix !== null) {
+    if (method !== 'GET')
+      throw new ReleaseUploadConfigError('invalid-list-method', 'Object listing requires GET.')
+    requireS3ObjectKey(
+      listPrefix.endsWith('/') ? listPrefix.slice(0, -1) : listPrefix,
+      'list prefix'
+    )
+    url.pathname = url.pathname.slice(0, -encodeS3ObjectKey(objectKey).length)
+    url.searchParams.set('list-type', '2')
+    url.searchParams.set('encoding-type', 'url')
+    url.searchParams.set('prefix', listPrefix)
+    if (continuationToken) url.searchParams.set('continuation-token', continuationToken)
+  }
   const normalizedPayloadSha256 = normalizeS3PayloadSha256(payloadSha256)
   const signedAdditionalHeaders = normalizeAdditionalSignedHeaders(additionalHeaders)
   const checksumSha256 =

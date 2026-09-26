@@ -1,5 +1,7 @@
 # Releasing Videorc (macOS Beta) — Runbook
 
+> When `VIDEORC_RELEASE_CONTROLLER_ENABLED=true`, follow [the resumable coordinator runbook](../release-coordinator-runbook.md). The instructions below remain the legacy path before cutover.
+
 How to cut a new version and make existing users auto-update to it. This is the
 repeatable per-release process. For one-time signing setup see
 [macos-signing.md](macos-signing.md); for the broader packaging reference see

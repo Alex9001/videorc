@@ -76,6 +76,12 @@ function formatReleaseVersion(version) {
 }
 
 async function main() {
+  const { releaseControllerEnabled } = await import('./lib/release-coordinator.mjs')
+  if (await releaseControllerEnabled())
+    throw new Error(
+      'Controller enabled: use release:announce with the exact --request and --platform for durable notification identity.'
+    )
+
   const argv = process.argv.slice(2)
   const dryRun = argv.includes('--dry-run')
   const releaseId = argv.find((arg) => !arg.startsWith('--'))

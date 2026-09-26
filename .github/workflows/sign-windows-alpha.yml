@@ -1,38 +1,37 @@
-name: Build Windows Alpha Candidate
+name: Sign Windows Alpha Candidate
+run-name: ${{ inputs.correlation }}
 'on':
   workflow_dispatch:
     inputs:
-      release_id:
-        description: Exact <package version>-alpha.1 id; bump package version for every candidate
+      request_id:
         required: true
         type: string
-      request_id:
-        description: Activated request (required after controller cutover)
-        required: false
-        type: string
       source_commit:
-        required: false
+        required: true
+        type: string
+      release_id:
+        required: true
         type: string
       correlation:
-        required: false
+        required: true
         type: string
-run-name: ${{ inputs.correlation || format('windows-{0}', inputs.release_id) }}
 concurrency:
-  group: >-
-    ${{ vars.VIDEORC_RELEASE_CONTROLLER_ENABLED == 'true' && format('windows-request-{0}',
-    github.run_id) || 'windows-alpha-candidate' }}
+  group: windows-alpha-sign-${{ inputs.request_id }}
   cancel-in-progress: false
 permissions:
   contents: read
   actions: read
 jobs:
-  resolve:
-    if: ${{ vars.VIDEORC_RELEASE_CONTROLLER_ENABLED == 'true' && inputs.request_id != '' }}
+  verify:
+    name: Verify exact request before protected review
+    if: ${{ github.ref == 'refs/heads/main' && vars.VIDEORC_RELEASE_CONTROLLER_ENABLED == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
-      tooling_sha: ${{ steps.identity.outputs.tooling_sha }}
+      artifact_id: ${{ steps.identity.outputs.artifact_id }}
+      artifact_digest: ${{ steps.identity.outputs.artifact_digest }}
+      producer_run_id: ${{ steps.identity.outputs.producer_run_id }}
     env:
       RELEASE_REQUEST_ID: ${{ inputs.request_id }}
       EXPECTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
@@ -60,338 +59,43 @@ jobs:
           run_install: false
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - id: identity
-        run: node scripts/release-worker.mjs verify
+        run: node scripts/release-worker.mjs unsigned
         env:
           GH_TOKEN: ${{ github.token }}
           VIDEORC_RELEASE_CONTROL_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_READ_S3_ACCESS_KEY_ID }}
           VIDEORC_RELEASE_CONTROL_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_READ_S3_SECRET_ACCESS_KEY }}
           VIDEORC_RELEASE_CONTROL_DATA_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_READ_S3_ACCESS_KEY_ID }}
           VIDEORC_RELEASE_CONTROL_DATA_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_READ_S3_SECRET_ACCESS_KEY }}
-  gates:
-    needs: resolve
-    if: ${{ needs.resolve.result == 'success' }}
-    uses: ./.github/workflows/release-windows-gates.yml
-    with:
-      source_sha: ${{ needs.resolve.outputs.source_sha }}
-  unsigned:
-    needs:
-      - resolve
-    if: >-
-      ${{ always() && (needs.resolve.result == 'success' || (vars.VIDEORC_RELEASE_CONTROLLER_ENABLED
-      != 'true' && inputs.request_id == '')) }}
-    concurrency:
-      group: windows-alpha-build-${{ inputs.request_id || 'legacy' }}
-      cancel-in-progress: ${{ vars.VIDEORC_RELEASE_CONTROLLER_ENABLED == 'true' }}
-    name: Build and test unsigned candidate payload
-    runs-on: windows-latest
-    timeout-minutes: 180
-    outputs:
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
-      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
-      manifest_sha256: ${{ steps.handoff.outputs.manifest_sha256 }}
-    steps:
-      - name: Check out dispatch commit
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ needs.resolve.outputs.source_sha || github.sha }}
-      - name: Verify current protected-main source
-        if: ${{ vars.VIDEORC_RELEASE_CONTROLLER_ENABLED != 'true' }}
-        shell: pwsh
-        env:
-          EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if ($env:GITHUB_REF -ne 'refs/heads/main') {
-            throw 'Windows candidate builds must be dispatched from the protected main branch.'
-          }
-          $actual = (git rev-parse HEAD).Trim()
-          if ($actual -ne $env:EXPECTED_SOURCE_COMMIT) {
-            throw "Checked out $actual, expected $env:EXPECTED_SOURCE_COMMIT."
-          }
-
-          git fetch --no-tags origin main
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Unable to fetch the protected main branch.'
-          }
-          $currentMain = (git rev-parse origin/main).Trim()
-          if ($actual -ne $currentMain) {
-            throw "Main advanced to $currentMain. Re-dispatch the candidate build from current main."
-          }
-      - name: Set up pnpm
-        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
-        with:
-          version: 11.0.9
-          run_install: false
-      - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 24.6.0
-          cache: pnpm
-      - name: Set up Rust
-        shell: pwsh
-        run: >
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          --no-self-update
-
-          rustup default stable
-      - name: Cache trusted release dependencies
-        uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97
-        with:
-          shared-key: release-windows-package-v1
-          cache-workspace-crates: false
-          cache-on-failure: false
-          env-vars: CARGO CC CFLAGS CXX CMAKE RUST
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Cache verified Electron and NSIS downloads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
-        with:
-          path: |-
-            ~\AppData\Local\electron\Cache
-            ~\AppData\Local\electron-builder\Cache
-          key: >-
-            release-windows-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{
-            hashFiles('pnpm-lock.yaml', 'apps/desktop/package.json') }}
-      - name: Run source and unit gates
-        if: ${{ vars.VIDEORC_RELEASE_CONTROLLER_ENABLED != 'true' }}
-        shell: pwsh
-        run: >
-          $ErrorActionPreference = 'Stop'
-
-          function Invoke-NativeGate {
-            param(
-              [Parameter(Mandatory)] [string] $Label,
-              [Parameter(Mandatory)] [scriptblock] $Command
-            )
-            & $Command
-            $exitCode = $LASTEXITCODE
-            if ($exitCode -ne 0) {
-              throw "$Label failed with exit code $exitCode."
-            }
-          }
-
-
-          Invoke-NativeGate 'Prettier' { pnpm format:check }
-
-          Invoke-NativeGate 'text integrity' { pnpm check:text-files }
-
-          Invoke-NativeGate 'script tests' { pnpm test:scripts }
-
-          Invoke-NativeGate 'TypeScript' { pnpm typecheck }
-
-          Invoke-NativeGate 'ESLint' { pnpm lint }
-
-          Invoke-NativeGate 'desktop tests' { pnpm --filter @videorc/desktop test }
-
-          Invoke-NativeGate 'Rustfmt' { cargo fmt --check --all }
-
-          Invoke-NativeGate 'Rust tests' { cargo test -p videorc-backend }
-
-          # Same allow list as the windows.yml Clippy gate, and for the same
-
-          # reason: macOS-only helpers are dead code under cfg(windows), the
-
-          # known cross-check warning wall (docs/windows-port-plan.md). Without
-
-          # the allows this gate fails on 92 pre-existing dead-code findings and
-
-          # no Windows candidate can ever be cut. Burn the wall down, then drop
-
-          # the allows from BOTH gates together — they must not drift again.
-
-          Invoke-NativeGate 'Clippy' { cargo clippy -p videorc-backend -- -D warnings -A dead_code
-          -A unused_imports -A unused_variables -A unused_mut }
-      - name: Set up minimal Windows capture-worker toolchain
-        id: capture-msys2
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            make diffutils patch curl tar xz mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-nasm
-      - name: Build exact unsigned staging payload
-        env:
-          VIDEORC_BUNDLED_TWITCH_CLIENT_ID: ${{ secrets.VIDEORC_BUNDLED_TWITCH_CLIENT_ID }}
-          VIDEORC_BUNDLED_KICK_CLIENT_ID: ${{ secrets.VIDEORC_BUNDLED_KICK_CLIENT_ID }}
-          VIDEORC_BUNDLED_KICK_CLIENT_SECRET: ${{ secrets.VIDEORC_BUNDLED_KICK_CLIENT_SECRET }}
-          VIDEORC_BUNDLED_X_OAUTH1_CONSUMER_KEY: ${{ secrets.VIDEORC_BUNDLED_X_OAUTH1_CONSUMER_KEY }}
-          VIDEORC_BUNDLED_X_OAUTH1_CONSUMER_SECRET: ${{ secrets.VIDEORC_BUNDLED_X_OAUTH1_CONSUMER_SECRET }}
-          VIDEORC_BUNDLED_YOUTUBE_CLIENT_ID: ${{ secrets.VIDEORC_BUNDLED_YOUTUBE_CLIENT_ID }}
-          VIDEORC_BUNDLED_YOUTUBE_CLIENT_SECRET: ${{ secrets.VIDEORC_BUNDLED_YOUTUBE_CLIENT_SECRET }}
-          VIDEORC_MSYS2_ROOT: ${{ steps.capture-msys2.outputs.msys2-location }}
-          VIDEORC_RELEASE_ID: ${{ inputs.release_id }}
-          VIDEORC_RELEASE_SOURCE_COMMIT: ${{ needs.resolve.outputs.source_sha || github.sha }}
-          VIDEORC_WINDOWS_ACCEPTANCE_STATUS: pending
-          VIDEORC_WINDOWS_PUBLISHER_NAME: ${{ vars.VIDEORC_WINDOWS_PUBLISHER_NAME }}
-        run: pnpm package:desktop:windows:unsigned
-      - name: Verify packaged capture-worker protocol, normalization and source manifests
-        run: node scripts/ffmpeg-capture-windows.mjs apps/desktop/release/win-unpacked/resources/ffmpeg
-      - name: Verify bundled FFmpeg live microphone controls
-        run: pnpm probe:live-audio-controls
-        env:
-          VIDEORC_SMOKE_FFMPEG_PATH: >-
-            ${{ github.workspace
-            }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffmpeg.exe
-      - name: Verify packaged 1080p recording duration and A/V
-        run: pnpm smoke:packaged:bundled
-        env:
-          VIDEORC_PACKAGED_APP_EXECUTABLE: apps/desktop/release/win-unpacked/Videorc.exe
-          VIDEORC_SMOKE_OUTPUT_DIR: ${{ runner.temp }}/videorc-windows-recording-smoke
-          VIDEORC_SMOKE_RECORDING_MS: '5000'
-          VIDEORC_SMOKE_TIMEOUT_MS: '120000'
-          VIDEORC_SMOKE_VIDEO_WIDTH: '1920'
-          VIDEORC_SMOKE_VIDEO_HEIGHT: '1080'
-          VIDEORC_SMOKE_VIDEO_FPS: '30'
-          VIDEORC_SMOKE_VIDEO_BITRATE_KBPS: '6000'
-      - name: Verify native DXGI/GDI ScreenOnly recording and BMP preview
-        run: |
-          $attempts = 3
-          for ($attempt = 1; $attempt -le $attempts; $attempt++) {
-            $env:VIDEORC_SMOKE_OUTPUT_DIR = Join-Path $env:RUNNER_TEMP "videorc-windows-native-screen-smoke-attempt-$attempt"
-            Write-Host "Windows native screen smoke attempt $attempt/$attempts"
-            pnpm smoke:windows-native-screen
-            if ($LASTEXITCODE -eq 0) {
-              exit 0
-            }
-            if ($attempt -eq $attempts) {
-              exit $LASTEXITCODE
-            }
-            Write-Host "Native screen smoke attempt $attempt failed; retrying with a fresh app/output directory."
-          }
-        env:
-          VIDEORC_PERF_APP_EXECUTABLE: apps/desktop/release/win-unpacked/Videorc.exe
-          VIDEORC_SMOKE_OUTPUT_DIR: ${{ runner.temp }}/videorc-windows-native-screen-smoke
-          VIDEORC_SMOKE_FFMPEG_PATH: >-
-            ${{ github.workspace
-            }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffmpeg.exe
-          VIDEORC_SMOKE_FFPROBE_PATH: >-
-            ${{ github.workspace
-            }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffprobe.exe
-          VIDEORC_SMOKE_TIMEOUT_MS: '180000'
-          VIDEORC_WINDOWS_NATIVE_SCREEN_RECORDING_MS: '6000'
-          VIDEORC_SMOKE_VIDEO_WIDTH: '1280'
-          VIDEORC_SMOKE_VIDEO_HEIGHT: '720'
-          VIDEORC_SMOKE_VIDEO_FPS: '30'
-          VIDEORC_SMOKE_VIDEO_BITRATE_KBPS: '4000'
-      - name: Verify Windows preview stays live while recording
-        run: pnpm smoke:recording-native-preview
-        env:
-          VIDEORC_PERF_APP_EXECUTABLE: apps/desktop/release/win-unpacked/Videorc.exe
-          VIDEORC_SMOKE_OUTPUT_DIR: ${{ runner.temp }}/videorc-windows-preview-recording-smoke
-          VIDEORC_SMOKE_FFMPEG_PATH: >-
-            ${{ github.workspace
-            }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffmpeg.exe
-          VIDEORC_SMOKE_FFPROBE_PATH: >-
-            ${{ github.workspace
-            }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffprobe.exe
-          VIDEORC_SMOKE_TIMEOUT_MS: '180000'
-          VIDEORC_NATIVE_PREVIEW_RECORDING_MS: '12000'
-          VIDEORC_NATIVE_PREVIEW_WARMUP_MS: '6000'
-          VIDEORC_NATIVE_PREVIEW_MEASUREMENT_MS: '5000'
-          VIDEORC_EXPECT_NATIVE_METAL_PREVIEW: '0'
-          VIDEORC_NATIVE_PREVIEW_EXERCISE_PROOF_POLLING: '1'
-          VIDEORC_NATIVE_PREVIEW_MAX_INPUT_TO_PRESENT_P95_MS: '350'
-          VIDEORC_NATIVE_PREVIEW_MAX_INPUT_TO_PRESENT_P99_MS: '500'
-          VIDEORC_NATIVE_PREVIEW_MEASUREMENT_ATTEMPTS: '4'
-          VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT: raw-yuv420p
-      - name: Verify unsigned handoff and bind its manifest
-        id: handoff
-        shell: pwsh
-        run: >
-          $ErrorActionPreference = 'Stop'
-
-          $appPath = 'apps/desktop/release/win-unpacked/Videorc.exe'
-
-          $manifestPath = 'apps/desktop/release/windows-unsigned-staging.json'
-
-          if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) {
-            throw 'Unsigned staging payload is missing Videorc.exe.'
-          }
-
-          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-            throw 'Unsigned staging payload is missing its exact file manifest.'
-          }
-
-          $signature = Get-AuthenticodeSignature -LiteralPath $appPath
-
-          if ([string]$signature.Status -ne 'NotSigned') {
-            throw "Unsigned handoff must be NotSigned, got $($signature.Status)."
-          }
-
-          $manifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm
-          SHA256).Hash.ToLowerInvariant()
-
-          if ($manifestSha256 -notmatch '^[a-f0-9]{64}$') {
-            throw 'Unsigned staging manifest SHA-256 is not canonical.'
-          }
-
-          "manifest_sha256=$manifestSha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8
-          -Append
-      - name: Upload one-day hash-bound unsigned handoff
-        id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: windows-alpha-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            apps/desktop/release/win-unpacked
-            apps/desktop/release/windows-unsigned-staging.json
-          if-no-files-found: error
-          compression-level: 0
-          include-hidden-files: true
-          overwrite: false
-          retention-days: 1
-  eligible:
-    name: Windows candidate source and artifact gates
-    needs:
-      - gates
-      - unsigned
-    if: ${{ vars.VIDEORC_RELEASE_CONTROLLER_ENABLED == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    steps:
-      - run: echo 'Source stability, advisory and exact packaged artifact gates passed.'
   sign:
-    if: ${{ vars.VIDEORC_RELEASE_CONTROLLER_ENABLED != 'true' }}
     name: OIDC-sign, validate, and store exact candidate
-    needs: unsigned
+    needs: verify
     runs-on: windows-latest
     timeout-minutes: 120
     environment: windows-alpha-release
     permissions:
-      actions: read
+      actions: write
       contents: read
       id-token: write
+    env:
+      RELEASE_REQUEST_ID: ${{ inputs.request_id }}
+      EXPECTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+      VIDEORC_RELEASE_ID: ${{ inputs.release_id }}
+      VIDEORC_RELEASE_CONTROL_PREFIX: ${{ vars.VIDEORC_RELEASE_CONTROL_PREFIX }}
+      VIDEORC_RELEASE_CONTROL_S3_BUCKET: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_BUCKET }}
+      VIDEORC_RELEASE_CONTROL_S3_REGION: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_REGION }}
+      VIDEORC_RELEASE_CONTROL_S3_ENDPOINT_URL: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_ENDPOINT_URL }}
+      VIDEORC_RELEASE_CONTROL_S3_FORCE_PATH_STYLE: ${{ vars.VIDEORC_RELEASE_CONTROL_S3_FORCE_PATH_STYLE }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_BUCKET: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_BUCKET }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_REGION: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_REGION }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_ENDPOINT_URL: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_ENDPOINT_URL }}
+      VIDEORC_RELEASE_CONTROL_DATA_S3_FORCE_PATH_STYLE: ${{ vars.VIDEORC_RELEASE_CONTROL_DATA_S3_FORCE_PATH_STYLE }}
     steps:
       - name: Check out exact candidate source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.sha }}
-      - name: Reverify current protected-main source after approval
-        shell: pwsh
-        env:
-          EXPECTED_SOURCE_COMMIT: ${{ github.sha }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if ($env:GITHUB_REF -ne 'refs/heads/main') {
-            throw 'Windows candidate signing must run from the protected main branch.'
-          }
-          $actual = (git rev-parse HEAD).Trim()
-          if ($actual -ne $env:EXPECTED_SOURCE_COMMIT) {
-            throw "Checked out $actual, expected $env:EXPECTED_SOURCE_COMMIT."
-          }
-          git fetch --no-tags origin main
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Unable to fetch the protected main branch.'
-          }
-          $currentMain = (git rev-parse origin/main).Trim()
-          if ($actual -ne $currentMain) {
-            throw "Main advanced to $currentMain while approval was pending. Re-dispatch from current main."
-          }
+          ref: ${{ needs.verify.outputs.source_sha }}
       - name: Set up pnpm
         uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
         with:
@@ -404,20 +108,32 @@ jobs:
           cache: pnpm
       - name: Install signing-job dependencies without lifecycle scripts
         run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Download exact unsigned handoff
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - name: Cache verified Electron and NSIS downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          artifact-ids: ${{ needs.unsigned.outputs.artifact_id }}
-          path: apps/desktop/release
-          merge-multiple: true
+          path: |-
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: >-
+            release-windows-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('pnpm-lock.yaml', 'apps/desktop/package.json') }}
+      - name: Download and hash exact unsigned archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEORC_RELEASE_CONTROL_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_SIGN_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_SIGN_S3_SECRET_ACCESS_KEY }}
+          EXPECTED_ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_SIGN_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_SIGN_S3_SECRET_ACCESS_KEY }}
+        run: node scripts/release-unsigned-download.mjs
       - name: Verify GitHub artifact and exact unsigned contents
         shell: pwsh
         env:
-          EXPECTED_ARTIFACT_ID: ${{ needs.unsigned.outputs.artifact_id }}
-          EXPECTED_ARTIFACT_DIGEST: ${{ needs.unsigned.outputs.artifact_digest }}
-          EXPECTED_MANIFEST_SHA256: ${{ needs.unsigned.outputs.manifest_sha256 }}
+          EXPECTED_ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
           VIDEORC_RELEASE_ID: ${{ inputs.release_id }}
-          VIDEORC_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          VIDEORC_RELEASE_SOURCE_COMMIT: ${{ needs.verify.outputs.source_sha }}
           VIDEORC_WINDOWS_PUBLISHER_NAME: ${{ vars.VIDEORC_WINDOWS_PUBLISHER_NAME }}
         run: >
           $ErrorActionPreference = 'Stop'
@@ -430,18 +146,7 @@ jobs:
             throw 'The upload action did not expose a canonical artifact digest.'
           }
 
-          if ($env:EXPECTED_MANIFEST_SHA256 -notmatch '^[a-f0-9]{64}$') {
-            throw 'The unsigned job did not expose a canonical manifest SHA-256.'
-          }
-
-          $manifestPath = 'apps/desktop/release/windows-unsigned-staging.json'
-
-          $actualManifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm
-          SHA256).Hash.ToLowerInvariant()
-
-          if ($actualManifestSha256 -ne $env:EXPECTED_MANIFEST_SHA256) {
-            throw "Unsigned staging manifest changed across jobs: $actualManifestSha256."
-          }
+          # The immutable producer archive digest binds the manifest itself.
 
           pnpm release:staging:verify:windows
 
@@ -460,7 +165,7 @@ jobs:
         env:
           VIDEORC_WINDOWS_PUBLISHER_NAME: ${{ vars.VIDEORC_WINDOWS_PUBLISHER_NAME }}
           VIDEORC_RELEASE_ID: ${{ inputs.release_id }}
-          VIDEORC_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          VIDEORC_RELEASE_SOURCE_COMMIT: ${{ needs.verify.outputs.source_sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           # Same script the unsigned job runs before writing the manifest, so
@@ -576,6 +281,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Windows signing service configuration is incomplete.'
           }
+      - name: Claim exact signing attempt before any signing side effect
+        run: node scripts/release-worker.mjs sign-start
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEORC_RELEASE_CONTROL_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_SIGN_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_SIGN_S3_SECRET_ACCESS_KEY }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_SIGN_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_SIGN_S3_SECRET_ACCESS_KEY }}
       - name: Log in to Azure with GitHub OIDC
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43
         env:
@@ -595,7 +308,7 @@ jobs:
           LOCALAPPDATA: ${{ runner.temp }}\videorc-signing-localappdata
           VIDEORC_RELEASE_ID: ${{ inputs.release_id }}
           VIDEORC_RELEASE_NOTES_URL: https://www.videorc.com/releases/${{ inputs.release_id }}
-          VIDEORC_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          VIDEORC_RELEASE_SOURCE_COMMIT: ${{ needs.verify.outputs.source_sha }}
           VIDEORC_WINDOWS_ACCEPTANCE_STATUS: pending
           VIDEORC_WINDOWS_CERTIFICATE_PROFILE_NAME: ${{ vars.VIDEORC_WINDOWS_CERTIFICATE_PROFILE_NAME }}
           VIDEORC_WINDOWS_KNOWN_ISSUES_URL: https://www.videorc.com/windows-alpha
@@ -725,7 +438,7 @@ jobs:
           }
       - name: Validate exact signed release bundle after logout
         env:
-          VIDEORC_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
+          VIDEORC_RELEASE_SOURCE_COMMIT: ${{ needs.verify.outputs.source_sha }}
           VIDEORC_WINDOWS_PUBLISHER_NAME: ${{ vars.VIDEORC_WINDOWS_PUBLISHER_NAME }}
         run: pnpm release:validate:windows
       - name: Store immutable private candidate
@@ -739,3 +452,11 @@ jobs:
           VIDEORC_WINDOWS_FFMPEG_LICENSE_PATH: apps/desktop/release/win-unpacked/resources/ffmpeg/LICENSE.txt
           VIDEORC_WINDOWS_FFMPEG_SOURCE_PATH: apps/desktop/release/win-unpacked/resources/ffmpeg/SOURCE.txt
         run: pnpm release:candidate:upload:windows
+      - name: Persist candidate receipt after immutable upload
+        run: node scripts/release-worker.mjs candidate-receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIDEORC_RELEASE_CONTROL_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_SIGN_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_SIGN_S3_SECRET_ACCESS_KEY }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_SIGN_S3_ACCESS_KEY_ID }}
+          VIDEORC_RELEASE_CONTROL_DATA_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_RELEASE_CONTROL_DATA_SIGN_S3_SECRET_ACCESS_KEY }}
