@@ -98,6 +98,8 @@ mod storage;
 mod streaming;
 mod support_bundle;
 mod synthetic_diagnostic;
+#[cfg(target_os = "macos")]
+mod system_audio_capture;
 mod twitch;
 mod twitch_chat;
 #[cfg(target_os = "macos")]
