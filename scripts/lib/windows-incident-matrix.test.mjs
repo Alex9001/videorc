@@ -368,3 +368,20 @@ test('an artifact cannot pass incident acceptance without a measured bounded pac
   run.artifacts[0].packetTail = { pass: true, tailMismatchMs: null }
   assert.equal(evaluateWindowsIncidentRun(scenario, run).pass, false)
 })
+
+test('incident backend receives the exact selected FFmpeg pair over inherited tools', async () => {
+  const { incidentBackendEnvironment } = await import('./windows-incident-runner.mjs')
+  const env = incidentBackendEnvironment({
+    inherited: {
+      VIDEORC_BUNDLED_FFMPEG_PATH: 'other-ffmpeg',
+      VIDEORC_BUNDLED_FFPROBE_PATH: 'other-probe'
+    },
+    ffmpegPath: 'D:/pinned/bin/ffmpeg.exe',
+    ffprobePath: 'D:/pinned/bin/ffprobe.exe',
+    root: '/owned-incident',
+    audio: 'controlled',
+    injectFailure: false
+  })
+  assert.equal(env.VIDEORC_BUNDLED_FFMPEG_PATH, 'D:/pinned/bin/ffmpeg.exe')
+  assert.equal(env.VIDEORC_BUNDLED_FFPROBE_PATH, 'D:/pinned/bin/ffprobe.exe')
+})

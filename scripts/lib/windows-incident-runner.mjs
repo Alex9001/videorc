@@ -186,6 +186,7 @@ export async function runWindowsIncident(argv) {
             runtime,
             backendPath,
             ffmpegPath,
+            ffprobePath,
             root: caseRoot,
             injectFailure: scenario.audio === 'direct-fallback',
             audio: scenario.audio
@@ -304,10 +305,19 @@ export function incidentAggregateVerdict(runs, expected) {
   return 'PASS'
 }
 
-async function launchBackend({ runtime, backendPath, ffmpegPath, root, injectFailure, audio }) {
-  const env = {
-    ...process.env,
+export function incidentBackendEnvironment({
+  inherited,
+  ffmpegPath,
+  ffprobePath,
+  root,
+  injectFailure,
+  audio
+}) {
+  return {
+    ...inherited,
     ...incidentAudioEnvironment(audio),
+    VIDEORC_BUNDLED_FFMPEG_PATH: ffmpegPath,
+    VIDEORC_BUNDLED_FFPROBE_PATH: ffprobePath,
     VIDEORC_DATABASE_PATH: join(root, 'videorc.sqlite3'),
     VIDEORC_RECORDINGS_DIR: join(root, 'recordings'),
     VIDEORC_SECRETS_PATH: join(root, 'secrets.json'),
@@ -317,6 +327,25 @@ async function launchBackend({ runtime, backendPath, ffmpegPath, root, injectFai
     VIDEORC_WINDOWS_D3D11_MEDIA: '0',
     VIDEORC_INCIDENT_WORKER_OPEN_FAILURE: injectFailure ? '1' : '0'
   }
+}
+
+async function launchBackend({
+  runtime,
+  backendPath,
+  ffmpegPath,
+  ffprobePath,
+  root,
+  injectFailure,
+  audio
+}) {
+  const env = incidentBackendEnvironment({
+    inherited: process.env,
+    ffmpegPath,
+    ffprobePath,
+    root,
+    injectFailure,
+    audio
+  })
   const child = spawn(backendPath, [], {
     ...runtime.devAppSpawnOptions({ env }),
     stdio: ['ignore', 'pipe', 'pipe']
