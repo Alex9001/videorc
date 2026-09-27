@@ -1468,6 +1468,13 @@ const diagnosticStatsSchema = boundedSemanticValue(
         nullableSchema(stringSchema({ minLength: 1, maxLength: 16_384 }))
       ),
       captureRecoveryLastDurationMs: optionalSchema(nullableSchema(numberSchema({ min: 0 }))),
+      // System audio (plan 069): absent while no system source is attached;
+      // nullable for defense in depth against the serde-null trap.
+      systemAudioLiveLevel: optionalSchema(nullableSchema(numberSchema({ min: 0, max: 1 }))),
+      systemAudioLivePeakDb: optionalSchema(nullableSchema(numberSchema())),
+      systemAudioCapturedFrames: optionalSchema(nullableSchema(nonNegativeInteger)),
+      systemAudioActive: optionalSchema(nullableSchema(booleanSchema)),
+      audioMixClippedSamples: optionalSchema(nullableSchema(nonNegativeInteger)),
       updatedAt: optionalSchema(timestamp)
     },
     { allowUnknown: true }

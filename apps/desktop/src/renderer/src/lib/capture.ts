@@ -27,6 +27,9 @@ import type {
 import {
   HORIZONTAL_LAYOUT_PRESETS,
   LAYOUT_PRESET_VALUES,
+  SYSTEM_AUDIO_GAIN_DB_DEFAULT,
+  SYSTEM_AUDIO_GAIN_DB_MAX,
+  SYSTEM_AUDIO_GAIN_DB_MIN,
   VERTICAL_LAYOUT_PRESETS
 } from '../../../shared/backend'
 
@@ -1232,7 +1235,11 @@ export const defaultCaptureConfig: CaptureConfig = {
     // writer trims to the encoder bridge's first-frame epoch), so the old calibrated
     // -750ms constant is gone — it could never fit every resolution at once.
     microphoneSyncOffsetMs: 0,
-    microphoneSyncOffsetUserSet: false
+    microphoneSyncOffsetUserSet: false,
+    // Plan 069: Off means not captured at all (notifications and calls are
+    // private); -6 dB keeps a voice on top of games and music.
+    systemAudioEnabled: false,
+    systemAudioGainDb: SYSTEM_AUDIO_GAIN_DB_DEFAULT
   },
   // 1080p30 until the performance check has measured this computer: the old
   // 1440p default sent an Intel UHD 600 into a 0.28x software encode.
@@ -1417,8 +1424,23 @@ export function normalizeAudioSettings(audio: unknown): AudioSettings {
         ? candidate.microphoneMuted
         : defaultCaptureConfig.audio.microphoneMuted,
     microphoneSyncOffsetMs,
-    microphoneSyncOffsetUserSet: offsetUserSet
+    microphoneSyncOffsetUserSet: offsetUserSet,
+    // Anything but an explicit `true` is Off: a stored config from before plan
+    // 069 must never start capturing the computer's sound.
+    systemAudioEnabled: candidate.systemAudioEnabled === true,
+    systemAudioGainDb: normalizeSystemAudioGainDb(candidate.systemAudioGainDb)
   }
+}
+
+export function normalizeSystemAudioGainDb(value: unknown): number {
+  return typeof value === 'number'
+    ? clampNumber(
+        value,
+        SYSTEM_AUDIO_GAIN_DB_DEFAULT,
+        SYSTEM_AUDIO_GAIN_DB_MIN,
+        SYSTEM_AUDIO_GAIN_DB_MAX
+      )
+    : SYSTEM_AUDIO_GAIN_DB_DEFAULT
 }
 
 export function normalizeMicrophoneSyncOffsetMs(value: unknown, fallback = 0): number {
@@ -2502,8 +2524,8 @@ export function reconcileSourceSelection(
   if (devices.length === 0) {
     // No device snapshot yet: the renderer mounts with an empty deviceList
     // placeholder and reconciles before the backend's first devices.list
-    // answer. A real snapshot is never empty (the system-audio placeholder is
-    // always listed), so reconciling here would clear remembered selections
+    // answer. A real snapshot is never empty (the system-audio device is
+    // always listed, on every platform), so reconciling here would clear remembered selections
     // and toast "unavailable" for devices that are present.
     return { ...sources }
   }

@@ -13,7 +13,7 @@ import {
 const portalDevices = [
   { id: PORTAL_MONITOR_SOURCE_ID, kind: 'screen', status: 'available' },
   { id: PORTAL_WINDOW_SOURCE_ID, kind: 'window', status: 'available' },
-  { id: 'audio:system', kind: 'systemAudio', status: 'unavailable' }
+  { id: 'system-audio:default', kind: 'system-audio', status: 'unavailable' }
 ]
 
 test('the Linux device list carries one available portal monitor and window entry', () => {

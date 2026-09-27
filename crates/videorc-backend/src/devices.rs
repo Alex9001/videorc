@@ -66,7 +66,7 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
 
 /// Linux: the portal screen/window entries (Plan 0006, L4), V4L2 cameras
 /// (L3), PulseAudio / PipeWire microphones through FFmpeg (L2), and the
-/// system audio placeholder.
+/// system audio device (Unavailable: Linux system audio is out of scope).
 #[cfg(target_os = "linux")]
 async fn list_linux_devices(ffmpeg_path: &str) -> DeviceList {
     let native_capture_sources = list_native_capture_sources();
@@ -79,7 +79,7 @@ async fn list_linux_devices(ffmpeg_path: &str) -> DeviceList {
     devices.extend(cameras.devices);
     let ffmpeg_path = crate::ffmpeg::resolve_ffmpeg_path_ref(Some(ffmpeg_path));
     devices.extend(crate::linux_pulse_audio::list_linux_microphones(&ffmpeg_path).await);
-    devices.push(system_audio_placeholder());
+    devices.push(system_audio_device());
     DeviceList { devices, warnings }
 }
 
@@ -179,7 +179,7 @@ async fn list_macos_devices(ffmpeg_path: &str) -> DeviceList {
     }
 
     devices.extend(native_microphones);
-    devices.push(system_audio_placeholder());
+    devices.push(system_audio_device());
 
     DeviceList { devices, warnings }
 }
@@ -218,7 +218,7 @@ fn windows_device_list_from_parts(
     warnings.extend(native_cameras.warnings);
     devices.extend(native_cameras.devices);
     devices.extend(native_microphones);
-    devices.push(system_audio_placeholder());
+    devices.push(system_audio_device());
 
     DeviceList { devices, warnings }
 }
@@ -247,7 +247,7 @@ fn unsupported_device_list() -> DeviceList {
             width: None,
             height: None,
         },
-        system_audio_placeholder(),
+        system_audio_device(),
     ]);
     warnings.push("Device probing is only implemented for macOS/Windows.".to_string());
 
@@ -337,13 +337,73 @@ fn avfoundation_probe_failed_screen_device() -> Device {
     }
 }
 
-fn system_audio_placeholder() -> Device {
+/// Stable id of the one system-audio device (plan 069). Everything the
+/// computer plays, except Videorc, is one source; there is no per-output pick.
+const SYSTEM_AUDIO_DEVICE_ID: &str = "system-audio:default";
+
+/// What the platform says about capturing system audio. It comes from a cheap
+/// probe that never prompts and never starts a capture stream.
+///
+/// Each platform constructs a subset of the variants; tests cover all of them.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemAudioSupport {
+    /// Capture is supported and its grant is in place.
+    Ready,
+    /// macOS: system audio rides the Screen Recording grant, which is missing.
+    ScreenRecordingPermissionMissing,
+    /// No system audio capture on this platform yet (Windows arrives in plan
+    /// 069 S8; Linux is out of scope).
+    UnsupportedPlatform,
+}
+
+fn system_audio_support() -> SystemAudioSupport {
+    #[cfg(target_os = "macos")]
+    {
+        // ScreenCaptureKit audio uses the Screen Recording grant the app
+        // already asks for ("Screen & System Audio Recording"). Preflight only:
+        // it neither prompts nor opens a stream, so listing devices stays cheap.
+        if objc2_core_graphics::CGPreflightScreenCaptureAccess() {
+            SystemAudioSupport::Ready
+        } else {
+            SystemAudioSupport::ScreenRecordingPermissionMissing
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        SystemAudioSupport::UnsupportedPlatform
+    }
+}
+
+/// The system-audio device row. It stays on the list on every platform: the
+/// renderer treats a non-empty device list as "devices loaded"
+/// (`app-shell.tsx`), and this row guarantees that on a machine with no
+/// camera or microphone.
+fn system_audio_device() -> Device {
+    system_audio_device_for(system_audio_support())
+}
+
+fn system_audio_device_for(support: SystemAudioSupport) -> Device {
+    let (status, detail) = match support {
+        SystemAudioSupport::Ready => (DeviceStatus::Available, None),
+        SystemAudioSupport::ScreenRecordingPermissionMissing => (
+            DeviceStatus::PermissionRequired,
+            Some(
+                "System audio needs the Screen Recording permission. Allow Videorc in System Settings > Privacy & Security > Screen & System Audio Recording."
+                    .to_string(),
+            ),
+        ),
+        SystemAudioSupport::UnsupportedPlatform => (
+            DeviceStatus::Unavailable,
+            Some("System audio capture is not supported on this platform yet.".to_string()),
+        ),
+    };
     Device {
-        id: "system-audio:native-adapter-pending".to_string(),
-        name: "System Audio".to_string(),
+        id: SYSTEM_AUDIO_DEVICE_ID.to_string(),
+        name: "System audio".to_string(),
         kind: DeviceKind::SystemAudio,
-        status: DeviceStatus::Unavailable,
-        detail: Some("System audio capture depends on the native audio adapter.".to_string()),
+        status,
+        detail,
         width: None,
         height: None,
     }
@@ -1233,7 +1293,7 @@ mod tests {
                 "screen:dxgi:0000000000000001:0",
                 "camera:windows-dshow:5553422043616d657261",
                 "microphone:windows-dshow:4d6963726f70686f6e65204172726179",
-                "system-audio:native-adapter-pending",
+                "system-audio:default",
             ]
         );
         assert_eq!(
@@ -1245,6 +1305,60 @@ mod tests {
             available_microphone_names(&devices.devices),
             vec!["Microphone Array".to_string()]
         );
+    }
+
+    #[test]
+    fn system_audio_device_maps_each_probe_result_to_a_device_status() {
+        let ready = system_audio_device_for(SystemAudioSupport::Ready);
+        assert_eq!(ready.id, "system-audio:default");
+        assert_eq!(ready.name, "System audio");
+        assert_eq!(ready.kind, DeviceKind::SystemAudio);
+        assert_eq!(ready.status, DeviceStatus::Available);
+        assert_eq!(ready.detail, None);
+
+        let missing = system_audio_device_for(SystemAudioSupport::ScreenRecordingPermissionMissing);
+        assert_eq!(missing.id, "system-audio:default");
+        assert_eq!(missing.status, DeviceStatus::PermissionRequired);
+        assert!(
+            missing
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Screen Recording")),
+            "the permission row must name the grant: {missing:?}"
+        );
+
+        let unsupported = system_audio_device_for(SystemAudioSupport::UnsupportedPlatform);
+        assert_eq!(unsupported.id, "system-audio:default");
+        assert_eq!(unsupported.status, DeviceStatus::Unavailable);
+        assert!(unsupported.detail.is_some());
+
+        for device in [ready, missing, unsupported] {
+            let detail = device.detail.clone().unwrap_or_default();
+            assert!(
+                !detail.contains('\u{2014}'),
+                "no em dashes in copy: {detail}"
+            );
+            let wire = serde_json::to_value(&device).unwrap();
+            assert_eq!(wire["id"], "system-audio:default");
+            assert_eq!(wire["kind"], "system-audio");
+        }
+    }
+
+    #[test]
+    fn system_audio_device_status_comes_from_the_platform_probe() {
+        let device = system_audio_device();
+        assert_eq!(device.id, "system-audio:default");
+        assert_eq!(device.kind, DeviceKind::SystemAudio);
+        #[cfg(target_os = "macos")]
+        assert!(
+            matches!(
+                device.status,
+                DeviceStatus::Available | DeviceStatus::PermissionRequired
+            ),
+            "macOS reports the Screen Recording preflight, never a permanent Unavailable: {device:?}"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(device.status, DeviceStatus::Unavailable);
     }
 
     #[test]

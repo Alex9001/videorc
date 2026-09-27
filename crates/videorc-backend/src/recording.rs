@@ -17077,6 +17077,7 @@ fn microphone_audio_track() -> AudioTrack {
         id: "microphone".to_string(),
         label: "Microphone".to_string(),
         source: AudioTrackSource::Microphone,
+        mix_sources: Vec::new(),
     }
 }
 
@@ -17085,6 +17086,7 @@ fn test_tone_audio_track() -> AudioTrack {
         id: "test-tone".to_string(),
         label: "Test tone".to_string(),
         source: AudioTrackSource::TestTone,
+        mix_sources: Vec::new(),
     }
 }
 
@@ -28255,6 +28257,7 @@ mod tests {
             microphone_gain_db: 6.5,
             microphone_muted: false,
             microphone_sync_offset_ms: 0,
+            ..Default::default()
         };
 
         let native = capture_audio_filter(&microphone_input_layout(false), &audio);
@@ -28284,6 +28287,7 @@ mod tests {
             microphone_gain_db: 6.5,
             microphone_muted: true,
             microphone_sync_offset_ms: 0,
+            ..Default::default()
         };
 
         let filter = capture_audio_filter(&microphone_input_layout(true), &audio);
@@ -28307,6 +28311,7 @@ mod tests {
             microphone_gain_db: 0.0,
             microphone_muted: false,
             microphone_sync_offset_ms: 0,
+            ..Default::default()
         };
 
         let filter = capture_audio_filter(&microphone_input_layout(true), &audio);
@@ -29755,6 +29760,8 @@ mod tests {
                     session_id: "live-audio-lock-test".to_string(),
                     microphone_gain_db: 6.0,
                     microphone_muted: false,
+                    system_audio_enabled: None,
+                    system_audio_gain_db: None,
                 },
             )
             .await
@@ -29801,6 +29808,8 @@ mod tests {
                 session_id: "live-audio-lock-test".to_string(),
                 microphone_gain_db: -3.0,
                 microphone_muted: true,
+                system_audio_enabled: None,
+                system_audio_gain_db: None,
             },
         )
         .await;

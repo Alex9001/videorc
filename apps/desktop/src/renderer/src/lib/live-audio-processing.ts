@@ -58,9 +58,14 @@ export class LatestWinsLiveAudioProcessingQueue {
 
   enqueue(params: AudioProcessingUpdateParams): void {
     if (this.stopped || params.sessionId !== this.sessionId) return
-    if (sameAudioProcessingParams(params, this.pending ?? this.inFlight)) return
+    // The mic fields are always a complete state; the optional system-audio
+    // fields mean "unchanged" when omitted. Fold a newer request into the one
+    // still waiting so a system-audio edit is never lost to a later mic-only
+    // edit (and the reverse): newest value per field wins.
+    const next = this.pending ? mergeAudioProcessingParams(this.pending, params) : params
+    if (sameAudioProcessingParams(next, this.pending ?? this.inFlight)) return
 
-    this.pending = params
+    this.pending = next
     if (!this.drainPromise) {
       this.drainPromise = this.drain().finally(() => {
         this.drainPromise = null
@@ -99,6 +104,32 @@ export class LatestWinsLiveAudioProcessingQueue {
   }
 }
 
+const OPTIONAL_AUDIO_PROCESSING_FIELDS = ['systemAudioEnabled', 'systemAudioGainDb'] as const
+
+/**
+ * Newest value per field wins. Optional fields the newer request omits keep
+ * the older request's value, and stay omitted when neither request set them.
+ */
+export function mergeAudioProcessingParams(
+  older: AudioProcessingUpdateParams,
+  newer: AudioProcessingUpdateParams
+): AudioProcessingUpdateParams {
+  const merged: AudioProcessingUpdateParams = {
+    sessionId: newer.sessionId,
+    microphoneGainDb: newer.microphoneGainDb,
+    microphoneMuted: newer.microphoneMuted
+  }
+  const systemAudioEnabled = newer.systemAudioEnabled ?? older.systemAudioEnabled
+  if (systemAudioEnabled !== undefined) merged.systemAudioEnabled = systemAudioEnabled
+  const systemAudioGainDb = newer.systemAudioGainDb ?? older.systemAudioGainDb
+  if (systemAudioGainDb !== undefined) merged.systemAudioGainDb = systemAudioGainDb
+  return merged
+}
+
+/**
+ * True when sending `left` after `right` would change nothing: same session,
+ * same mic state, and every optional field `left` sets already matches.
+ */
 function sameAudioProcessingParams(
   left: AudioProcessingUpdateParams,
   right: AudioProcessingUpdateParams | null
@@ -107,7 +138,10 @@ function sameAudioProcessingParams(
     right !== null &&
     left.sessionId === right.sessionId &&
     left.microphoneGainDb === right.microphoneGainDb &&
-    left.microphoneMuted === right.microphoneMuted
+    left.microphoneMuted === right.microphoneMuted &&
+    OPTIONAL_AUDIO_PROCESSING_FIELDS.every(
+      (field) => left[field] === undefined || left[field] === right[field]
+    )
   )
 }
 

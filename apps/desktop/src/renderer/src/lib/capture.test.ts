@@ -42,6 +42,7 @@ import {
   normalizeAudioSettings,
   normalizeMicrophoneSyncOffsetMs,
   normalizeStreamingSettings,
+  normalizeSystemAudioGainDb,
   normalizeVideoSettings,
   parseAudioSyncRecommendationJson,
   parseMicrophoneSyncOffsetInput,
@@ -951,6 +952,61 @@ describe('normalizeMicrophoneSyncOffsetMs', () => {
 
   it('uses the provided fallback when the value is not numeric', () => {
     expect(normalizeMicrophoneSyncOffsetMs('nope', -120)).toBe(-120)
+  })
+})
+
+describe('system audio settings (plan 069)', () => {
+  it('defaults to Off at -6 dB', () => {
+    expect(defaultCaptureConfig.audio.systemAudioEnabled).toBe(false)
+    expect(defaultCaptureConfig.audio.systemAudioGainDb).toBe(-6)
+  })
+
+  it('loads a config stored before system audio existed as Off at -6 dB', () => {
+    const legacy = normalizeAudioSettings({
+      microphoneGainDb: 4,
+      microphoneMuted: true,
+      microphoneSyncOffsetMs: 0
+    })
+    expect(legacy).toStrictEqual({
+      microphoneGainDb: 4,
+      microphoneMuted: true,
+      microphoneSyncOffsetMs: 0,
+      microphoneSyncOffsetUserSet: false,
+      systemAudioEnabled: false,
+      systemAudioGainDb: -6
+    })
+    expect(normalizeAudioSettings(undefined).systemAudioEnabled).toBe(false)
+    expect(normalizeAudioSettings(null).systemAudioGainDb).toBe(-6)
+  })
+
+  it('treats anything but an explicit true as Off', () => {
+    expect(normalizeAudioSettings({ systemAudioEnabled: true }).systemAudioEnabled).toBe(true)
+    expect(normalizeAudioSettings({ systemAudioEnabled: false }).systemAudioEnabled).toBe(false)
+    for (const junk of ['true', 1, null, {}]) {
+      expect(normalizeAudioSettings({ systemAudioEnabled: junk }).systemAudioEnabled).toBe(false)
+    }
+  })
+
+  it('clamps the level to -24..+12 dB and falls back to -6 for junk', () => {
+    expect(normalizeAudioSettings({ systemAudioGainDb: -3 }).systemAudioGainDb).toBe(-3)
+    expect(normalizeAudioSettings({ systemAudioGainDb: -60 }).systemAudioGainDb).toBe(-24)
+    expect(normalizeAudioSettings({ systemAudioGainDb: 40 }).systemAudioGainDb).toBe(12)
+    for (const junk of ['0', null, Number.NaN, Number.POSITIVE_INFINITY, true]) {
+      expect(normalizeSystemAudioGainDb(junk)).toBe(-6)
+    }
+  })
+
+  it('reads a stored localStorage config without system audio keys as Off', () => {
+    vi.stubGlobal('localStorage', {
+      getItem: () => JSON.stringify({ audio: { microphoneGainDb: 2, microphoneMuted: false } }),
+      setItem: vi.fn(),
+      removeItem: vi.fn()
+    })
+    expect(loadCaptureConfig().audio).toMatchObject({
+      microphoneGainDb: 2,
+      systemAudioEnabled: false,
+      systemAudioGainDb: -6
+    })
   })
 })
 
