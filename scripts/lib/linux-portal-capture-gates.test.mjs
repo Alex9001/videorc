@@ -6,6 +6,7 @@ import {
   PORTAL_WINDOW_SOURCE_ID,
   assessPortalDeviceList,
   assessPortalPreviewProof,
+  assessPortalRecording,
   assessPortalScreenStatus
 } from './linux-portal-capture-gates.mjs'
 
@@ -127,4 +128,37 @@ test('Phase D proof requires live compositor, portal layer, and non-synthetic pi
   assert.equal(nativeClaim.ok, false)
   assert.match(nativeClaim.failures.join('\n'), /electron-proof-surface/)
   assert.match(nativeClaim.failures.join('\n'), /cametal-layer/)
+})
+
+test('a portal recording must carry video at the requested size over most of the take', () => {
+  const expected = { width: 1920, height: 1080, recordingMs: 6000 }
+  const good = {
+    metrics: { hasVideo: true, width: 1920, height: 1080, durationSeconds: 5.8 },
+    sizeBytes: 2_000_000
+  }
+  assert.deepEqual(assessPortalRecording(good, expected), { ok: true, failures: [] })
+
+  const noVideo = assessPortalRecording(
+    { metrics: { hasVideo: false, durationSeconds: 5.8 }, sizeBytes: 2_000_000 },
+    expected
+  )
+  assert.equal(noVideo.ok, false)
+  assert.match(noVideo.failures.join(';'), /no video stream/)
+
+  const wrongSize = assessPortalRecording(
+    { ...good, metrics: { ...good.metrics, width: 2880, height: 1800 } },
+    expected
+  )
+  assert.match(wrongSize.failures.join(';'), /2880x1800 != requested 1920x1080/)
+
+  const short = assessPortalRecording(
+    { ...good, metrics: { ...good.metrics, durationSeconds: 1.2 } },
+    expected
+  )
+  assert.match(short.failures.join(';'), /duration 1.2s < 3.6s/)
+
+  const empty = assessPortalRecording({ ...good, sizeBytes: 900 }, expected)
+  assert.match(empty.failures.join(';'), /file size 900 bytes/)
+
+  assert.equal(assessPortalRecording(undefined, expected).ok, false)
 })
