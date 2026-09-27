@@ -713,3 +713,35 @@ audio/video packet ends and fails closed when timing cannot be measured. The
 100 ms bound remains unchanged. A real generated FLV regression covers both
 aligned and excessive audio tails. Earlier receiver passes with unknown tails
 are not acceptance evidence for that bound. Final results remain in PR #472.
+
+### Clean preview rerun and remaining hosted failures
+
+The user confirmed closing the test app during the earlier preview failures.
+With its windows left open, all 100 lifecycle cycles passed, as did the remaining
+studio components, including native reattachment and real ScreenCaptureKit
+recording analysis. The corrected freeform smoke waits for native surface
+readiness and sends valid CDP mouse-button state. Its latest full run passed all
+98 gestures and recording composition, but failed the unchanged landscape
+cadence bound: 36 ms versus 33 ms. The aggregate is not recorded as green.
+
+The `c3f7f38c` hosted native PCM matrix completed all 48 starts and owned cleanups,
+with 18 artifact passes and 30 failures. The clock correction reduced generated
+silence in one representative 1080p attempt from about 10.4 seconds to about
+1 ms. Remaining failures include measured silence, repeated frames and audio
+tails; these are retained as failures. A representative 720p tail had all 378
+supplied frames encoded, so encoder frame dropping alone does not explain it.
+
+Review also corrected Windows sibling tool discovery: an explicitly selected
+`ffmpeg.exe` now resolves its matching `ffprobe.exe`, and the incident runner
+passes both exact tool paths to the backend. This repairs a proven discovery
+defect; it does not establish that live RTMP tails are fixed.
+
+A bounded standalone OpenH264 comparison now precedes backend compilation in
+Windows CI and preserves paired outputs, exact tool/input hashes, frame counts,
+packet tails and bitrate measurements. Local FFmpeg 8.1.1 / OpenH264 2.6 evidence
+with a terminal noise burst reproduced 12–13 dropped frames and 375–408 ms tails
+with skipping enabled. Disabling it retained all 90 frames and reduced tails to
+8 ms, but the 1080p case averaged 10.96 Mbps against a requested 6 Mbps and
+exceeded the measured two-second rate-plus-buffer envelope. Neither setting is
+qualified by this diagnostic. Shipping frame-skipping policy is unchanged;
+the paired Windows run and the independent tone matrix remain separate evidence.

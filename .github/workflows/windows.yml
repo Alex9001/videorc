@@ -182,9 +182,24 @@ jobs:
           node-version: '24.6.0'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - id: ffmpeg-fetch
+        run: pnpm ffmpeg:fetch:windows
+      - name: Compare OpenH264 frame skipping on identical finite inputs
+        shell: pwsh
+        run: pnpm probe:windows-openh264 -- --output "$env:RUNNER_TEMP/openh264-comparison"
+      - name: Retain standalone OpenH264 comparison before backend compilation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-openh264-comparison
+          path: ${{ runner.temp }}/openh264-comparison
+          if-no-files-found: warn
+          retention-days: 14
       - id: backend-build
+        if: ${{ !cancelled() && steps.ffmpeg-fetch.outcome == 'success' }}
         run: cargo build -p videorc-backend
       - name: Prepare standalone diagnostic backend artifact
+        if: ${{ !cancelled() && steps.backend-build.outcome == 'success' }}
         shell: pwsh
         run: |
           $diagnosticDirectory = Join-Path $env:RUNNER_TEMP 'windows-diagnostic-backend'
@@ -208,9 +223,8 @@ jobs:
           path: ${{ runner.temp }}/windows-diagnostic-backend
           if-no-files-found: error
           retention-days: 14
-      - id: ffmpeg-fetch
-        run: pnpm ffmpeg:fetch:windows
       - name: Bounded Media Foundation diagnostic matrix
+        if: ${{ !cancelled() && steps.backend-build.outcome == 'success' }}
         shell: pwsh
         run: |
           pnpm smoke:windows-mf-probe -- --output "$env:RUNNER_TEMP/mf-probe"

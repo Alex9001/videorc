@@ -432,3 +432,26 @@ a physical flash/click reference. A nonzero runner exit means a failed or
 blocked diagnostic case, not a reason to relax the existing analyzer limits.
 The hosted Windows diagnostic job runs both synthetic audio controls; it cannot close
 the affected Intel/DirectShow incident or physical/provider acceptance.
+
+### Isolate OpenH264 frame skipping
+
+```powershell
+pnpm probe:windows-openh264 -- --output "$env:TEMP/openh264-comparison-new"
+```
+
+This bounded standalone comparison runs before backend compilation in Windows CI.
+It encodes the same finite, hashed 1080p30/720p30 raw video and stereo PCM inputs
+with `allow_skip_frames=1` and `0`. It uses both moving test content and a
+seeded noise burst during the final 500 ms to expose terminal-frame dropping.
+The encoder options match the Windows software path: OpenH264 bitrate control,
+6000 kbps maximum rate, 12000 kbit buffer, two-second GOP, AAC, `apad`, and
+`-shortest`. It records complete arguments, tool hashes/version, encoded frame
+count, packet end times, bytes, two-second bitrate, and encoding throughput.
+The finite file input deliberately removes capture pacing and native audio.
+
+Encoded outputs and reports are retained; large raw inputs are deleted after
+measurement. A successful command means the comparison completed, not that
+either skip setting meets release quality or bandwidth requirements. The report
+keeps the strict 100 ms packet-tail result and exposes any extra bandwidth used
+when frame skipping is disabled. No shipping encoder option is changed by this
+probe, and neither result replaces the full incident matrices.

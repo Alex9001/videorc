@@ -338,13 +338,16 @@ export function validateIncidentAudibleInterior(scenario, analysis) {
     silentSeconds += Math.max(0, silence.end - Math.max(cursor, silence.start))
     cursor = Math.max(cursor, silence.end)
   }
-  const pass = ['controlled', 'ffmpeg-control'].includes(scenario.audio)
-    ? silentSeconds < 0.02
-    : silentSeconds < (end - start) * 0.9
+  const allowedSilentSeconds = ['controlled', 'ffmpeg-control'].includes(scenario.audio)
+    ? 0.02
+    : (end - start) * 0.9
+  const pass = silentSeconds < allowedSilentSeconds
   return {
     pass,
     silentInteriorMs: silentSeconds * 1000,
-    reason: pass ? null : 'Expected audible content is silent across the measured interior'
+    reason: pass
+      ? null
+      : `Measured interior silence ${(silentSeconds * 1000).toFixed(1)}ms must be below ${(allowedSilentSeconds * 1000).toFixed(1)}ms for ${scenario.audio} audio`
   }
 }
 

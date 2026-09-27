@@ -212,6 +212,11 @@ test('incident audio evidence rejects silence spanning lead, measured interior a
   assert.equal(validateIncidentAudibleInterior({ audio: 'controlled' }, analysis).pass, true)
   analysis.findings.silences = [{ start: 1, end: 1.2, duration: 0.2 }]
   assert.equal(validateIncidentAudibleInterior({ audio: 'controlled' }, analysis).pass, false)
+  analysis.findings.silences = [{ start: 1, end: 1.03, duration: 0.03 }]
+  assert.match(
+    validateIncidentAudibleInterior({ audio: 'controlled' }, analysis).reason,
+    /silence 30.0ms must be below 20.0ms/
+  )
   analysis.findings.silences = []
   assert.equal(validateIncidentAudibleInterior({ audio: 'controlled' }, analysis).pass, true)
 })
