@@ -179,8 +179,8 @@ placeholder is still on the wire.
      session start whether or not system audio is on at start, so a live
      toggle never needs an FFmpeg change.
    - Each bus source gets a non-negative delay of `o_s - min(o_mic, o_sys)`.
-   - The bus can only delay, never advance (it plays out 50 ms behind the
-     wall clock). This split keeps every bus delay at zero or above.
+   - The bus can only delay, never advance (it plays out 50 ms, or 150 ms
+     per decision 13, behind the wall clock). This split keeps every bus delay at zero or above.
    - When `o_mic <= o_sys` the mic path is byte-identical to today.
 9. **Own-app exclusion.**
    - macOS: filter by display with `excludingApplications` set to every
@@ -191,6 +191,16 @@ placeholder is still on the wire.
      Electron main PID.
    - Library playback, Orcle voice and UI sounds therefore never land in the
      recording.
+   - **Amended after S0.** Excluding the app does not silence Chromium or
+     Electron renderer audio. It plays from the out-of-process audio service
+     helper, which SCK neither lists nor attributes to the app. On macOS the
+     Electron main process therefore appends
+     `disable-features=AudioServiceOutOfProcess`, so renderer audio plays
+     from the main process. The SCK filter then excludes the Electron main
+     app, found by the backend's parent PID.
+   - S5 and S7 re-check Library playback, the mic meter and Orcle with the
+     flag on. If the flag breaks any of them, STOP: the only other route is
+     CoreAudio process taps (macOS 14.2+).
 10. **Platforms.**
     - macOS 13+ ships first, through ScreenCaptureKit.
     - Windows 11 follows in S8 through WASAPI process loopback.
@@ -209,6 +219,23 @@ placeholder is still on the wire.
     - the bus renders zeros for it until then.
 
     `smoke:record-latency:gate` budgets must not move.
+
+    A delayed startup burst whose early frames are already behind the
+    cursor is trimmed, not queued.
+13. **Playout headroom (added after S0).** SCK delivers buffers 22–52 ms
+    after their last sample (median 35 ms), with startup bursts up to
+    665 ms.
+    - At the bus's 50 ms playout delay, about 31% of system frames would
+      land behind the cursor, which means constant crackle. At 150 ms the
+      loss is at most 0.45%, all from startup bursts.
+    - Sessions on a platform that supports system audio therefore run the
+      bus at `PLAYOUT_DELAY = 150 ms`, fixed at session start, whether or
+      not the switch is on.
+    - This changes only write timing. The FFmpeg input stays timestamped
+      by sample count, so mic-only PCM bytes stay identical. S2 proves that,
+      and S4 proves `smoke:record-latency:gate` stays green.
+    - Measured `o_sys = 0 ms` (S0: system audio trails the screen by
+      +5.6 ms on average at capture level). S7 re-measures it end to end.
 
 ## Slices
 
