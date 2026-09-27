@@ -4077,7 +4077,7 @@ mod linux {
     use crate::linux_portal_capture::{
         PortalCaptureState, RestoreTokenStore, parse_portal_source_id, portal_environment_available,
     };
-    use crate::linux_portal_session::{PortalStart, start_portal_session};
+    use crate::linux_portal_session::{PortalStart, portal_runtime, start_portal_session};
 
     pub fn run_native_screen_preview(
         config: NativeScreenPreviewConfig,
@@ -4098,15 +4098,12 @@ mod linux {
             ));
             return;
         }
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
+        // Never a per-capture runtime: the portal connection outlives this
+        // capture (see `portal_runtime`).
+        let runtime = match portal_runtime() {
             Ok(runtime) => runtime,
             Err(error) => {
-                let _ = startup_tx.send(NativeScreenStartup::Failed(format!(
-                    "portal capture runtime could not start: {error}"
-                )));
+                let _ = startup_tx.send(NativeScreenStartup::Failed(error));
                 return;
             }
         };
@@ -4196,11 +4193,10 @@ mod linux {
                 }
             },
         );
-        // Keep the session alive until the read ends: dropping the grant
-        // closes the portal session.
+        // Keep the session alive until the read ends, then close it so the
+        // compositor stops the share.
         let was_revoked = grant.revoked.load(Ordering::SeqCst);
-        drop(grant);
-        drop(runtime);
+        runtime.block_on(grant.close());
         match result {
             Ok(()) if was_revoked => {
                 let message = PortalCaptureState::Revoked.message();

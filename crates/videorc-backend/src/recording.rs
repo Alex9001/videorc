@@ -3287,7 +3287,12 @@ async fn start_session_with_timeline(
     };
     let has_session_audio = has_native_audio || silent_audio_fifo.is_some();
     let audio_tracks = capture_audio_tracks(&capture);
-    if matches!(capture.video, VideoInput::TestPattern) {
+    let active_screen = state.database.active_stream_screen()?;
+    let use_encoder_bridge =
+        should_use_compositor_encoder_bridge(&state, &params, active_screen.as_ref()).await?;
+    if matches!(capture.video, VideoInput::TestPattern)
+        && !linux_bridge_composes_native_sources(use_encoder_bridge, &params)
+    {
         let (code, message) = if matches!(params.layout.layout_preset, LayoutPreset::CameraOnly) {
             (
                 "camera-capture-fallback",
@@ -3311,9 +3316,6 @@ async fn start_session_with_timeline(
             message,
         )?;
     }
-    let active_screen = state.database.active_stream_screen()?;
-    let use_encoder_bridge =
-        should_use_compositor_encoder_bridge(&state, &params, active_screen.as_ref()).await?;
     emit_foundation_health_events(&state, &session_id, &params, use_encoder_bridge)?;
     // The legacy FFmpeg screen+camera overlay, side-by-side, and vertical stack
     // paths all rely on the camera device index. The protected compositor bridge
@@ -5182,7 +5184,9 @@ async fn start_session_with_timeline(
         Some(MicrophoneInput::AvFoundation { index }) => {
             Some(format!("microphone:avfoundation:{index}"))
         }
-        Some(MicrophoneInput::WindowsDshow { .. }) => params.sources.microphone_id.clone(),
+        Some(MicrophoneInput::WindowsDshow { .. } | MicrophoneInput::LinuxPulse { .. }) => {
+            params.sources.microphone_id.clone()
+        }
         Some(MicrophoneInput::SessionPcm { .. }) => pending_active
             .native_audio
             .as_ref()
@@ -5228,6 +5232,13 @@ async fn start_session_with_timeline(
             ));
         } else if cfg!(target_os = "windows") {
             sources.microphone_unavailable("Live microphone replacement requires the verified capture worker. This session keeps its initial microphone input.");
+        } else if cfg!(target_os = "linux")
+            && matches!(
+                capture.microphone.as_ref(),
+                Some(MicrophoneInput::LinuxPulse { .. })
+            )
+        {
+            sources.microphone_unavailable("Live microphone replacement is not available on Linux yet. This session keeps its initial microphone input.");
         }
         sources
             .snapshot(&session_id)
@@ -10625,6 +10636,21 @@ fn resolve_microphone_input(microphone_id: Option<&str>) -> Option<MicrophoneInp
             parse_windows_dshow_microphone_id(microphone_id)
                 .map(|device_name| MicrophoneInput::WindowsDshow { device_name })
         })
+        .or_else(|| {
+            crate::linux_pulse_audio::parse_linux_pulse_microphone_id(microphone_id)
+                .map(|source_name| MicrophoneInput::LinuxPulse { source_name })
+        })
+}
+
+/// Linux has no FFmpeg device `VideoInput` for portal screens or V4L2
+/// cameras: the compositor bridge composes them from the native preview
+/// frame stores. A `TestPattern` input there is a placeholder for the legacy
+/// path, not a fallback, unless the session really asked for the pattern.
+fn linux_bridge_composes_native_sources(
+    use_encoder_bridge: bool,
+    params: &StartSessionParams,
+) -> bool {
+    cfg!(target_os = "linux") && use_encoder_bridge && !params.sources.test_pattern
 }
 
 async fn resolve_primary_camera_video_input(
@@ -25909,6 +25935,19 @@ mod tests {
             capture.microphone,
             Some(MicrophoneInput::WindowsDshow {
                 device_name: "Microphone Array".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn linux_pulse_microphone_id_resolves_to_a_direct_pulse_input() {
+        let id = crate::linux_pulse_audio::linux_pulse_microphone_id(
+            "alsa_input.pci-0000_02_00.3.HiFi__Mic__source",
+        );
+        assert_eq!(
+            resolve_microphone_input(Some(&id)),
+            Some(MicrophoneInput::LinuxPulse {
+                source_name: "alsa_input.pci-0000_02_00.3.HiFi__Mic__source".to_string(),
             })
         );
     }

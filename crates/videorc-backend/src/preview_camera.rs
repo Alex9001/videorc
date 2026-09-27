@@ -52,7 +52,9 @@ const CAMERA_STOP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const WINDOWS_CAMERA_RATE_CAP_EPSILON_SECONDS: f64 = 0.000_001;
 
 fn native_camera_preview_thread_startup_timeout() -> Duration {
-    if cfg!(target_os = "windows") {
+    // FFmpeg-fed cameras (DirectShow, V4L2) pay a child spawn plus device
+    // negotiation per attempt before the first frame.
+    if cfg!(any(target_os = "windows", target_os = "linux")) {
         WINDOWS_CAMERA_PREVIEW_STARTUP_TIMEOUT
     } else {
         Duration::from_secs(4)
@@ -4073,6 +4075,7 @@ struct NativeCameraPreviewConfig {
 enum SelectedCameraSource {
     MacAvFoundation { unique_id: String },
     WindowsDshow { device_name: String },
+    LinuxV4l2 { device_path: String },
 }
 
 impl SelectedCameraSource {
@@ -4080,6 +4083,7 @@ impl SelectedCameraSource {
         match self {
             SelectedCameraSource::MacAvFoundation { unique_id } => unique_id,
             SelectedCameraSource::WindowsDshow { device_name } => device_name,
+            SelectedCameraSource::LinuxV4l2 { device_path } => device_path,
         }
     }
 }
@@ -4090,6 +4094,10 @@ fn selected_camera_source(camera_id: &str) -> Option<SelectedCameraSource> {
         .or_else(|| {
             parse_windows_dshow_camera_id(camera_id)
                 .map(|device_name| SelectedCameraSource::WindowsDshow { device_name })
+        })
+        .or_else(|| {
+            crate::linux_v4l2_camera::parse_linux_v4l2_camera_id(camera_id)
+                .map(|device_path| SelectedCameraSource::LinuxV4l2 { device_path })
         })
 }
 
@@ -4332,14 +4340,295 @@ fn run_native_camera_preview(
         windows::run_native_camera_preview(config, shared, stop_rx, startup_tx);
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::run_native_camera_preview(config, shared, stop_rx, startup_tx);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = config;
         let _ = shared;
         let _ = stop_rx;
         let _ = startup_tx.send(NativeCameraStartup::Failed(
-            "Native camera preview is only available on macOS.".to_string(),
+            "Native camera preview is only available on macOS, Windows and Linux.".to_string(),
         ));
+    }
+}
+
+/// Linux (L3): an owned FFmpeg V4L2 child writes scaled BGRA frames to the
+/// camera frame store, the Windows DirectShow shape. The capture box is the
+/// full output canvas (`camera_capture_target_dimensions`), so a layout
+/// switch never restarts the device.
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::io::Read;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::linux_v4l2_camera::{
+        V4l2StartFailure, classify_v4l2_failure, v4l2_preview_ffmpeg_args,
+    };
+    use crate::process_job::spawn_owned_std;
+
+    enum Attempt {
+        ProducedFrames,
+        Stopped,
+        FailedBeforeFirstFrame(String),
+    }
+
+    pub fn run_native_camera_preview(
+        config: NativeCameraPreviewConfig,
+        shared: Arc<StdMutex<PreviewCameraShared>>,
+        stop_rx: std_mpsc::Receiver<()>,
+        startup_tx: std_mpsc::Sender<NativeCameraStartup>,
+    ) {
+        let (width, height) = camera_capture_target_dimensions(&config.layout, &config.video);
+        let fps = config.video.fps.clamp(1, 120);
+        let Some(frame_len) = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            let _ = startup_tx.send(NativeCameraStartup::Failed(
+                "Linux camera preview dimensions are too large.".to_string(),
+            ));
+            return;
+        };
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        {
+            let stop_flag = Arc::clone(&stop_flag);
+            thread::spawn(move || {
+                let _ = stop_rx.recv();
+                stop_flag.store(true, Ordering::Release);
+            });
+        }
+
+        // Ask for the canvas size at the session rate (the driver settles on
+        // its nearest mode), then fall back to the device default.
+        let attempts = [Some((width, height, fps)), None];
+        let mut last_stderr = String::new();
+        for request in attempts {
+            if stop_flag.load(Ordering::Acquire) {
+                return;
+            }
+            match run_attempt(
+                &config,
+                &shared,
+                &startup_tx,
+                &stop_flag,
+                (width, height, fps, frame_len),
+                request,
+            ) {
+                Attempt::ProducedFrames | Attempt::Stopped => return,
+                Attempt::FailedBeforeFirstFrame(stderr) => {
+                    let fatal = matches!(
+                        classify_v4l2_failure(&config.unique_id, &stderr),
+                        V4l2StartFailure::PermissionNeeded(_) | V4l2StartFailure::DeviceMissing(_)
+                    );
+                    last_stderr = stderr;
+                    if fatal {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = startup_tx.send(
+            match classify_v4l2_failure(&config.unique_id, &last_stderr) {
+                V4l2StartFailure::PermissionNeeded(message) => {
+                    NativeCameraStartup::PermissionNeeded(message)
+                }
+                V4l2StartFailure::DeviceMissing(message) => {
+                    NativeCameraStartup::DeviceMissing(message)
+                }
+                V4l2StartFailure::Failed(message) => NativeCameraStartup::Failed(message),
+            },
+        );
+    }
+
+    fn run_attempt(
+        config: &NativeCameraPreviewConfig,
+        shared: &Arc<StdMutex<PreviewCameraShared>>,
+        startup_tx: &std_mpsc::Sender<NativeCameraStartup>,
+        stop_flag: &Arc<AtomicBool>,
+        (width, height, fps, frame_len): (u32, u32, u32, usize),
+        request: Option<(u32, u32, u32)>,
+    ) -> Attempt {
+        let mut command = Command::new(&config.ffmpeg_path);
+        command
+            .args(v4l2_preview_ffmpeg_args(
+                &config.unique_id,
+                width,
+                height,
+                request,
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match spawn_owned_std(&mut command) {
+            Ok(child) => child,
+            Err(error) => {
+                return Attempt::FailedBeforeFirstFrame(format!(
+                    "Could not start {}: {error}",
+                    config.ffmpeg_path
+                ));
+            }
+        };
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Attempt::FailedBeforeFirstFrame("FFmpeg stdout was not piped".to_string());
+        };
+        let stderr = collect_stderr(child.stderr.take());
+        let child = Arc::new(StdMutex::new(child));
+        let done = Arc::new(AtomicBool::new(false));
+        let killer =
+            spawn_stop_flag_killer(Arc::clone(&child), Arc::clone(&done), Arc::clone(stop_flag));
+
+        let mut buffer = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .frame_store
+            .checkout_overwrite_buffer(frame_len);
+        let mut startup_sent = false;
+        loop {
+            if stdout.read_exact(&mut buffer).is_err() {
+                break;
+            }
+            buffer = publish_bgra_frame(shared, width, height, buffer);
+            if !startup_sent {
+                let _ = startup_tx.send(NativeCameraStartup::Live {
+                    requested_width: width,
+                    requested_height: height,
+                    selected_format_width: request.map_or(width, |request| request.0),
+                    selected_format_height: request.map_or(height, |request| request.1),
+                    selected_format_min_fps: fps as f64,
+                    selected_format_max_fps: fps as f64,
+                    width,
+                    height,
+                    selected_fps: fps as f64,
+                    message: Some(if request.is_some() {
+                        format!(
+                            "Linux V4L2 camera preview requested {width}x{height}@{fps} from {}; the driver streams its nearest mode, scaled to fit.",
+                            config.unique_id
+                        )
+                    } else {
+                        format!(
+                            "Linux V4L2 camera preview is using the device default mode of {}, scaled to {width}x{height}.",
+                            config.unique_id
+                        )
+                    }),
+                });
+                startup_sent = true;
+            }
+        }
+
+        done.store(true, Ordering::Release);
+        let _ = child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .wait();
+        let _ = killer.join();
+        if startup_sent {
+            Attempt::ProducedFrames
+        } else if stop_flag.load(Ordering::Acquire) {
+            Attempt::Stopped
+        } else {
+            Attempt::FailedBeforeFirstFrame(
+                String::from_utf8_lossy(
+                    &stderr
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                )
+                .into_owned(),
+            )
+        }
+    }
+
+    fn collect_stderr(stderr: Option<std::process::ChildStderr>) -> Arc<StdMutex<Vec<u8>>> {
+        let bytes = Arc::new(StdMutex::new(Vec::new()));
+        if let Some(mut stderr) = stderr {
+            let target = Arc::clone(&bytes);
+            thread::spawn(move || {
+                let mut chunk = [0_u8; 4096];
+                while let Ok(read) = stderr.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    let mut target = target
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // Keep the tail: FFmpeg's last lines carry the reason.
+                    target.extend_from_slice(&chunk[..read]);
+                    let excess = target.len().saturating_sub(16 * 1024);
+                    target.drain(..excess);
+                }
+            });
+        }
+        bytes
+    }
+
+    fn spawn_stop_flag_killer(
+        child: Arc<StdMutex<Child>>,
+        done: Arc<AtomicBool>,
+        stop_flag: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            while !done.load(Ordering::Acquire) {
+                if stop_flag.load(Ordering::Acquire) {
+                    let _ = child
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .kill();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+    }
+
+    fn publish_bgra_frame(
+        shared: &Arc<StdMutex<PreviewCameraShared>>,
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        let callback_started_at = Instant::now();
+        let frame_len = bytes.len();
+        let mut guard = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .capture_timings
+            .record_callback_at(callback_started_at);
+        let now = Instant::now();
+        guard.frames_captured = guard.frames_captured.saturating_add(1);
+        guard.frames_in_window = guard.frames_in_window.saturating_add(1);
+        let window_started = *guard.window_started_at.get_or_insert(now);
+        let elapsed = window_started.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            guard.source_fps =
+                Some(guard.frames_in_window as f64 / elapsed.as_secs_f64().max(0.001));
+            guard.frames_in_window = 0;
+            guard.window_started_at = Some(now);
+        }
+        let sequence = guard.frames_captured;
+        guard.frame_store.publish_with_metadata(
+            sequence,
+            width,
+            height,
+            PreviewCameraPixelFormat::Bgra8,
+            (),
+            now,
+            bytes,
+        );
+        let next_buffer = guard.frame_store.checkout_overwrite_buffer(frame_len);
+        let publish_ms = callback_started_at.elapsed().as_secs_f64() * 1000.0;
+        guard
+            .capture_timings
+            .record_valid_frame(0.0, 0.0, publish_ms, frame_len as u64);
+        next_buffer
     }
 }
 

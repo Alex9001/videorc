@@ -116,3 +116,30 @@ export function assessPortalPreviewProof({ compositor, surface } = {}) {
   }
   return { ok: failures.length === 0, failures }
 }
+
+/**
+ * Portal → file: a portal-source session must finalize a real recording, not
+ * just a live preview. The artifact needs a decodable video stream at the
+ * requested size, a duration that covers most of the take, and more bytes
+ * than an empty container.
+ */
+export function assessPortalRecording(
+  { metrics, sizeBytes } = {},
+  { width, height, recordingMs, minBytes = 64 * 1024, minDurationRatio = 0.6 } = {}
+) {
+  const failures = []
+  if (!metrics?.hasVideo) failures.push('recording has no video stream')
+  if (metrics?.hasVideo && (metrics.width !== width || metrics.height !== height)) {
+    failures.push(`dimensions ${metrics.width}x${metrics.height} != requested ${width}x${height}`)
+  }
+  const minSeconds = (recordingMs / 1000) * minDurationRatio
+  if (!(metrics?.durationSeconds >= minSeconds)) {
+    failures.push(
+      `duration ${metrics?.durationSeconds ?? 'missing'}s < ${minSeconds.toFixed(1)}s of a ${recordingMs}ms take`
+    )
+  }
+  if (!(sizeBytes >= minBytes)) {
+    failures.push(`file size ${sizeBytes ?? 0} bytes < ${minBytes}`)
+  }
+  return { ok: failures.length === 0, failures }
+}

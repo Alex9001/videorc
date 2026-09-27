@@ -54,8 +54,7 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
 
     #[cfg(target_os = "linux")]
     {
-        let _ = ffmpeg_path;
-        list_linux_devices()
+        list_linux_devices(ffmpeg_path).await
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -65,21 +64,22 @@ pub async fn list_devices(ffmpeg_path: &str) -> DeviceList {
     }
 }
 
-/// Linux (Plan 0006): the portal screen/window entries plus the system
-/// audio placeholder. Cameras and microphones stay unlisted until their
-/// Linux arms (L2/L3 of the port plan) exist, and the warning says so.
+/// Linux: the portal screen/window entries (Plan 0006, L4), V4L2 cameras
+/// (L3), PulseAudio / PipeWire microphones through FFmpeg (L2), and the
+/// system audio placeholder.
 #[cfg(target_os = "linux")]
-fn list_linux_devices() -> DeviceList {
+async fn list_linux_devices(ffmpeg_path: &str) -> DeviceList {
     let native_capture_sources = list_native_capture_sources();
+    let cameras = list_native_cameras();
     let mut devices = Vec::new();
     let mut warnings = Vec::new();
     warnings.extend(native_capture_sources.warnings);
     devices.extend(native_capture_sources.devices);
+    warnings.extend(cameras.warnings);
+    devices.extend(cameras.devices);
+    let ffmpeg_path = crate::ffmpeg::resolve_ffmpeg_path_ref(Some(ffmpeg_path));
+    devices.extend(crate::linux_pulse_audio::list_linux_microphones(&ffmpeg_path).await);
     devices.push(system_audio_placeholder());
-    warnings.push(
-        "Camera and microphone probing is not implemented on Linux yet (port plan L2/L3)."
-            .to_string(),
-    );
     DeviceList { devices, warnings }
 }
 
@@ -432,6 +432,22 @@ fn normalize_device_name(name: &str) -> String {
 }
 
 pub async fn sample_audio_meter(params: AudioMeterParams) -> AudioMeterResult {
+    // Linux (L2): FFmpeg reads the PulseAudio/PipeWire source directly. The
+    // level is the raw device signal, like the macOS FFmpeg fallback below.
+    if let Some(source_name) = params
+        .microphone_id
+        .as_deref()
+        .filter(|_| cfg!(target_os = "linux"))
+        .and_then(crate::linux_pulse_audio::parse_linux_pulse_microphone_id)
+    {
+        let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path);
+        return run_ffmpeg_volume_meter(
+            &ffmpeg_path,
+            crate::linux_pulse_audio::pulse_meter_args(&source_name),
+        )
+        .await;
+    }
+
     if !cfg!(target_os = "macos") {
         return AudioMeterResult {
             status: AudioMeterStatus::Unavailable,
@@ -477,9 +493,9 @@ pub async fn sample_audio_meter(params: AudioMeterParams) -> AudioMeterResult {
     };
 
     let ffmpeg_path = resolve_ffmpeg_path(params.ffmpeg_path);
-    let mut command = Command::new(&ffmpeg_path);
-    command
-        .args([
+    run_ffmpeg_volume_meter(
+        &ffmpeg_path,
+        [
             "-hide_banner",
             "-f",
             "avfoundation",
@@ -494,7 +510,19 @@ pub async fn sample_audio_meter(params: AudioMeterParams) -> AudioMeterResult {
             "-f",
             "null",
             "-",
-        ])
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    )
+    .await
+}
+
+/// Runs a bounded FFmpeg `volumedetect` capture and maps its levels.
+async fn run_ffmpeg_volume_meter(ffmpeg_path: &str, args: Vec<String>) -> AudioMeterResult {
+    let mut command = Command::new(ffmpeg_path);
+    command
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
