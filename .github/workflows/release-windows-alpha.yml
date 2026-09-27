@@ -354,7 +354,11 @@ jobs:
     steps:
       - run: echo 'Source stability, advisory and exact packaged artifact gates passed.'
   sign:
-    if: ${{ vars.VIDEORC_RELEASE_CONTROLLER_ENABLED != 'true' }}
+    # The legacy path skips `resolve`, and a skipped ancestor fails the implicit
+    # success() check, so name the status explicitly or signing never runs.
+    if: >-
+      ${{ !cancelled() && needs.unsigned.result == 'success' && vars.VIDEORC_RELEASE_CONTROLLER_ENABLED
+      != 'true' }}
     name: OIDC-sign, validate, and store exact candidate
     needs: unsigned
     runs-on: windows-latest

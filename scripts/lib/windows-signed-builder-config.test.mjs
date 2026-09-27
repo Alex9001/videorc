@@ -182,6 +182,9 @@ describe('signed Windows electron-builder config', () => {
     assert.equal((unsignedJob.match(/\$\{\{ secrets\./g) ?? []).length, unsignedSecrets.length)
 
     assert.match(signingJob, /needs: unsigned/)
+    // `unsigned` needs `resolve`, which the legacy path skips. Without an
+    // explicit status check the implicit success() skips signing too.
+    assert.match(signingJob, /!cancelled\(\) && needs\.unsigned\.result == 'success'/)
     assert.match(signingJob, /environment: windows-alpha-release/)
     assert.match(signingJob, /id-token: write/)
     assert.match(signingJob, /pnpm install --frozen-lockfile --ignore-scripts/)
