@@ -13434,12 +13434,16 @@ app.whenReady().then(async () => {
       if (command.grantConsent !== undefined && typeof command.grantConsent !== 'boolean') {
         return Promise.reject(new Error('Orcle consent grant must be a boolean.'))
       }
+      if (command.listen !== undefined && typeof command.listen !== 'boolean') {
+        return Promise.reject(new Error('Orcle listening must be a boolean.'))
+      }
       return commentsCommandBroker.request(requestId, () => {
         if (!mainWindow || mainWindow.webContents.isDestroyed()) return false
         sendElectronEvent(mainWindow.webContents, 'comments-window:cohost-enable-request', {
           requestId,
           enabled: command.enabled,
-          ...(command.grantConsent === true ? { grantConsent: true } : {})
+          ...(command.grantConsent === true ? { grantConsent: true } : {}),
+          ...(typeof command.listen === 'boolean' ? { listen: command.listen } : {})
         })
         return true
       })

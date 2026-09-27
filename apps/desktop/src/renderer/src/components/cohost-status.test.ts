@@ -2,8 +2,8 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
-import { CohostStatus } from '@/components/cohost-status'
-import type { CohostQuestion, CohostState } from '@/lib/backend'
+import { CohostListeningIndicator, CohostStatus } from '@/components/cohost-status'
+import type { CohostListening, CohostQuestion, CohostState } from '@/lib/backend'
 import { offCohostState } from '@/lib/backend'
 import type { EntitlementUiGate } from '@/lib/entitlement-ui'
 
@@ -154,5 +154,53 @@ describe('CohostStatus', () => {
 
   it('keeps the trigger draggable-safe in the frameless window header', () => {
     expect(renderStatus()).toContain('[-webkit-app-region:no-drag]')
+  })
+})
+
+describe('CohostListeningIndicator (plan 068)', () => {
+  const render = (listening: CohostListening | undefined): string =>
+    renderToStaticMarkup(createElement(CohostListeningIndicator, { listening }))
+
+  it('shows nothing while listening is off', () => {
+    expect(render(undefined)).toBe('')
+    expect(render({ state: 'off' })).toBe('')
+  })
+
+  it('says Listening with a green microphone', () => {
+    const markup = render({ state: 'on' })
+    expect(markup).toContain('data-slot="cohost-listening"')
+    expect(markup).toContain('data-listening-state="on"')
+    expect(markup).toContain('>Listening<')
+    expect(markup).toContain('text-success')
+    expect(markup).toContain('title="Orcle hears your microphone as text."')
+  })
+
+  it('says Starting to listen without a tone', () => {
+    const markup = render({ state: 'starting' })
+    expect(markup).toContain('>Starting to listen<')
+    expect(markup).not.toContain('text-success')
+    expect(markup).not.toContain('text-warning')
+  })
+
+  it('names a block plainly and keeps the backend sentence on hover', () => {
+    const markup = render({
+      state: 'blocked',
+      reasonCode: 'no-microphone',
+      message: 'Select a microphone so Orcle can hear you.'
+    })
+    expect(markup).toContain('>Not listening: no microphone selected<')
+    expect(markup).toContain('text-warning')
+    expect(markup).toContain('title="Select a microphone so Orcle can hear you."')
+  })
+
+  it('keeps only the microphone in a tight header', () => {
+    expect(render({ state: 'on' })).toMatch(
+      /class="[^"]*@max-\[330px\]\/chat-header:sr-only[^"]*">Listening</
+    )
+  })
+
+  it('adds the listening sentence to the status tooltip', () => {
+    const markup = renderStatus({ state: listening({ listening: { state: 'on' } }) })
+    expect(markup).toContain('Orcle hears your microphone as text.')
   })
 })

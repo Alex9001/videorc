@@ -6,6 +6,8 @@ import type {
   CohostFlagAction,
   CohostFlagKind,
   CohostFlagTarget,
+  CohostListening,
+  CohostListeningState,
   CohostMoodScores,
   CohostPriority,
   CohostQuestion,
@@ -33,12 +35,20 @@ export {
 // is a pure derivation of the last `cohost.state` event so the pane, the
 // destination chip and the detached Comments window cannot disagree.
 
+/** What Orcle does with chat, the half of the consent every Orcle user gets. */
+export const COHOST_CHAT_CONSENT_SENTENCE = 'Orcle reads live chat with Videorc cloud AI.'
+
 /**
- * What Orcle sends, in one sentence (plan 060 D11). Every consent surface
- * (Settings, the pane notice, the status popover) repeats it verbatim.
+ * What Orcle sends (plan 060 D11, plan 068 D3). The consent surfaces that stand
+ * alone (the pane notice, the status popover) repeat it verbatim; Settings
+ * shows the chat half beside Enable Orcle and the listening half beside its
+ * own switch.
  */
-export const COHOST_CONSENT_SENTENCE =
-  'Orcle reads live chat with Videorc cloud AI; while live captions are on, it also reads short windows of what you say, as text (never audio), which are not kept.'
+export const COHOST_CONSENT_SENTENCE = `${COHOST_CHAT_CONSENT_SENTENCE} If you turn on listening, it also hears your microphone while you're live, as text (never stored as audio); a transcript is saved with your recording on this computer and nothing is kept on Videorc servers.`
+
+/** The listening half, as the description of Settings' listening switch. */
+export const COHOST_LISTEN_CONSENT_SENTENCE =
+  "Orcle hears your microphone while you're live, as text (never stored as audio), even with live captions off. A transcript is saved with your recording on this computer; nothing is kept on Videorc servers."
 
 export const EMPTY_COHOST_STATE: CohostState = {
   sessionId: null,
@@ -607,4 +617,149 @@ export function cohostNudgeVisible({
   if (enabled || !gateAllowed || !consented) return false
   if (dismissedForever) return false
   return dismissedSessionId !== sessionId
+}
+
+// --- Listening (plan 068) ----------------------------------------------------
+
+/** One compact label and one plain sentence for whether Orcle hears the
+ * streamer. `off` has no view: an unused feature shows nothing. */
+export interface CohostListeningView {
+  state: Exclude<CohostListeningState, 'off'>
+  /** "Listening", "Starting to listen", "Not listening: no microphone selected". */
+  label: string
+  /** The tooltip sentence: the backend's own words while blocked. */
+  detail: string
+}
+
+/** Why listening is blocked, as the streamer would say it. Codes the desktop
+ * does not know read "Not listening" with the backend's sentence on hover. */
+const COHOST_LISTEN_BLOCKED_REASONS: ReadonlyMap<string, string> = new Map([
+  ['no-capture', 'not live'],
+  ['no-microphone', 'no microphone selected'],
+  ['signed-out', 'sign in'],
+  ['unauthorized', 'sign in'],
+  ['signing-out', 'signing out'],
+  ['shutting-down', 'Videorc is closing'],
+  ['service-unavailable', "can't reach Videorc"],
+  ['consent-required', 'turn on cloud AI'],
+  ['cloud-ai-premium-required', 'needs Premium'],
+  ['listen-monthly-quota-exhausted', 'monthly listening time used up'],
+  ['captions-monthly-quota-exhausted', 'monthly caption time used up'],
+  ['listen-disabled', 'unavailable right now']
+])
+
+export const COHOST_LISTEN_QUOTA_REASON = 'listen-monthly-quota-exhausted'
+
+/** "98 h 20 min", "12 min", "under a minute"; null when unknown. */
+export function cohostListenTimeLabel(seconds: number | null | undefined): string | null {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return null
+  if (seconds < 60) return 'under a minute'
+  const totalMinutes = Math.floor(seconds / 60)
+  if (totalMinutes < 60) return `${totalMinutes} min`
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  return minutes > 0 ? `${hours} h ${minutes} min` : `${hours} h`
+}
+
+/**
+ * The monthly listening allowance in one line, for Settings and the tooltip.
+ * The server reports it only on a chunk it metered as listening, so it is
+ * null most of the time, and a used-up month says so plainly.
+ */
+export function cohostListenAllowanceLabel(
+  listening: CohostListening | null | undefined
+): string | null {
+  if (!listening) return null
+  if (listening.state === 'blocked' && listening.reasonCode === COHOST_LISTEN_QUOTA_REASON) {
+    return 'Your listening time for this month is used up.'
+  }
+  if (listening.remainingSeconds === 0) return 'No listening time left this month.'
+  const time = cohostListenTimeLabel(listening.remainingSeconds)
+  if (!time) return null
+  return `${time.charAt(0).toUpperCase()}${time.slice(1)} of listening left this month.`
+}
+
+export function cohostListeningView(
+  listening: CohostListening | null | undefined
+): CohostListeningView | null {
+  switch (listening?.state) {
+    case 'starting':
+      return {
+        state: 'starting',
+        label: 'Starting to listen',
+        detail: 'Orcle is starting to hear your microphone.'
+      }
+    case 'on': {
+      const allowance = cohostListenAllowanceLabel(listening)
+      const heard = 'Orcle hears your microphone as text.'
+      return {
+        state: 'on',
+        label: 'Listening',
+        detail: allowance ? `${heard} ${allowance}` : heard
+      }
+    }
+    case 'blocked': {
+      const reason = listening.reasonCode
+        ? COHOST_LISTEN_BLOCKED_REASONS.get(listening.reasonCode)
+        : undefined
+      return {
+        state: 'blocked',
+        label: reason ? `Not listening: ${reason}` : 'Not listening',
+        detail: listening.message?.trim() || "Orcle can't hear you right now."
+      }
+    }
+    default:
+      return null
+  }
+}
+
+// --- Listening prompt (plan 068 D3) -------------------------------------------
+
+/** Persisted once the streamer answers the one-time card either way. */
+export const COHOST_LISTEN_PROMPT_STORAGE_KEY = 'videorc.orcleListenPromptDismissed'
+
+/**
+ * The one-time "Orcle can hear you" card: only for someone who runs Orcle,
+ * has listening off, and has not answered it. `listen` unknown (a relay that
+ * predates the setting) never shows it.
+ */
+export function cohostListenPromptVisible({
+  enabled,
+  listen,
+  dismissed
+}: {
+  enabled: boolean
+  listen: boolean | undefined
+  dismissed: boolean
+}): boolean {
+  return enabled && listen === false && !dismissed
+}
+
+function localStorageOrNull(): Storage | null {
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage
+  } catch {
+    return null
+  }
+}
+
+export function readCohostListenPromptDismissed(
+  storage: Pick<Storage, 'getItem'> | null = localStorageOrNull()
+): boolean {
+  try {
+    return cohostNudgeDismissedFromStorage(storage?.getItem(COHOST_LISTEN_PROMPT_STORAGE_KEY))
+  } catch {
+    return false
+  }
+}
+
+/** Best effort: blocked storage keeps the answer for this window's life only. */
+export function persistCohostListenPromptDismissed(
+  storage: Pick<Storage, 'setItem'> | null = localStorageOrNull()
+): void {
+  try {
+    storage?.setItem(COHOST_LISTEN_PROMPT_STORAGE_KEY, '1')
+  } catch {
+    // Private window or blocked site data: nothing to persist into.
+  }
 }

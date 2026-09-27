@@ -1,4 +1,4 @@
-import { ChevronDownIcon, CohostIcon } from '@/components/icons'
+import { ChevronDownIcon, CohostIcon, MicrophoneIcon } from '@/components/icons'
 import {
   useEffect,
   useMemo,
@@ -12,6 +12,7 @@ import {
 import { CohostFlagRow } from '@/components/cohost-flag-row'
 import { CohostQuestionRow } from '@/components/cohost-question-row'
 import { CohostPresenceDot, CohostTypingDots } from '@/components/cohost-status'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
@@ -28,12 +29,15 @@ import {
   cohostErrorDetailText,
   cohostFlagRowKey,
   cohostHighlightMessageId,
+  cohostListenPromptVisible,
   cohostMoodScoresLabel,
   cohostPaneMode,
   cohostQuestionRowKey,
   cohostRowAt,
   cohostRows,
   moveCohostSelection,
+  persistCohostListenPromptDismissed,
+  readCohostListenPromptDismissed,
   reduceCohostUnread,
   resolveCohostSelection,
   sortedCohostFlags,
@@ -521,6 +525,60 @@ export function CohostPane({
         ) : null}
       </CollapsibleContent>
     </Collapsible>
+  )
+}
+
+/**
+ * The one-time "Orcle can hear you" card (plan 068 D3) at the top of the
+ * Orcle pane, for someone who already runs Orcle with listening off. Either
+ * answer is final: Turn on and Not now both persist, so it never comes back.
+ * A flush Alert row, not a card on a card; the words say what listening sends
+ * before the streamer opts in.
+ */
+export function CohostListenPrompt({
+  enabled,
+  listen,
+  onTurnOn
+}: {
+  /** Orcle can run here: Premium, cloud-AI consent, and Orcle on. */
+  enabled: boolean
+  /** Persisted `cohost.settings.listen`; unknown never shows the card. */
+  listen: boolean | undefined
+  onTurnOn: () => void
+}): ReactElement | null {
+  const [dismissed, setDismissed] = useState(() => readCohostListenPromptDismissed())
+  if (!cohostListenPromptVisible({ enabled, listen, dismissed })) return null
+  const answer = (): void => {
+    setDismissed(true)
+    persistCohostListenPromptDismissed()
+  }
+  return (
+    <div className="shrink-0 p-2" data-slot="cohost-listen-prompt">
+      <Alert aria-label="Orcle can hear you while you're live" role="group">
+        <MicrophoneIcon aria-hidden weight="duotone" />
+        <AlertTitle className="text-xs">Orcle can hear you while you&apos;re live</AlertTitle>
+        <AlertDescription className="text-xs">
+          It hears your mic as text (never stored as audio) and saves a transcript with your
+          recording on this computer.
+        </AlertDescription>
+        <div className="col-start-2 mt-1.5 flex flex-wrap gap-1">
+          <Button
+            size="xs"
+            type="button"
+            variant="secondary"
+            onClick={() => {
+              answer()
+              onTurnOn()
+            }}
+          >
+            Turn on
+          </Button>
+          <Button size="xs" type="button" variant="ghost" onClick={answer}>
+            Not now
+          </Button>
+        </div>
+      </Alert>
+    </div>
   )
 }
 

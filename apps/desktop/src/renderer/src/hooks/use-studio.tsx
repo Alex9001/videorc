@@ -3712,6 +3712,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const cohostGate = useMemo(() => liveCohostGate(entitlements), [entitlements])
   const cohostEnabled = cohostSettings?.enabled === true
+  const cohostListen = cohostSettings?.listen === true
   const cohostLiveSessionId = liveChatSnapshot.sessionId ?? null
 
   // Persisted co-host preferences live in the backend profile, not in local
@@ -3907,9 +3908,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       entitlementReason: cohostGate.allowed ? null : cohostGate.reason,
       upgradeUrl: (cohostGate.allowed ? undefined : cohostGate.upgradeUrl) ?? null,
       consented: aiConsent,
-      enabled: cohostEnabled
+      enabled: cohostEnabled,
+      listen: cohostListen
     }),
-    [aiConsent, cohostEnabled, cohostGate, cohostState]
+    [aiConsent, cohostEnabled, cohostGate, cohostListen, cohostState]
   )
 
   const cohostWindowStateRef = useRef(cohostWindowState)
@@ -3918,21 +3920,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     void window.videorc?.pushCohostWindowState?.(cohostWindowState)
   }, [cohostWindowState])
 
-  // "Turn on co-host" from the Comments window's presence popover or nudge.
-  // Both settings (engine enabled, cloud-AI consent) are main-renderer owned,
-  // so the window asks and gets the resolved window state back.
+  // "Turn on co-host" from the Comments window's presence popover or nudge, and
+  // "Turn on" listening from its one-time card (plan 068 D3). The settings
+  // (engine enabled, listening, cloud-AI consent) are main-renderer owned, so
+  // the window asks and gets the resolved window state back.
   useEffect(() => {
     const off = window.videorc?.onCohostEnableRequest?.((command: CohostEnableCommand) => {
       void (async () => {
         if (command.grantConsent === true) setAiConsent(true)
-        const settingsPatch: CohostSettingsPatch = { enabled: command.enabled }
+        const settingsPatch: CohostSettingsPatch = {
+          enabled: command.enabled,
+          ...(typeof command.listen === 'boolean' ? { listen: command.listen } : {})
+        }
         if (!client) throw new Error('Backend socket is not connected.')
         const next = await client.request<CohostSettings>('cohost.settings.set', settingsPatch)
         setCohostSettings(next)
         return {
           ...cohostWindowStateRef.current,
           consented: command.grantConsent === true || cohostWindowStateRef.current.consented,
-          enabled: next.enabled
+          enabled: next.enabled,
+          listen: next.listen === true
         } satisfies CohostWindowState
       })()
         .then(async (state) => {

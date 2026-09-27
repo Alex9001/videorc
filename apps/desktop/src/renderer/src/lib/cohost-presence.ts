@@ -1,5 +1,10 @@
 import type { CohostQuestion, CohostState } from './backend'
-import { cohostErrorDetail, cohostErrorDetailText, cohostReasonLabel } from './cohost-view'
+import {
+  cohostErrorDetail,
+  cohostErrorDetailText,
+  cohostListeningView,
+  cohostReasonLabel
+} from './cohost-view'
 
 // Co-host presence (W2). One pure derivation of `cohost.state` that every
 // surface renders: the Comments window header, the pane's segment header and
@@ -151,6 +156,10 @@ function presenceTooltip(
   if (nextPass) lines.push(`next pass in ${nextPass}`)
 
   if (state?.partial === true) lines.push('Chat outran one AI pass; the newest messages were used.')
+
+  // Whether Orcle hears the streamer (plan 068): a sentence, never a second dot.
+  const listening = cohostListeningView(state?.listening)
+  if (listening) lines.push(listening.detail)
 
   // The failed tick in the server's own words — the one thing a streamer can
   // paste into a bug report. Only ever shown on a state that actually failed.

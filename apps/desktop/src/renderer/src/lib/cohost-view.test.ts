@@ -33,9 +33,15 @@ import {
   cohostErrorToastMessage,
   cohostFlagRowKey,
   cohostHighlightMessageId,
+  cohostListenAllowanceLabel,
+  cohostListeningView,
+  cohostListenPromptVisible,
+  cohostListenTimeLabel,
   cohostNudgeDismissedFromStorage,
   cohostNudgeVisible,
   cohostPaneMode,
+  persistCohostListenPromptDismissed,
+  readCohostListenPromptDismissed,
   cohostQuestionRowKey,
   cohostQuestionToast,
   cohostQuestionToastMessage,
@@ -48,6 +54,10 @@ import {
   sortedCohostFlags,
   sortedCohostQuestions,
   trimDraftToCap,
+  COHOST_CHAT_CONSENT_SENTENCE,
+  COHOST_CONSENT_SENTENCE,
+  COHOST_LISTEN_CONSENT_SENTENCE,
+  COHOST_LISTEN_PROMPT_STORAGE_KEY,
   COHOST_QUESTION_TOAST_THROTTLE_MS,
   EMPTY_COHOST_STATE,
   EMPTY_COHOST_UNREAD
@@ -787,5 +797,154 @@ describe('tick wire v2 view', () => {
     expect(cohostMoodScoresLabel({ hype: 0.2, tension: 0.7, confusion: 0.1 })).toBe(
       'Hype 20% · Tension 70% · Confusion 10%'
     )
+  })
+})
+
+describe('listening (plan 068)', () => {
+  it('shows nothing while listening is off or unknown', () => {
+    expect(cohostListeningView(undefined)).toBeNull()
+    expect(cohostListeningView(null)).toBeNull()
+    expect(cohostListeningView({ state: 'off' })).toBeNull()
+  })
+
+  it('says Listening and Starting to listen in a word or three', () => {
+    expect(cohostListeningView({ state: 'on' })).toEqual({
+      state: 'on',
+      label: 'Listening',
+      detail: 'Orcle hears your microphone as text.'
+    })
+    expect(cohostListeningView({ state: 'on', remainingSeconds: 7_200 })?.detail).toBe(
+      'Orcle hears your microphone as text. 2 h of listening left this month.'
+    )
+    expect(cohostListeningView({ state: 'starting' })).toEqual({
+      state: 'starting',
+      label: 'Starting to listen',
+      detail: 'Orcle is starting to hear your microphone.'
+    })
+  })
+
+  it('names every blocked reason plainly, with the backend sentence on hover', () => {
+    const label = (reasonCode: string): string | undefined =>
+      cohostListeningView({ state: 'blocked', reasonCode, message: 'm' })?.label
+    expect(label('no-microphone')).toBe('Not listening: no microphone selected')
+    expect(label('signed-out')).toBe('Not listening: sign in')
+    expect(label('unauthorized')).toBe('Not listening: sign in')
+    expect(label('listen-monthly-quota-exhausted')).toBe(
+      'Not listening: monthly listening time used up'
+    )
+    expect(label('consent-required')).toBe('Not listening: turn on cloud AI')
+    expect(label('no-capture')).toBe('Not listening: not live')
+    expect(label('service-unavailable')).toBe("Not listening: can't reach Videorc")
+    expect(label('signing-out')).toBe('Not listening: signing out')
+    expect(label('shutting-down')).toBe('Not listening: Videorc is closing')
+    expect(label('listen-disabled')).toBe('Not listening: unavailable right now')
+    expect(label('cloud-ai-premium-required')).toBe('Not listening: needs Premium')
+
+    const blocked = cohostListeningView({
+      state: 'blocked',
+      reasonCode: 'no-microphone',
+      message: 'Select a microphone so Orcle can hear you.'
+    })
+    expect(blocked?.state).toBe('blocked')
+    expect(blocked?.detail).toBe('Select a microphone so Orcle can hear you.')
+  })
+
+  it('reads an unknown or missing reason as a bare Not listening', () => {
+    expect(
+      cohostListeningView({ state: 'blocked', reasonCode: 'brand-new-code', message: 'Why.' })
+    ).toEqual({ state: 'blocked', label: 'Not listening', detail: 'Why.' })
+    // Object keys never leak through as reasons.
+    expect(cohostListeningView({ state: 'blocked', reasonCode: 'constructor' })?.label).toBe(
+      'Not listening'
+    )
+    expect(cohostListeningView({ state: 'blocked' })?.detail).toBe(
+      "Orcle can't hear you right now."
+    )
+  })
+
+  it('formats the listening time left', () => {
+    expect(cohostListenTimeLabel(undefined)).toBeNull()
+    expect(cohostListenTimeLabel(-1)).toBeNull()
+    expect(cohostListenTimeLabel(Number.NaN)).toBeNull()
+    expect(cohostListenTimeLabel(30)).toBe('under a minute')
+    expect(cohostListenTimeLabel(12 * 60 + 40)).toBe('12 min')
+    expect(cohostListenTimeLabel(3_600)).toBe('1 h')
+    expect(cohostListenTimeLabel(98 * 3_600 + 20 * 60)).toBe('98 h 20 min')
+  })
+
+  it('says the monthly allowance only when the server reported it', () => {
+    expect(cohostListenAllowanceLabel(undefined)).toBeNull()
+    expect(cohostListenAllowanceLabel({ state: 'on' })).toBeNull()
+    expect(cohostListenAllowanceLabel({ state: 'on', remainingSeconds: 5_400 })).toBe(
+      '1 h 30 min of listening left this month.'
+    )
+    expect(cohostListenAllowanceLabel({ state: 'on', remainingSeconds: 45 })).toBe(
+      'Under a minute of listening left this month.'
+    )
+    expect(cohostListenAllowanceLabel({ state: 'on', remainingSeconds: 0 })).toBe(
+      'No listening time left this month.'
+    )
+    expect(
+      cohostListenAllowanceLabel({
+        state: 'blocked',
+        reasonCode: 'listen-monthly-quota-exhausted',
+        message: 'Used up.'
+      })
+    ).toBe('Your listening time for this month is used up.')
+    // Another block with a known allowance still says what is left.
+    expect(
+      cohostListenAllowanceLabel({
+        state: 'blocked',
+        reasonCode: 'no-microphone',
+        remainingSeconds: 600
+      })
+    ).toBe('10 min of listening left this month.')
+  })
+
+  it('offers the one-time card only to an Orcle user with listening off', () => {
+    const base = { enabled: true, listen: false, dismissed: false }
+    expect(cohostListenPromptVisible(base)).toBe(true)
+    expect(cohostListenPromptVisible({ ...base, enabled: false })).toBe(false)
+    expect(cohostListenPromptVisible({ ...base, listen: true })).toBe(false)
+    expect(cohostListenPromptVisible({ ...base, listen: undefined })).toBe(false)
+    expect(cohostListenPromptVisible({ ...base, dismissed: true })).toBe(false)
+  })
+
+  it('persists the answer and survives storage that throws', () => {
+    const values = new Map<string, string>()
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => void values.set(key, value)
+    }
+    expect(readCohostListenPromptDismissed(storage)).toBe(false)
+    persistCohostListenPromptDismissed(storage)
+    expect(values.get(COHOST_LISTEN_PROMPT_STORAGE_KEY)).toBe('1')
+    expect(COHOST_LISTEN_PROMPT_STORAGE_KEY).toBe('videorc.orcleListenPromptDismissed')
+    expect(readCohostListenPromptDismissed(storage)).toBe(true)
+
+    const broken = {
+      getItem: (): string | null => {
+        throw new Error('SecurityError')
+      },
+      setItem: (): void => {
+        throw new Error('QuotaExceededError')
+      }
+    }
+    expect(readCohostListenPromptDismissed(broken)).toBe(false)
+    expect(() => persistCohostListenPromptDismissed(broken)).not.toThrow()
+    expect(readCohostListenPromptDismissed(null)).toBe(false)
+  })
+
+  it('names listening, the transcript and what is kept in the consent copy', () => {
+    expect(COHOST_CONSENT_SENTENCE.startsWith(COHOST_CHAT_CONSENT_SENTENCE)).toBe(true)
+    for (const sentence of [COHOST_CONSENT_SENTENCE, COHOST_LISTEN_CONSENT_SENTENCE]) {
+      expect(sentence).toContain("microphone while you're live, as text (never stored as audio)")
+      expect(sentence).toContain('saved with your recording on this computer')
+      expect(sentence).toContain('nothing is kept on Videorc servers')
+    }
+    expect(cohostPaneMode({ gate: { allowed: true }, consented: false, enabled: true })).toEqual({
+      kind: 'consent',
+      reason: `${COHOST_CONSENT_SENTENCE} Turn on cloud AI to use it.`
+    })
   })
 })

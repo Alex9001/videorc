@@ -4237,7 +4237,7 @@ export interface CohostSettings {
   autoHighlight: boolean
   /**
    * The comment the streamer is talking about goes on stream by itself
-   * (default off; needs live captions, wired in plan 060 S3).
+   * (default off; needs `listen` or live captions, wired in plan 060 S3).
    */
   voiceHighlight: boolean
   /** Plain-language chat rules the co-host flags against; ≤ 10 × 120 chars. */
@@ -4521,6 +4521,11 @@ export interface CohostWindowState {
   consented: boolean
   /** Persisted `cohost.settings.enabled`. */
   enabled: boolean
+  /**
+   * Persisted `cohost.settings.listen` (plan 068). Absent from a relay seeded
+   * without it (smokes); the window then never offers the listening card.
+   */
+  listen?: boolean
 }
 
 /**
@@ -4534,7 +4539,8 @@ export function offCohostWindowState(): CohostWindowState {
     entitlementReason: null,
     upgradeUrl: null,
     consented: false,
-    enabled: false
+    enabled: false,
+    listen: false
   }
 }
 
@@ -4560,6 +4566,8 @@ export interface CohostEnableCommand {
   enabled: boolean
   /** Grant renderer-local cloud-AI consent in the same click. */
   grantConsent?: boolean
+  /** Also set `cohost.settings.listen` in the same save (plan 068 D3). */
+  listen?: boolean
 }
 
 // Live captions (captions.* RPCs + events; premium cloud-AI feature).

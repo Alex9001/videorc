@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
 import { CohostFlagRow } from '@/components/cohost-flag-row'
-import { CohostPane } from '@/components/cohost-pane'
+import { CohostListenPrompt, CohostPane } from '@/components/cohost-pane'
 import { CohostQuestionRow } from '@/components/cohost-question-row'
 import { Command } from '@/components/ui/command'
 import type { CohostFlag, CohostQuestion, CohostState } from '@/lib/backend'
@@ -330,5 +330,27 @@ describe('CohostPane', () => {
     })
     expect(markup).toContain('grouped 2 questions')
     expect(markup).not.toContain('>1 q<')
+  })
+})
+
+describe('the one-time listening card (plan 068 D3)', () => {
+  const renderPrompt = (enabled: boolean, listen: boolean | undefined): string =>
+    renderToStaticMarkup(
+      createElement(CohostListenPrompt, { enabled, listen, onTurnOn: () => undefined })
+    )
+
+  it('asks an Orcle user with listening off', () => {
+    const markup = renderPrompt(true, false)
+    expect(markup).toContain('data-slot="cohost-listen-prompt"')
+    expect(markup).toContain('Orcle can hear you while you&#x27;re live')
+    expect(markup).toContain('never stored as audio')
+    expect(markup).toContain('>Turn on<')
+    expect(markup).toContain('>Not now<')
+  })
+
+  it('stays away when listening is on or unknown, or Orcle cannot run', () => {
+    expect(renderPrompt(true, true)).toBe('')
+    expect(renderPrompt(true, undefined)).toBe('')
+    expect(renderPrompt(false, false)).toBe('')
   })
 })

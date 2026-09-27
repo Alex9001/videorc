@@ -9,8 +9,8 @@ import {
 } from 'react'
 import { toast } from 'sonner'
 
-import { CohostPane } from '@/components/cohost-pane'
-import { CohostStatus } from '@/components/cohost-status'
+import { CohostListenPrompt, CohostPane } from '@/components/cohost-pane'
+import { CohostListeningIndicator, CohostStatus } from '@/components/cohost-status'
 import { ActivityPane } from '@/components/stream-manager/activity-pane'
 import {
   ChatPane,
@@ -175,7 +175,11 @@ export interface StreamManagerProps {
   cohostActionPending?: boolean
   cohostStarting?: boolean
   cohostNudgeDismissedForever?: boolean
+  /** Persisted `cohost.settings.listen` (plan 068); unknown hides its card. */
+  cohostListen?: boolean
   onCohostEnable?: (enabled: boolean) => void
+  /** Turn listening on from the one-time card (plan 068 D3). */
+  onCohostListenOn?: () => void
   onCohostNudgeDismiss?: () => void
   onCohostShowOnStream?: (question: CohostQuestion) => void
   onCohostAnswered?: (question: CohostQuestion) => void
@@ -218,7 +222,9 @@ export function StreamManager({
   cohostActionPending = false,
   cohostStarting = false,
   cohostNudgeDismissedForever = false,
+  cohostListen,
   onCohostEnable,
+  onCohostListenOn,
   onCohostNudgeDismiss,
   onCohostShowOnStream,
   onCohostAnswered,
@@ -428,7 +434,9 @@ export function StreamManager({
         )}
         data-slot="orcle-pane-header"
       >
-        <span className="text-xs font-medium">Orcle</span>
+        <span className="shrink-0 text-xs font-medium">Orcle</span>
+        {/* Whether Orcle hears you (plan 068); nothing while listening is off. */}
+        {cohostVisible ? <CohostListeningIndicator listening={cohostState?.listening} /> : null}
         <span className="flex-1" />
         <CohostStatus
           consented={cohostConsented}
@@ -444,6 +452,16 @@ export function StreamManager({
           onUpgrade={onCohostUpgrade}
         />
       </div>
+      {/* The one-time listening card (plan 068 D3), on air or off, above the
+          scroll so it never scrolls away. Same gate as the pane itself:
+          Premium, cloud-AI consent, and Orcle on. */}
+      {onCohostListenOn ? (
+        <CohostListenPrompt
+          enabled={cohostEnabled && cohostConsented && cohostGate?.allowed === true}
+          listen={cohostListen}
+          onTurnOn={onCohostListenOn}
+        />
+      ) : null}
       {cohostVisible ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <CohostPane

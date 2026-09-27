@@ -270,11 +270,18 @@ function CommentsWindowApp(): ReactElement {
     }
 
   // Turning the co-host on (and, from the consent CTA, granting cloud-AI
-  // consent) is main-renderer owned; the relay reply carries the truth back so
-  // the switch reflects what actually happened, not what was clicked.
-  const setCohostEnabled = (enabled: boolean, grantConsent = false): void => {
+  // consent, or from the one-time card, listening) is main-renderer owned; the
+  // relay reply carries the truth back so the switch reflects what actually
+  // happened, not what was clicked. The listening card shows only while Orcle
+  // is on, so its Turn on keeps `enabled` true.
+  const setCohostEnabled = (enabled: boolean, grantConsent = false, listen?: boolean): void => {
     void window.videorc
-      ?.sendCohostEnable?.({ requestId: crypto.randomUUID(), enabled, grantConsent })
+      ?.sendCohostEnable?.({
+        requestId: crypto.randomUUID(),
+        enabled,
+        grantConsent,
+        ...(listen === undefined ? {} : { listen })
+      })
       .then((state) => state && setCohost(state))
       .catch((error) =>
         toast.error(
@@ -332,6 +339,7 @@ function CommentsWindowApp(): ReactElement {
         cohostConsented={cohost.consented}
         cohostEnabled={cohost.enabled}
         cohostGate={cohostGate}
+        cohostListen={cohost.listen}
         cohostNudgeDismissedForever={cohostNudgeDismissed}
         cohostStarting={cohostStarting}
         cohostState={cohost.state}
@@ -339,6 +347,7 @@ function CommentsWindowApp(): ReactElement {
         onCohostRestoreQuestion={(question) => sendCohostAction('restore')(question.id)}
         onCohostEnable={(enabled) => setCohostEnabled(enabled)}
         onCohostEnableConsent={() => setCohostEnabled(true, true)}
+        onCohostListenOn={() => setCohostEnabled(true, false, true)}
         onCohostNudgeDismiss={() => {
           setCohostNudgeDismissed(true)
           localStorage.setItem(COHOST_NUDGE_STORAGE_KEY, '1')
