@@ -70,7 +70,10 @@ try {
   if (typeof ready.adminToken !== 'string' || ready.adminToken.length < 32) {
     throw new Error('Debug backend READY omitted its private smoke admin credential.')
   }
-  backend = await connectBackend({ ...ready, token: ready.adminToken, adminToken: undefined }, timeoutMs)
+  backend = await connectBackend(
+    { ...ready, token: ready.adminToken, adminToken: undefined },
+    timeoutMs
+  )
   const observed = collectCaptionEvents(backend)
 
   await proveRealtimeContract({ backend, observed, fake })
@@ -371,7 +374,13 @@ async function proveListenOnlySession({ backend, observed, fake }) {
       candidate.chunkCount > recordsBefore &&
       candidate.canonicalCues?.at(-1)?.text === 'Chunk fallback recovered.'
   )
-  const listening = await waitForCohost(backend, (candidate) => candidate.listening?.state === 'on')
+  // Listening may read `on` before any upload (a skipped silent chunk proves
+  // the path); the allowance arrives with the first listen-metered answer.
+  const listening = await waitForCohost(
+    backend,
+    (candidate) =>
+      candidate.listening?.state === 'on' && candidate.listening?.remainingSeconds !== undefined
+  )
 
   const purposes = fake.state.chunkPurposes.slice(chunkRequestsBefore)
   if (purposes.length < 1 || purposes.some((purpose) => purpose !== 'listen')) {

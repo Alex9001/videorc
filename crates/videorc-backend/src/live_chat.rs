@@ -1557,8 +1557,12 @@ where
     // A new chat session replaces any co-host session; keep that retirement
     // in the same lifecycle transaction as the coordinator replacement so a
     // concurrent start/stop cannot apply an older operation to the new engine.
-    crate::cohost::stop_cohost_for_session_end_under_lifecycle_fence(state, &lifecycle_delivery)
-        .await;
+    crate::cohost::stop_cohost_for_session_end_under_lifecycle_fence(
+        state,
+        &lifecycle_delivery,
+        crate::captions::ListenStop::Abort,
+    )
+    .await;
     let session_generation = {
         let mut coordinator = state.live_chat.lock().await;
         coordinator.start_session(params.session_id.clone(), providers);
@@ -2400,12 +2404,30 @@ async fn send_to_destination(
 
 /// Stop the active chat session, aborting connectors and marking providers ended.
 pub async fn stop_live_chat(state: &AppState) -> LiveChatSnapshot {
-    stop_live_chat_before_snapshot_emit(state, std::future::ready(())).await
+    stop_live_chat_before_snapshot_emit(
+        state,
+        std::future::ready(()),
+        crate::captions::ListenStop::Abort,
+    )
+    .await
+}
+
+/// `session.stop`: the chat session ends with the capture. Orcle stops too,
+/// but a listen-only transcription task drains with the capture so the
+/// stream's last words still reach its SRT and Clip that (plan 068 review).
+pub async fn stop_live_chat_for_capture_end(state: &AppState) -> LiveChatSnapshot {
+    stop_live_chat_before_snapshot_emit(
+        state,
+        std::future::ready(()),
+        crate::captions::ListenStop::DrainIfCapturing,
+    )
+    .await
 }
 
 async fn stop_live_chat_before_snapshot_emit<F>(
     state: &AppState,
     before_snapshot_emit: F,
+    listen_stop: crate::captions::ListenStop,
 ) -> LiveChatSnapshot
 where
     F: std::future::Future<Output = ()>,
@@ -2418,8 +2440,12 @@ where
         kick_cleanup
     };
     spawn_kick_cleanup(state, kick_cleanup);
-    crate::cohost::stop_cohost_for_session_end_under_lifecycle_fence(state, &lifecycle_delivery)
-        .await;
+    crate::cohost::stop_cohost_for_session_end_under_lifecycle_fence(
+        state,
+        &lifecycle_delivery,
+        listen_stop,
+    )
+    .await;
     let snapshot = current_status(state).await;
     before_snapshot_emit.await;
     state.emit_event("liveChat.snapshot", snapshot.clone());
@@ -4516,10 +4542,14 @@ mod tests {
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
         let stop_state = state.clone();
         let stop = tokio::spawn(async move {
-            stop_live_chat_before_snapshot_emit(&stop_state, async move {
-                let _ = captured_tx.send(());
-                let _ = resume_rx.await;
-            })
+            stop_live_chat_before_snapshot_emit(
+                &stop_state,
+                async move {
+                    let _ = captured_tx.send(());
+                    let _ = resume_rx.await;
+                },
+                crate::captions::ListenStop::Abort,
+            )
             .await
         });
         captured_rx
@@ -5545,5 +5575,56 @@ mod tests {
             ]),
             CommentsSendOperationPhase::Partial
         );
+    }
+
+    /// Plan 068 review, finding 2: `session.stop` retires chat and Orcle, but
+    /// a listen-only transcription task drains with the capture (its last
+    /// words reach the SRT and Clip that); with no capture running, or on an
+    /// explicit `liveChat.stop`, it ends at once.
+    #[tokio::test]
+    async fn session_stop_lets_orcles_listen_task_drain_with_the_capture() {
+        let _caption_test_guard = crate::captions::caption_lifecycle_test_lock().lock().await;
+        let state = test_state();
+        *state.recording.lock().await =
+            Some(crate::recording::test_active_recording_stub("session-a"));
+        state
+            .live_chat
+            .lock()
+            .await
+            .start_session("session-a".to_string(), Vec::new());
+        crate::cohost::start_cohost_session_for_test(&state, "session-a").await;
+        crate::captions::install_listen_only_test_task(&state).await;
+        stop_live_chat_for_capture_end(&state).await;
+        assert!(state.live_chat.lock().await.session_id().is_none());
+        assert!(!crate::captions::listen_wanted_for_test(&state).await);
+        assert!(crate::captions::caption_task_alive_for_test(&state).await);
+        *state.recording.lock().await = None;
+        crate::captions::finish_captions_for_capture(&state).await;
+        assert!(!crate::captions::caption_task_alive_for_test(&state).await);
+
+        // No capture: nothing to drain with.
+        state
+            .live_chat
+            .lock()
+            .await
+            .start_session("session-b".to_string(), Vec::new());
+        crate::cohost::start_cohost_session_for_test(&state, "session-b").await;
+        crate::captions::install_listen_only_test_task(&state).await;
+        stop_live_chat_for_capture_end(&state).await;
+        assert!(!crate::captions::caption_task_alive_for_test(&state).await);
+
+        // An explicit chat stop is an opt-out: it aborts even while capturing.
+        *state.recording.lock().await =
+            Some(crate::recording::test_active_recording_stub("session-c"));
+        state
+            .live_chat
+            .lock()
+            .await
+            .start_session("session-c".to_string(), Vec::new());
+        crate::cohost::start_cohost_session_for_test(&state, "session-c").await;
+        crate::captions::install_listen_only_test_task(&state).await;
+        stop_live_chat(&state).await;
+        assert!(!crate::captions::caption_task_alive_for_test(&state).await);
+        *state.recording.lock().await = None;
     }
 }

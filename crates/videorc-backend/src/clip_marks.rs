@@ -185,6 +185,11 @@ impl ClipMarkDetector {
     pub fn note_manual_mark(&mut self, at_seconds: f64) {
         self.last_mark_at_seconds = Some(at_seconds);
     }
+
+    /// Sign-out: the carried words are transcript; they go with it.
+    pub fn forget_words(&mut self) {
+        self.tail.clear();
+    }
 }
 
 pub type ClipMarkDetectorSlot = Arc<StdMutex<ClipMarkDetector>>;
@@ -193,14 +198,28 @@ pub fn new_clip_mark_detector_slot() -> ClipMarkDetectorSlot {
     Arc::new(StdMutex::new(ClipMarkDetector::default()))
 }
 
+/// The capture a voice mark belongs to, read when the caption task started.
+/// The final chunks of a stream are transcribed after the recording slot is
+/// retired (the capture-end drain), so a voice mark never re-reads the slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkTarget {
+    pub session_id: String,
+    /// The session writes a recording file (a stream-only session keeps no
+    /// marks).
+    pub records_to_file: bool,
+}
+
 /// Caption-task hook for every transcript final (both intents, both
 /// transports): match under the std lock and return. A hit is recorded on a
-/// spawned task so the caller never waits on the recording lock.
+/// spawned task so the caller never waits on the recording lock. `target` is
+/// the capture the caption task transcribes; `None` falls back to the active
+/// recording slot.
 pub(crate) fn note_transcript_final(
     state: &AppState,
     text: &str,
     segments: &[CaptionSegment],
     offset_seconds: f64,
+    target: Option<MarkTarget>,
 ) {
     let found = state
         .clip_marks
@@ -222,6 +241,7 @@ pub(crate) fn note_transcript_final(
     handle.spawn(async move {
         match record_mark(
             &state,
+            target,
             Some(found.at_seconds),
             ClipMarkSource::Voice,
             Some(found.phrase.clone()),
@@ -252,26 +272,32 @@ pub(crate) fn note_transcript_final(
 
 /// `clip.mark`: a manual mark at the capture's current elapsed time.
 pub async fn mark_manual(state: &AppState) -> Result<ClipMarkedEvent, ClipMarkError> {
-    record_mark(state, None, ClipMarkSource::Manual, None).await
+    record_mark(state, None, None, ClipMarkSource::Manual, None).await
 }
 
-/// Store a mark for the active session and emit `clip.marked`. `at_seconds`
-/// `None` stamps the capture's elapsed time now. Without a recording output
-/// nothing is stored and the event says why.
+/// Store a mark and emit `clip.marked`. With a `target` (a voice mark, whose
+/// time the transcript already carries) the mark lands on that capture even
+/// after its recording slot was retired; otherwise it lands on the active
+/// session, and `at_seconds` `None` stamps its elapsed time now. Without a
+/// recording output nothing is stored and the event says why.
 async fn record_mark(
     state: &AppState,
+    target: Option<MarkTarget>,
     at_seconds: Option<f64>,
     source: ClipMarkSource,
     phrase: Option<String>,
 ) -> Result<ClipMarkedEvent, ClipMarkError> {
-    let (session_id, at_seconds, records_to_file) = {
-        let recording = state.recording.lock().await;
-        let active = recording.as_ref().ok_or(ClipMarkError::NoActiveSession)?;
-        (
-            active.session_id.clone(),
-            at_seconds.unwrap_or_else(|| active.capture_elapsed_seconds()),
-            active.output_path.is_some(),
-        )
+    let (session_id, at_seconds, records_to_file) = match (target, at_seconds) {
+        (Some(target), Some(at_seconds)) => (target.session_id, at_seconds, target.records_to_file),
+        (_, at_seconds) => {
+            let recording = state.recording.lock().await;
+            let active = recording.as_ref().ok_or(ClipMarkError::NoActiveSession)?;
+            (
+                active.session_id.clone(),
+                at_seconds.unwrap_or_else(|| active.capture_elapsed_seconds()),
+                active.output_path.is_some(),
+            )
+        }
     };
     let at_seconds = at_seconds.max(0.0);
     if source == ClipMarkSource::Manual
@@ -435,5 +461,105 @@ mod tests {
         assert!(
             find_clip_phrase(&[word("clip", 1.0), word("that", 1.5)], &[word("ok", 2.0)]).is_none()
         );
+    }
+
+    fn mark_test_state() -> AppState {
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        AppState::new(
+            "test-token".to_string(),
+            0,
+            events,
+            crate::storage::Database::open_in_memory_for_tests(),
+        )
+    }
+
+    fn persist_session(state: &AppState, session_id: &str) {
+        state
+            .database
+            .create_session(&crate::storage::NewSession {
+                id: session_id.to_string(),
+                title: "Clip mark test".to_string(),
+                started_at: "2026-09-27T10:00:00Z".to_string(),
+                mode: "record+stream".to_string(),
+                output_path: Some("/tmp/clip-mark-test.mp4".to_string()),
+                container: Some("mp4".to_string()),
+                stream_preset: None,
+                sources: serde_json::from_str("{}").unwrap(),
+                layout: crate::protocol::default_layout_settings(),
+                output: serde_json::from_value(serde_json::json!({
+                    "recordEnabled": true,
+                    "streamEnabled": true,
+                    "video": {
+                        "preset": "tutorial-1080p30",
+                        "width": 1920,
+                        "height": 1080,
+                        "fps": 30,
+                        "bitrateKbps": 6000
+                    },
+                    "rtmp": { "preset": "custom", "serverUrl": "", "streamKey": "" }
+                }))
+                .unwrap(),
+            })
+            .unwrap();
+    }
+
+    /// The last "clip that" of a stream is transcribed by the capture-end
+    /// drain, after the recording slot is gone: it still lands on its session.
+    #[tokio::test]
+    async fn a_voice_mark_heard_during_the_capture_end_drain_lands_on_its_session() {
+        let state = mark_test_state();
+        persist_session(&state, "stream-a");
+        let mut events = state.events.subscribe();
+        assert!(state.recording.lock().await.is_none());
+        let event = record_mark(
+            &state,
+            Some(MarkTarget {
+                session_id: "stream-a".to_string(),
+                records_to_file: true,
+            }),
+            Some(1_804.5),
+            ClipMarkSource::Voice,
+            Some("clip that".to_string()),
+        )
+        .await
+        .expect("a carried target needs no recording slot");
+        assert!(event.saved);
+        assert_eq!(event.session_id, "stream-a");
+        let marks = list_marks(&state, "stream-a").unwrap();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].at_seconds, 1_804.5);
+        assert_eq!(marks[0].phrase.as_deref(), Some("clip that"));
+        assert_eq!(events.try_recv().unwrap().event, "clip.marked");
+
+        // A stream-only capture still keeps nothing, and says why.
+        let event = record_mark(
+            &state,
+            Some(MarkTarget {
+                session_id: "stream-b".to_string(),
+                records_to_file: false,
+            }),
+            Some(12.0),
+            ClipMarkSource::Voice,
+            Some("clip it".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(!event.saved);
+        assert_eq!(event.reason.as_deref(), Some("recording-off"));
+        assert!(list_marks(&state, "stream-b").unwrap().is_empty());
+
+        // Without a target (a manual mark) the active slot is still required.
+        assert!(matches!(
+            record_mark(&state, None, None, ClipMarkSource::Manual, None).await,
+            Err(ClipMarkError::NoActiveSession)
+        ));
+    }
+
+    #[test]
+    fn forgetting_words_drops_a_half_said_phrase() {
+        let mut detector = ClipMarkDetector::default();
+        assert!(detector.note_final("okay clip", &[], 10.0).is_none());
+        detector.forget_words();
+        assert!(detector.note_final("that", &[], 11.0).is_none());
     }
 }

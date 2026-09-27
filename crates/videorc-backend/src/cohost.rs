@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
-use crate::captions::{CaptionUpdateKind, CaptionsUpdate};
+use crate::captions::{CaptionUpdateKind, CaptionsUpdate, ListenStop};
 use crate::cohost_ack::{AuthorLedger, DeadAirLane, GreetedHow, dead_air_due, dead_air_text};
 use crate::comment_highlight::{CommentHighlightPhase, CommentHighlightState};
 use crate::live_chat::{LiveChatEventType, LiveChatMessage};
@@ -987,6 +987,11 @@ pub struct RecentSpeechFinal {
     pub segments: Vec<crate::captions::CaptionSegment>,
     /// Captions were presenting when this final landed.
     pub presented: bool,
+    /// The capture the caption task transcribes (its session id and whether
+    /// it records to a file), carried so a voice clip mark in the capture-end
+    /// drain lands after the recording slot is gone. `None` falls back to the
+    /// active slot.
+    pub mark_target: Option<crate::clip_marks::MarkTarget>,
 }
 
 /// The last five minutes of transcript finals, in memory, in arrival order.
@@ -1290,6 +1295,8 @@ struct CohostSession {
     transcript_pending: String,
     /// What the outstanding tick sent, restored on a version fallback.
     in_flight_transcript: String,
+    /// Sign-out forgot the speech the in-flight tick carried: drop its answer.
+    discard_in_flight: bool,
     /// Chat you haven't acknowledged (plan 068 D9): who chatted this session
     /// and who was greeted, and the dead-air nudge.
     ledger: AuthorLedger,
@@ -1450,8 +1457,34 @@ impl CohostSession {
             speech_cursor: None,
             transcript_pending: String::new(),
             in_flight_transcript: String::new(),
+            discard_in_flight: false,
             ledger: AuthorLedger::default(),
             dead_air: DeadAirLane::default(),
+        }
+    }
+
+    /// Sign-out: everything this session learned from speech goes (see
+    /// `purge_speech_for_sign_out`). Chat state stays.
+    fn forget_speech(&mut self) {
+        self.transcript_pending.clear();
+        self.in_flight_transcript.clear();
+        self.summary.clear();
+        self.topic = None;
+        self.promises.clear();
+        self.promise_seen.clear();
+        self.closed_promises.clear();
+        self.reminded_promises.clear();
+        self.promise_reminder = None;
+        self.recap = None;
+        self.recap_expires_at = None;
+        for question in &mut self.questions {
+            question.on_topic = false;
+        }
+        self.ledger.forget_voice();
+        // The tick in flight carried the transcript and returns what it
+        // heard: its answer is dropped, never applied.
+        if self.in_flight {
+            self.discard_in_flight = true;
         }
     }
 
@@ -3677,6 +3710,14 @@ impl CohostEngine {
         if session.generation != generation {
             return false;
         }
+        if std::mem::take(&mut session.discard_in_flight) {
+            session.in_flight = false;
+            session.in_flight_messages.clear();
+            session.in_flight_dropped = 0;
+            session.in_flight_rules.clear();
+            session.in_flight_transcript.clear();
+            return true;
+        }
         match result {
             Ok(response) => session.apply_response(response, dropped, now, now_iso),
             Err(error) => session.apply_failure(&error, now),
@@ -3857,6 +3898,7 @@ pub(crate) fn note_transcript_final(
         &final_.text,
         &final_.segments,
         final_.offset_seconds,
+        final_.mark_target.clone(),
     );
     if let Ok(mut speech) = state.cohost_recent_speech.lock() {
         speech.push(final_);
@@ -3880,6 +3922,31 @@ fn clear_transcript(state: &AppState) {
 /// lifecycle fence.
 pub(crate) async fn publish_listening(state: &AppState, listening: CohostListening) {
     let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
+    publish_listening_under_fence(state, listening, &lifecycle_delivery).await;
+}
+
+/// `publish_listening` for a state the caption task decided on in
+/// `listen_epoch`: dropped when the listen intent ended since (an explicit
+/// stop, sign-out), so a late `on` never overwrites what the stop published.
+/// The epoch is checked under the lifecycle fence the stop paths publish
+/// under.
+pub(crate) async fn publish_listening_for_epoch(
+    state: &AppState,
+    listen_epoch: u64,
+    listening: CohostListening,
+) {
+    let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
+    if crate::captions::current_listen_epoch(state).await != listen_epoch {
+        return;
+    }
+    publish_listening_under_fence(state, listening, &lifecycle_delivery).await;
+}
+
+async fn publish_listening_under_fence(
+    state: &AppState,
+    listening: CohostListening,
+    lifecycle_delivery: &OwnedMutexGuard<()>,
+) {
     let snapshot = {
         let mut engine = state.cohost.lock().await;
         let Some(session) = engine.session.as_mut() else {
@@ -3891,6 +3958,65 @@ pub(crate) async fn publish_listening(state: &AppState, listening: CohostListeni
         session.listening = Some(listening);
         engine.snapshot()
     };
+    emit_state(state, &snapshot, lifecycle_delivery);
+}
+
+/// Sign-out is a privacy boundary for what Orcle heard (plan 068 review):
+/// the spotlight transcript, the recent-speech buffer, the Clip that tail and
+/// voice activity go, and so do the session's pending transcript, summary,
+/// topic, promises, recap, on-topic marks and voice greetings; a tick in
+/// flight is dropped when it answers. Nothing heard under this account can
+/// ride a tick under the next one. Listening reads `blocked` (`signed-out`)
+/// until `resume_listen_after_sign_in`. The caption teardown already ended
+/// the listen intent and joined its task before this runs.
+pub(crate) async fn purge_speech_for_sign_out(state: &AppState) {
+    clear_transcript(state);
+    if let Ok(mut detector) = state.clip_marks.lock() {
+        detector.forget_words();
+    }
+    if let Ok(mut voice) = state.cohost_voice.lock() {
+        *voice = VoiceActivity::default();
+    }
+    let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
+    let snapshot = {
+        let mut engine = state.cohost.lock().await;
+        let Some(session) = engine.session.as_mut() else {
+            return;
+        };
+        session.forget_speech();
+        if session
+            .listening
+            .as_ref()
+            .is_some_and(|listening| listening.state != CohostListeningState::Off)
+        {
+            session.listening = Some(CohostListening::blocked(
+                "signed-out",
+                "Sign in so Orcle can hear you.",
+            ));
+        }
+        engine.snapshot()
+    };
+    emit_state(state, &snapshot, &lifecycle_delivery);
+}
+
+/// Sign-in completed: a running Orcle session with listening on hears the
+/// streamer again (its consent still decides, as at start).
+pub(crate) async fn resume_listen_after_sign_in(state: &AppState) {
+    let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
+    let running = {
+        let engine = state.cohost.lock().await;
+        let listen = engine.settings.enabled && engine.settings.listen;
+        engine
+            .session
+            .as_ref()
+            .filter(|_| listen)
+            .map(|session| (session.session_id.clone(), session.consent))
+    };
+    let Some((session_id, consent)) = running else {
+        return;
+    };
+    start_listen_if_wanted(state, &session_id, consent, true).await;
+    let snapshot = state.cohost.lock().await.snapshot();
     emit_state(state, &snapshot, &lifecycle_delivery);
 }
 
@@ -3921,6 +4047,17 @@ async fn start_listen_if_wanted(state: &AppState, session_id: &str, consent: boo
         crate::captions::start_listen_for_cohost(state, session_id).await
     };
     record_listening(state, session_id, listening).await;
+}
+
+/// A running Orcle session for `session_id`, without its schedulers, for the
+/// stop-path tests outside this module.
+#[cfg(test)]
+pub(crate) async fn start_cohost_session_for_test(state: &AppState, session_id: &str) {
+    state
+        .cohost
+        .lock()
+        .await
+        .start_session(session_id.to_string(), true, None, Instant::now());
 }
 
 pub async fn cohost_status(state: &AppState) -> CohostState {
@@ -4057,13 +4194,20 @@ where
 
 pub async fn stop_cohost(state: &AppState) -> CohostState {
     let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
-    stop_cohost_under_lifecycle_fence(state, &lifecycle_delivery, std::future::ready(())).await
+    stop_cohost_under_lifecycle_fence(
+        state,
+        &lifecycle_delivery,
+        std::future::ready(()),
+        ListenStop::Abort,
+    )
+    .await
 }
 
 async fn stop_cohost_under_lifecycle_fence<F>(
     state: &AppState,
     lifecycle_delivery: &OwnedMutexGuard<()>,
     before_state_emit: F,
+    listen_stop: ListenStop,
 ) -> CohostState
 where
     F: std::future::Future<Output = ()>,
@@ -4074,7 +4218,7 @@ where
     drop(engine);
     if stopped {
         clear_transcript(state);
-        crate::captions::stop_listen(state).await;
+        crate::captions::stop_listen_with(state, listen_stop).await;
     }
     before_state_emit.await;
     if stopped {
@@ -4085,12 +4229,22 @@ where
 }
 
 /// Live-chat session boundary (stop, or a replacing start): drop the engine
-/// session so no late tick can publish into the next stream.
+/// session so no late tick can publish into the next stream. `listen_stop`
+/// says whether a listen-only transcription task ends now (an explicit stop,
+/// a replacing start) or drains with the capture that is ending
+/// (`session.stop`), so the stream's last words reach its SRT and Clip that.
 pub(crate) async fn stop_cohost_for_session_end_under_lifecycle_fence(
     state: &AppState,
     lifecycle_delivery: &OwnedMutexGuard<()>,
+    listen_stop: ListenStop,
 ) {
-    stop_cohost_under_lifecycle_fence(state, lifecycle_delivery, std::future::ready(())).await;
+    stop_cohost_under_lifecycle_fence(
+        state,
+        lifecycle_delivery,
+        std::future::ready(()),
+        listen_stop,
+    )
+    .await;
 }
 
 /// Recording monitors are generation-late by construction: final media work
@@ -4130,7 +4284,9 @@ async fn stop_cohost_for_session_end_if_matching_impl<F>(
     drop(engine);
     if stopped {
         clear_transcript(state);
-        crate::captions::stop_listen(state).await;
+        // The recording monitor retires its capture next: the listen task
+        // drains there (`finish_captions_for_capture`) instead of aborting.
+        crate::captions::stop_listen_with(state, ListenStop::DrainWithCapture).await;
     }
     before_state_emit.await;
     if stopped {
@@ -6893,6 +7049,7 @@ mod tests {
                     text: text.to_string(),
                     segments: Vec::new(),
                     presented: false,
+                    mark_target: None,
                 })
                 .collect(),
             version: finals.len() as u64,
@@ -9039,6 +9196,7 @@ mod tests {
             text: text.to_string(),
             segments: Vec::new(),
             presented: false,
+            mark_target: None,
         };
         assert!(speech.since(None, now).is_some());
         assert!(speech.since(Some(speech.version()), now).is_none());
@@ -9088,6 +9246,7 @@ mod tests {
                 text: "clip that".to_string(),
                 segments: Vec::new(),
                 presented: false,
+                mark_target: None,
             },
         );
         assert_eq!(
@@ -9621,5 +9780,203 @@ mod tests {
                 .all(|event| event.event != COHOST_STATE_EVENT)
         );
         stop_cohost(&state).await;
+    }
+
+    // --- Plan 068 review fixes ------------------------------------------------
+
+    /// Finding 4: sign-out purges everything Orcle heard under the account,
+    /// blocks listening, and drops the answer of a tick in flight.
+    #[tokio::test]
+    async fn sign_out_purges_what_orcle_heard_and_blocks_listening() {
+        let state = test_state();
+        let start = Instant::now();
+        note_transcript_final(
+            &state,
+            &CaptionsUpdate {
+                session_client_id: "captions-test".to_string(),
+                seq: 1,
+                kind: CaptionUpdateKind::Final,
+                text: "okay clip".to_string(),
+                chunk_seconds: 3,
+                remaining_seconds: None,
+            },
+            RecentSpeechFinal {
+                at: start,
+                offset_seconds: 12.0,
+                duration_seconds: 3.0,
+                text: "okay clip".to_string(),
+                segments: Vec::new(),
+                presented: false,
+                mark_target: None,
+            },
+        );
+        state.cohost_voice.lock().unwrap().last_voice_at = Some(start);
+        {
+            let mut engine = state.cohost.lock().await;
+            engine.settings = enabled_settings();
+            let generation = engine.start_session("session-1".to_string(), true, None, start);
+            let mut row = chat_message("session-1", 1, "2026-08-22T10:01:01Z");
+            row.author_name = "Jonathan".to_string();
+            row.first_message = true;
+            engine.note_messages(&[row]);
+            engine.note_speech(
+                generation,
+                &speech(&[(
+                    start + secs(1),
+                    "welcome jonathan, the setup at ten viewers",
+                )]),
+            );
+            // The tick in flight carries that transcript.
+            engine.note_messages(&messages("session-1", 2..7));
+            let in_flight = engine
+                .prepare_tick(generation, true, true, start + secs(20))
+                .unwrap();
+            assert!(in_flight.request.transcript.is_some());
+            engine.note_speech(
+                generation,
+                &speech(&[
+                    (
+                        start + secs(1),
+                        "welcome jonathan, the setup at ten viewers",
+                    ),
+                    (start + secs(21), "and more words"),
+                ]),
+            );
+            let session = engine.session.as_mut().unwrap();
+            assert!(session.ledger.author_greeted_by_voice_for_test());
+            session.summary = "We built a keyboard.".to_string();
+            session.topic = Some("Keyboards".to_string());
+            session.promises = vec![CohostPromise {
+                id: "p_1".to_string(),
+                text: "Show the setup".to_string(),
+                trigger: CohostPromiseTrigger {
+                    kind: CohostPromiseTriggerKind::Viewers,
+                    value: Some(10),
+                },
+                first_seen_at: "t0".to_string(),
+            }];
+            session.set_recap("You missed the build.".to_string(), start, "t0");
+            session.listening = Some(CohostListening::on(Some(600)));
+        }
+        let mut events = state.events.subscribe();
+
+        purge_speech_for_sign_out(&state).await;
+
+        assert_eq!(
+            state
+                .cohost_transcript
+                .lock()
+                .unwrap()
+                .snapshot(Instant::now())
+                .text,
+            ""
+        );
+        assert!(recent_speech_since(&state, None).is_some_and(|speech| speech.finals.is_empty()));
+        assert_eq!(voice_activity(&state), VoiceActivity::default());
+        let emitted = events.try_recv().expect("the purge publishes the state");
+        assert_eq!(emitted.event, COHOST_STATE_EVENT);
+        assert_eq!(emitted.payload["listening"]["state"], "blocked");
+        assert_eq!(emitted.payload["listening"]["reasonCode"], "signed-out");
+        let mut engine = state.cohost.lock().await;
+        let generation = {
+            let session = engine.session.as_ref().unwrap();
+            assert!(session.transcript_pending.is_empty());
+            assert!(session.summary.is_empty());
+            assert_eq!(session.topic, None);
+            assert!(session.promises.is_empty());
+            assert!(session.recap.is_none());
+            assert!(!session.ledger.author_greeted_by_voice_for_test());
+            session.generation
+        };
+        // The answer to the tick that carried the purged words never lands.
+        let mut late = response(Vec::new());
+        late.summary = Some("What they said before signing out.".to_string());
+        late.topic = Some("Keyboards".to_string());
+        assert!(engine.apply_tick_result(generation, 0, Ok(late), start + secs(30), "t9"));
+        let session = engine.session.as_ref().unwrap();
+        assert!(!session.in_flight);
+        assert!(session.summary.is_empty());
+        assert_eq!(session.topic, None);
+        drop(engine);
+
+        // Without a session the purge still clears the buffers, quietly.
+        let quiet = test_state();
+        let mut quiet_events = quiet.events.subscribe();
+        purge_speech_for_sign_out(&quiet).await;
+        assert!(quiet_events.try_recv().is_err());
+    }
+
+    /// Finding 4: sign-in resumes listening for a session still running with
+    /// listening on (here it waits for a capture, as at any start).
+    #[tokio::test]
+    async fn sign_in_resumes_listening_for_a_running_session() {
+        let _caption_test_guard = crate::captions::caption_lifecycle_test_lock().lock().await;
+        let state = test_state();
+        {
+            let mut engine = state.cohost.lock().await;
+            engine.settings = CohostSettings {
+                listen: true,
+                ..enabled_settings()
+            };
+            engine.start_session("session-1".to_string(), true, None, Instant::now());
+            engine.session.as_mut().unwrap().listening = Some(CohostListening::blocked(
+                "signed-out",
+                "Sign in so Orcle can hear you.",
+            ));
+        }
+        let mut events = state.events.subscribe();
+        resume_listen_after_sign_in(&state).await;
+        let listening = state.cohost.lock().await.snapshot().listening.unwrap();
+        assert_eq!(listening.state, CohostListeningState::Blocked);
+        assert_eq!(listening.reason_code.as_deref(), Some("no-capture"));
+        assert!(crate::captions::listen_wanted_for_test(&state).await);
+        assert_eq!(events.try_recv().unwrap().event, COHOST_STATE_EVENT);
+        crate::captions::stop_listen(&state).await;
+
+        // Listening off in settings: sign-in leaves it alone.
+        state.cohost.lock().await.settings.listen = false;
+        resume_listen_after_sign_in(&state).await;
+        assert!(!crate::captions::listen_wanted_for_test(&state).await);
+    }
+
+    /// Finding 2: the recording monitor's Orcle stop (a capture end) leaves
+    /// the listen-only task to drain in `finish_captions_for_capture`; an
+    /// explicit `cohost.stop` still ends it at once.
+    #[tokio::test]
+    async fn a_capture_end_stop_lets_the_listen_task_drain_and_an_explicit_stop_aborts() {
+        let _caption_test_guard = crate::captions::caption_lifecycle_test_lock().lock().await;
+        let state = test_state();
+        {
+            let mut engine = state.cohost.lock().await;
+            engine.settings = enabled_settings();
+            engine.start_session("rec-1".to_string(), true, None, Instant::now());
+        }
+        crate::captions::install_listen_only_test_task(&state).await;
+        let fence = state.live_chat_persistence.begin_delivery().await;
+        stop_cohost_for_session_end_if_matching_before_emit(
+            &state,
+            "rec-1",
+            &fence,
+            std::future::ready(()),
+        )
+        .await;
+        drop(fence);
+        assert!(state.cohost.lock().await.session.is_none());
+        assert!(!crate::captions::listen_wanted_for_test(&state).await);
+        assert!(
+            crate::captions::caption_task_alive_for_test(&state).await,
+            "the stream's last chunks still drain"
+        );
+        crate::captions::finish_captions_for_capture(&state).await;
+        assert!(!crate::captions::caption_task_alive_for_test(&state).await);
+
+        state
+            .cohost
+            .lock()
+            .await
+            .start_session("rec-2".to_string(), true, None, Instant::now());
+        crate::captions::install_listen_only_test_task(&state).await;
+        stop_cohost(&state).await;
+        assert!(!crate::captions::caption_task_alive_for_test(&state).await);
     }
 }

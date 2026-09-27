@@ -8399,6 +8399,12 @@ async fn handle_text_message_with_role(
                             tokio::spawn(async move {
                                 refresh_account_entitlements(&entitlement_state).await
                             });
+                            // Orcle stopped listening at sign-out; a session
+                            // still running with listening on resumes now.
+                            let listen_state = state.clone();
+                            tokio::spawn(async move {
+                                cohost::resume_listen_after_sign_in(&listen_state).await
+                            });
                             ServerResponse::ok(command.id, resolved)
                         }
                         Err(error) => {
@@ -9756,7 +9762,8 @@ async fn handle_text_message_with_role(
             }
         }
         "session.stop" => {
-            live_chat::stop_live_chat(state).await;
+            // Orcle's listen task drains with this capture (plan 068 review).
+            live_chat::stop_live_chat_for_capture_end(state).await;
             // Older renderers send no params; the click timestamp is telemetry
             // only, so a malformed payload degrades to "no timestamp".
             let stop_params = if command.params.is_null() {

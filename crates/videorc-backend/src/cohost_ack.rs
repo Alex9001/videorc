@@ -679,9 +679,35 @@ impl AuthorLedger {
         std::mem::take(&mut self.log)
     }
 
+    /// Sign-out: a greeting heard in speech goes with the purged transcript
+    /// (the viewer may show in "Say hi" again), and so does the unread
+    /// greeting log. Chat, highlight and manual greetings stay.
+    pub(crate) fn forget_voice(&mut self) {
+        for author in self.authors.values_mut() {
+            if author
+                .greeted
+                .as_ref()
+                .is_some_and(|greeting| greeting.how == GreetedHow::Voice)
+            {
+                author.greeted = None;
+            }
+        }
+        self.log.clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn author(&self, key: &str) -> Option<&LedgerAuthor> {
         self.authors.get(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn author_greeted_by_voice_for_test(&self) -> bool {
+        self.authors.values().any(|author| {
+            author
+                .greeted
+                .as_ref()
+                .is_some_and(|greeting| greeting.how == GreetedHow::Voice)
+        })
     }
 }
 
@@ -1414,5 +1440,28 @@ mod tests {
             .clone();
         assert_ne!(first, second);
         assert_eq!(lane.current(now + secs(120) + DEAD_AIR_NUDGE_TTL), None);
+    }
+
+    /// Finding 4: sign-out forgets greetings heard in speech (and the unread
+    /// log naming them); chat and manual greetings stay.
+    #[test]
+    fn forgetting_voice_keeps_chat_and_manual_greetings() {
+        let start = Instant::now();
+        let mut ledger = AuthorLedger::default();
+        ledger.note_message("k:jon", &row(1, "Jonathan", "hi", true), false, start);
+        ledger.note_message("k:ann", &row(2, "Anna", "hi", true), false, start);
+        ledger.note_message("k:cy", &row(3, "Cyrus", "hi", true), false, start);
+        assert_eq!(
+            ledger.greet_by_voice("welcome jonathan", start + secs(1)),
+            1
+        );
+        assert_eq!(ledger.greet_by_chat("thanks anna", start + secs(2)), 1);
+        assert!(ledger.greet("k:cy", GreetedHow::Manual, start + secs(3)));
+        ledger.forget_voice();
+        assert!(ledger.author("k:jon").unwrap().greeted.is_none());
+        assert!(ledger.author("k:ann").unwrap().greeted.is_some());
+        assert!(ledger.author("k:cy").unwrap().greeted.is_some());
+        assert!(ledger.take_log().is_empty());
+        assert!(!ledger.author_greeted_by_voice_for_test());
     }
 }

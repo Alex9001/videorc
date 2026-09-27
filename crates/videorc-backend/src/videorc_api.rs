@@ -1227,6 +1227,15 @@ pub fn is_listen_block_code(code: &str) -> bool {
     matches!(code, "listen-monthly-quota-exhausted" | "listen-disabled")
 }
 
+/// Terminal codes a caption-metered request (a `captions` chunk, the realtime
+/// token) gets for captions alone: the caption allowance, or the captions
+/// switch. The web answers `ai-disabled` for its global AI switch as well; a
+/// listen chunk that follows tells the two apart. Premium, sign-in, the
+/// account blocklist and server configuration apply to listening too.
+pub fn is_caption_scoped_code(code: &str) -> bool {
+    matches!(code, "captions-monthly-quota-exhausted" | "ai-disabled")
+}
+
 #[derive(Debug, Clone)]
 pub enum CaptionChunkFailure {
     /// Stop the caption session and surface the reason (premium required,
