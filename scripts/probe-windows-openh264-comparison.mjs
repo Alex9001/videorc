@@ -18,15 +18,24 @@ import {
   measureOpenh264Comparison
 } from './lib/windows-openh264-comparison.mjs'
 
+import { runOwnedPcmEof, ownedPcmEofAggregate } from './lib/windows-owned-pcm-eof.mjs'
+
 const argv = process.argv.slice(2).filter((arg) => arg !== '--')
 const options = {}
 while (argv.length) {
   const name = argv.shift(),
     value = argv.shift()
-  if (!['--ffmpeg', '--ffprobe', '--output'].includes(name) || !value || value.startsWith('--'))
+  if (
+    !['--ffmpeg', '--ffprobe', '--output', '--eof-stability-passes'].includes(name) ||
+    !value ||
+    value.startsWith('--')
+  )
     throw new Error('Expected --ffmpeg, --ffprobe or --output followed by a value')
   options[name] = value
 }
+const eofStabilityPasses = Number(options['--eof-stability-passes'] ?? '1')
+if (!Number.isInteger(eofStabilityPasses) || eofStabilityPasses < 1 || eofStabilityPasses > 25)
+  throw new Error('EOF stability passes must be an integer from 1 through 25')
 const ffmpeg = resolve(options['--ffmpeg'] ?? 'vendor/ffmpeg/windows-x64/bin/ffmpeg.exe')
 const ffprobe = resolve(options['--ffprobe'] ?? join(dirname(ffmpeg), 'ffprobe.exe'))
 if (!options['--output']) throw new Error('A new --output directory is required')
@@ -189,13 +198,59 @@ try {
     rmSync(video)
     rmSync(audio)
   }
+  report.ownedPcmEof = []
+  const baselines = new Map()
+  for (let pass = 0; pass <= eofStabilityPasses; pass++) {
+    for (const initialAudioDelayMs of [0, 600]) {
+      const keepAudioAlive = pass > 0
+      const directory = join(output, `owned-pcm-pass${pass}-delay${initialAudioDelayMs}`)
+      mkdirSync(directory, { mode: 0o700 })
+      const row = { pass, initialAudioDelayMs, keepAudioAlive, state: 'running' }
+      report.ownedPcmEof.push(row)
+      save()
+      Object.assign(
+        row,
+        await runOwnedPcmEof({
+          ffmpeg,
+          ffprobe,
+          output: directory,
+          queuedAudioMs: initialAudioDelayMs,
+          initialAudioDelayMs,
+          keepAudioAlive
+        }),
+        { state: 'complete' }
+      )
+      if (!keepAudioAlive) baselines.set(initialAudioDelayMs, row)
+      else {
+        const baseline = baselines.get(initialAudioDelayMs)
+        row.firstOutputDeltaFromEarlyEofMs =
+          Number.isFinite(row.firstOutputMs) && Number.isFinite(baseline.firstOutputMs)
+            ? row.firstOutputMs - baseline.firstOutputMs
+            : null
+        row.stopDeltaFromEarlyEofMs =
+          Number.isFinite(row.stopMs) && Number.isFinite(baseline.stopMs)
+            ? row.stopMs - baseline.stopMs
+            : null
+      }
+      save()
+      if (row.unsafeCleanup || row.cancelled)
+        throw new Error(
+          'Owned PCM probe cancelled or cleanup incomplete; refusing further processes'
+        )
+    }
+  }
+  report.ownedPcmEofVerdict = ownedPcmEofAggregate(report.ownedPcmEof, eofStabilityPasses)
   report.measurementComplete =
     report.cases.length === openh264ComparisonCases.length &&
     report.cases.every(
       (row) => row.attempts.length === 2 && row.attempts.every((attempt) => attempt.completed)
     )
-  if (!report.measurementComplete) {
-    report.error = 'One or more paired measurements failed'
+  report.measurementComplete &&= report.ownedPcmEof.every(
+    (row) =>
+      row.childReaped && row.exitCode === 0 && Number.isFinite(row.packetTail?.tailMismatchMs)
+  )
+  if (!report.measurementComplete || !report.ownedPcmEofVerdict.pass) {
+    report.error = 'Paired measurement or owned PCM EOF regression failed'
     process.exitCode = 1
   }
 } catch (error) {

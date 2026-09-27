@@ -50,16 +50,16 @@ The failed session in the first bundle, `b6dcec24-b9e6-44ca-bc31-6c757c9efef8`, 
 Windows 0.9.115 **record+stream to YouTube and Twitch**, not just the YouTube
 destination named by the legacy `streamPreset` summary.
 
-| UTC, 2026-09-26 | Evidence |
-| --- | --- |
-| 22:12:14 | Start requested; two destinations configured. |
-| 22:12:17 | Capture worker received no fresh microphone PCM within 2 s; selected microphone retained through DirectShow fallback. This does not prove the direct input subsequently delivered audio. |
-| 22:12:25 | Intel Quick Sync MFT failed at `process-output`, `HRESULT=0x8000FFFF`; software OpenH264 selected. Combined reason also says system-memory input failed. |
-| 22:12:26 | Compositor barrier passed: three fresh 1920×1080 frames after 280 ms. Shared recording/stream writer started. |
-| 22:12:29 | 39 compositor ticks skipped before encode under output pressure. |
-| 22:12:34.751 | `ffmpeg-output-startup-failed`: no positive output media progress within 8,000 ms of process spawn. |
-| 22:12:35.199 | `recording-degraded`: 16 fps versus 30, incorrectly followed by “The stream continues”. This was 448 ms after the failure health event. |
-| 22:12:35 | Empty MKV removed; session marked failed; recorded writer counts eventually returned to zero. |
+| UTC, 2026-09-26 | Evidence                                                                                                                                                                                 |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 22:12:14        | Start requested; two destinations configured.                                                                                                                                            |
+| 22:12:17        | Capture worker received no fresh microphone PCM within 2 s; selected microphone retained through DirectShow fallback. This does not prove the direct input subsequently delivered audio. |
+| 22:12:25        | Intel Quick Sync MFT failed at `process-output`, `HRESULT=0x8000FFFF`; software OpenH264 selected. Combined reason also says system-memory input failed.                                 |
+| 22:12:26        | Compositor barrier passed: three fresh 1920×1080 frames after 280 ms. Shared recording/stream writer started.                                                                            |
+| 22:12:29        | 39 compositor ticks skipped before encode under output pressure.                                                                                                                         |
+| 22:12:34.751    | `ffmpeg-output-startup-failed`: no positive output media progress within 8,000 ms of process spawn.                                                                                      |
+| 22:12:35.199    | `recording-degraded`: 16 fps versus 30, incorrectly followed by “The stream continues”. This was 448 ms after the failure health event.                                                  |
+| 22:12:35        | Empty MKV removed; session marked failed; recorded writer counts eventually returned to zero.                                                                                            |
 
 No successful Running transition or usable recording is proven for this
 attempt. `finalDiagnostics` is null. Its 17 session logs contain no retained
@@ -81,12 +81,12 @@ PC's sustained capacity without examining FFmpeg progress timing.
 
 ## Findings and confidence
 
-| Finding | Impact | Confidence | Effort / fix risk |
-| --- | --- | --- | --- |
-| Startup stderr and session diagnostics are discarded on failure | The immediate cause of a real failed broadcast is hidden | HIGH, code and bundle agree | M / MED |
-| Configured streaming is mistaken for confirmed live output in a late warning | User sees “could not start” and “stream continues” together | HIGH, trace replay reproduced 3/3 | S–M / MED |
-| Intel rejection still falls through to an overloaded CPU path | Poor quality and startup pressure on this machine | HIGH for fallback; exact timeout causality unproven | L / HIGH |
-| Compact MF reason truncates the second topology failure | Cannot see the second stage/HRESULT despite Plan 065's intended diagnostic contract | HIGH, bundle ends with `system-memory input also failed: Me...` | S / LOW |
+| Finding                                                                      | Impact                                                                              | Confidence                                                      | Effort / fix risk |
+| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------- | ----------------- |
+| Startup stderr and session diagnostics are discarded on failure              | The immediate cause of a real failed broadcast is hidden                            | HIGH, code and bundle agree                                     | M / MED           |
+| Configured streaming is mistaken for confirmed live output in a late warning | User sees “could not start” and “stream continues” together                         | HIGH, trace replay reproduced 3/3                               | S–M / MED         |
+| Intel rejection still falls through to an overloaded CPU path                | Poor quality and startup pressure on this machine                                   | HIGH for fallback; exact timeout causality unproven             | L / HIGH          |
+| Compact MF reason truncates the second topology failure                      | Cannot see the second stage/HRESULT despite Plan 065's intended diagnostic contract | HIGH, bundle ends with `system-memory input also failed: Me...` | S / LOW           |
 
 Ranked hypotheses for the eight-second stall, not conclusions:
 
@@ -125,6 +125,7 @@ promise that a driver update or lower resolution solves this report.
    `FfmpegStderrTail` is persisted at :5125. Therefore queued startup messages
    never reach that consumer after rejection. The raw event channel is
    unbounded; any new diagnostic collector must itself be bounded.
+
 2. `SessionStartRowGuard::drop` (:5213) calls `finish_session(..., None, None)`.
    The running monitor owns final diagnostics (:8213). Reuse
    `persist_terminal_session_or_recovery` (:7631) and existing finalization
@@ -326,16 +327,16 @@ waiver of physical gates.
 ## Done criteria
 
 - [x] Failed/cancelled startup persists a redacted bounded FFmpeg tail and
-  session-owned diagnostics; reload/export tests prove it.
+      session-owned diagnostics; reload/export tests prove it.
 - [x] Both MF topology failure summaries retain stage/HRESULT under the cap.
 - [x] Event-order regression suppresses post-failure active notices and keeps
-  valid warnings for the new/running session.
+      valid warnings for the new/running session.
 - [ ] The precise Windows stall has a failing reproduction and a passing
-  regression; hardware/configuration assumptions are recorded, not guessed.
+      regression; hardware/configuration assumptions are recorded, not guessed.
 - [ ] Original two-destination plus recording case passes analyzed A/V on
-  affected hardware, or is explicitly recorded as still BLOCKED/unresolved.
+      affected hardware, or is explicitly recorded as still BLOCKED/unresolved.
 - [ ] Applicable verification and Windows repeat gates pass. Missing physical
-  evidence cannot be replaced with macOS tests or a fake receiver alone.
+      evidence cannot be replaced with macOS tests or a fake receiver alone.
 - [x] Only scoped files changed; plan index updated with actual status.
 
 ## STOP conditions and maintenance
@@ -357,7 +358,6 @@ The local desktop test invocation ran the entire existing suite: 174 files,
 1,742 tests passed, one skipped. That suite was the older local checkout and
 does not validate the released Windows binary. No implementation smoke claimed.
 
-
 ## Follow-up: successful dual-destination attempt (2026-09-27)
 
 Additional private evidence, not for commit:
@@ -370,11 +370,11 @@ destination.
 
 The second bundle retains the original failure and adds:
 
-| UTC session start | Mode | First confirmed FFmpeg output | Result |
-| --- | --- | --- | --- |
-| 22:12:14 | Record + YouTube + Twitch | No positive output before 8,000 ms deadline | Failed |
-| 22:15:53 | Local recording only | 6,262 ms | Completed |
-| 22:17:46 | Record + YouTube + Twitch | 6,352 ms | Completed, MP4 export recorded |
+| UTC session start | Mode                      | First confirmed FFmpeg output               | Result                         |
+| ----------------- | ------------------------- | ------------------------------------------- | ------------------------------ |
+| 22:12:14          | Record + YouTube + Twitch | No positive output before 8,000 ms deadline | Failed                         |
+| 22:15:53          | Local recording only      | 6,262 ms                                    | Completed                      |
+| 22:17:46          | Record + YouTube + Twitch | 6,352 ms                                    | Completed, MP4 export recorded |
 
 A new `Videorc backend ready` event at 22:17:20 precedes the successful
 livestream, whose startup timeline says `cold=true`. Therefore this is not
@@ -413,7 +413,6 @@ retention and terminal-state warning fixes remain independently established.
 No product changes, Windows reproduction, release or fix verification are
 claimed by this follow-up.
 
-
 ## Execution checkpoint
 
 Implementation began 2026-09-27 in an isolated worktree from `b772cb59`.
@@ -433,7 +432,6 @@ command; installed VBoxManage path is a stale stub without VirtualBox.app;
 repository self-hosted runner list is empty. Native Windows repeat gates and
 Intel/DirectShow reproduction are currently unavailable. Independent portable
 regression fixes and macOS gates proceed.
-
 
 ### Implemented scope and portable verification
 
@@ -455,13 +453,13 @@ behavior was changed. Steps 3 and 4 remain open pending Windows reproduction.
 
 Reviewer verification on 2026-09-27:
 
-| Gate | Result |
-| --- | --- |
-| `pnpm test:scripts` | PASS: 1,595 tests, 267 suites. |
+| Gate                                                            | Result                                   |
+| --------------------------------------------------------------- | ---------------------------------------- |
+| `pnpm test:scripts`                                             | PASS: 1,595 tests, 267 suites.           |
 | `pnpm --filter @videorc/desktop exec vitest run --maxWorkers=2` | PASS: 223 files, 2,227 tests, 1 skipped. |
-| StudioProvider integration file alone | PASS: all 108 tests. |
-| `pnpm typecheck`, `pnpm lint`, `pnpm format:check` | PASS. |
-| `cargo fmt --check --all`, `git diff --check` | PASS at review checkpoint. |
+| StudioProvider integration file alone                           | PASS: all 108 tests.                     |
+| `pnpm typecheck`, `pnpm lint`, `pnpm format:check`              | PASS.                                    |
+| `cargo fmt --check --all`, `git diff --check`                   | PASS at review checkpoint.               |
 
 The initial unrestricted desktop run, concurrent with cold native builds,
 accumulated overlapping React act/timeouts and was interrupted. The changed
@@ -469,14 +467,13 @@ case plus its successor passed together, the entire provider file passed, and
 then the complete suite passed with two workers. No test was disabled to get
 that result. Native verification follows below.
 
-
 ### Native verification
 
 - Final `cargo test -p videorc-backend`: PASS, 80 library + 2,461 backend
-  + 1 integration tests; 10 ignored. The first run identified two outdated
-  assertions for the changed copy/private retired-session history. Both were
-  corrected without weakening replacement-session isolation, then the complete
-  suite passed.
+  - 1 integration tests; 10 ignored. The first run identified two outdated
+    assertions for the changed copy/private retired-session history. Both were
+    corrected without weakening replacement-session isolation, then the complete
+    suite passed.
 - Reviewer independently ran the final built test executable: `ffmpeg`
   69 passed/2 ignored; `published` 13 passed; `recording_degraded` 2 passed;
   MF compact failure regressions 2 passed; `retired_stderr_generation`
@@ -495,7 +492,6 @@ reviewer independently reran all 13 `published` regressions successfully.
 Final clippy and Windows cross-compilation passed after this change. Native
 Windows repetition and Intel hardware acceptance remain unavailable; a
 cross-compile does not satisfy those gates. App smoke outcomes follow below.
-
 
 ### App smoke evidence and open timing failures
 
@@ -529,7 +525,6 @@ recording, but causality has not been established by a controlled baseline
 comparison. No timing threshold was changed. Remaining independent device and
 lifecycle results, and the one planned isolated latency rerun, follow below.
 
-
 ### Final review checkpoint
 
 Final-binary native tail passed: 100 detached-preview toggles, placement/docking,
@@ -559,14 +554,12 @@ At the implementation handoff, the patch was uncommitted in
 the confirmed fixes. That merge does not close steps 3–4 or claim native Windows
 acceptance. No release or broadcast is part of this incident task.
 
-
 Final isolated preview interaction stress repeat: PASS, exit 0, report has no
 failures. Rapid-scene stall was 24 ms; floating, resize and docked phases delivered
 59.9, 59.8 and 59.6 fps respectively. Thresholds and source were unchanged.
 Final latency also exited 0 after its harness timers drained. The temporary
 `vendor/ffmpeg/current` symlink created for local smokes was removed; its original
 FFmpeg target was untouched. Final Rust format and diff whitespace checks passed.
-
 
 ## Follow-on execution: remaining plan (2026-09-27)
 
@@ -613,7 +606,6 @@ all independently executable work, with unfinished acceptance explicit rather
 than declaring the entire incident solved. This user request authorizes commits,
 push and PR creation for this branch, not merge or release.
 
-
 Follow-on scope clarification: `session_audio.rs` may add a diagnostic-only
 worker-open failure hook, compiled only for Windows debug builds and requiring
 both `VIDEORC_ENABLE_SMOKE_RPC=1` and a dedicated incident flag. It must enter the
@@ -625,7 +617,6 @@ reproduction instrumentation, not a shipping media-policy change.
 The user confirmed no Windows PC is currently available. Hosted Windows can
 exercise the controlled-audio diagnostic cases and no-encoder probe behavior;
 physical worker/DirectShow and affected Intel acceptance must remain BLOCKED.
-
 
 ### Follow-on review checkpoint before hosted execution
 
@@ -654,7 +645,6 @@ Review corrections include complete-line READY parsing, redacted launch errors,
 immutable incident output directories, exact process ownership, independent
 receiver cleanup, atomic partial MF reports, and bounded optional report loading.
 No causal encoder/profile/timeout change has been justified or made.
-
 
 ### Reviewed implementation and acceptance record
 
@@ -755,3 +745,42 @@ Review of an exactly 100 ms measured tail exposed floating-point rejection at
 the boundary. Packet ends now use safe integer microseconds; regressions accept
 100 ms and reject 100.001 ms in either direction. This corrects comparison
 precision without changing the limit or accepting the larger observed tails.
+
+### Rejected software-padding candidate and next causal check
+
+A portable paced-PCM reproduction isolated an additional software-path defect:
+after microphone EOF, unpaced `apad` can fill FFmpeg's pre-encode shortest queue.
+Its overflow heartbeat advances the video queue timestamp artificially. In a
+paired run with identical 120 input/output video frames and encoded bytes,
+default padding produced a 2,080 ms tail; post-padding `arealtime` produced an
+11 ms tail with effectively identical video-writer completion time. Disabling
+padding is not acceptable because microphone EOF must not stop continuing video.
+
+The narrow pacing candidate was rejected and removed before committing. With
+production input probing and queues, it reduced a measured tail from 181 to
+11 ms. However, a delayed 600 ms initial PCM delivery increased stop latency
+from 132 to 586 ms, and an immediate queued burst stretched startup past ten
+seconds. A shorter tail does not justify those regressions. No production pacing
+or frame-skipping change is retained.
+
+The bounded stop-order comparison used production input arguments and retained
+all 120 input/filter/output frames. Keeping paced PCM alive through video EOF
+reduced the tail from 181 to 11 ms in both normal and delayed-start cases;
+EOF-to-exit remained 128 ms (early-EOF baselines: 140 and 114 ms). This supports
+an owned silent drain without adding a second pacing clock.
+
+The implementation under verification limits silent drain to Windows software
+encoding with owned raw-video and native-PCM inputs. Stop freezes capture stats,
+irreversibly silences writes, retires active and prepared microphones, and keeps
+timed zeros flowing until the existing FFmpeg owner exits. Partial-frame writes,
+late unmute, pending source switches, unexpected reader exit, failed startup and
+replacement-session isolation have dedicated regression coverage. Review also
+required preserving completion receipts when Stop cancels a prepared source.
+
+The maintained portable comparison now retains early-EOF baselines and repeats
+normal/delayed silent-drain candidates 25 times each on hosted Windows. Each
+candidate must preserve the video timeline, pass the unchanged 100 ms A/V limits,
+and close owned processes/sockets. Candidate p95 first-output/EOF-to-exit must
+meet the existing 1000/300 ms budgets; these are component measurements, not a
+replacement for application latency acceptance. Final verification is pending.
+This does not resolve or qualify the affected Intel hardware incident.

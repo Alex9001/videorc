@@ -455,3 +455,22 @@ either skip setting meets release quality or bandwidth requirements. The report
 keeps the strict 100 ms packet-tail result and exposes any extra bandwidth used
 when frame skipping is disabled. No shipping encoder option is changed by this
 probe, and neither result replaces the full incident matrices.
+
+The comparison also exercises owned PCM shutdown over runner-owned loopback TCP
+using the production raw-video/PCM queue sizes and default probing. It retains
+an early-PCM-EOF baseline, then ends captured input at three seconds while timed
+zeros continue until four seconds of video finish and FFmpeg exits. Normal and
+600 ms delayed/queued startup cases retain frame accounting, A/V start skew,
+packet tail, first-output time and video-EOF-to-exit time, plus their differences
+from the matching baseline. The 1500 ms diagnostic deadline bounds this probe;
+application click-to-idle acceptance still uses the existing latency budget.
+
+`--eof-stability-passes 25` repeats each candidate case 25 times on hosted
+Windows; the early-EOF baseline pair runs once. Every candidate must preserve the
+video timeline, keep PCM open through video EOF, close all owned processes and
+sockets, and satisfy the unchanged 100 ms start-skew/tail limits. No `arealtime`,
+input pacing, frame-skipping or codec policy changes are used by this comparison.
+The candidate aggregate also enforces the existing 1000 ms cold-start budget on
+first-output p95 and the existing 300 ms stop budget on EOF-to-exit p95 for each
+startup case. These component measurements do not replace the full application
+latency gate. Per-attempt baseline deltas remain in the report.

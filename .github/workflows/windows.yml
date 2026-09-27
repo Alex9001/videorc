@@ -186,7 +186,7 @@ jobs:
         run: pnpm ffmpeg:fetch:windows
       - name: Compare OpenH264 frame skipping on identical finite inputs
         shell: pwsh
-        run: pnpm probe:windows-openh264 -- --output "$env:RUNNER_TEMP/openh264-comparison"
+        run: pnpm probe:windows-openh264 -- --output "$env:RUNNER_TEMP/openh264-comparison" --eof-stability-passes 25
       - name: Retain standalone OpenH264 comparison before backend compilation
         if: always()
         uses: actions/upload-artifact@v4

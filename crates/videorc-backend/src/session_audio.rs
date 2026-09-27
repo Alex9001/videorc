@@ -776,6 +776,7 @@ pub struct AudioSwitchHandle {
     shared: Arc<std::sync::Mutex<AudioShared>>,
     producer_count: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
 }
 
 enum HandoffPurpose {
@@ -1070,6 +1071,12 @@ impl SessionAudio {
             .losses
             .pop_front()
     }
+    /// End capture immediately while preserving the timed PCM pipe until the
+    /// video owner closes FFmpeg. This transition is irreversible for a session.
+    pub fn request_silent_drain(&self) -> bool {
+        self.handle.request_silent_drain()
+    }
+
     pub fn request_stop(&self) {
         self.handle.stop.store(true, Ordering::Release);
         let stats = self.stats();
@@ -1094,6 +1101,19 @@ impl SessionAudio {
 }
 
 impl AudioSwitchHandle {
+    fn request_silent_drain(&self) -> bool {
+        // Share the source-commit linearization point: a racing handoff either
+        // completes before this freeze or observes draining and cannot commit.
+        let shared = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+        if self.stop.load(Ordering::Acquire) || self.draining.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        shared.stats.mark_stopped();
+        shared.stats.finish_recording_window();
+        shared.totals.finish_recording_window();
+        true
+    }
+
     pub async fn replace(
         &self,
         request: crate::live_source_switch::SourceSwitchParams,
@@ -1248,7 +1268,10 @@ impl AudioSwitchHandle {
         coordinator: &Arc<std::sync::Mutex<crate::live_source_switch::SourceSwitchCoordinator>>,
         cancelled: &AtomicBool,
     ) -> anyhow::Result<()> {
-        if self.stop.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
+        if self.stop.load(Ordering::Acquire)
+            || self.draining.load(Ordering::Acquire)
+            || cancelled.load(Ordering::Acquire)
+        {
             anyhow::bail!("Source change cancelled");
         }
         coordinator
@@ -1378,6 +1401,7 @@ pub fn attach_prepared(
         caption_injector: source.as_ref().and_then(|source| source.caption_injector()),
     }));
     let stop = Arc::new(AtomicBool::new(false));
+    let draining = Arc::new(AtomicBool::new(false));
     let processing_settings = AudioProcessingSettingsHandle::new(settings);
     let (finished_tx, finished) = mpsc::sync_channel(1);
     let (commands, command_rx) = mpsc::sync_channel(1);
@@ -1389,6 +1413,7 @@ pub fn attach_prepared(
         shared: shared.clone(),
         producer_count: producer_count.clone(),
         stop: stop.clone(),
+        draining: draining.clone(),
     };
     let writer_settings = processing_settings.clone();
     let path = fifo_path.clone();
@@ -1416,6 +1441,7 @@ pub fn attach_prepared(
                     BusContext {
                         settings: &writer_settings,
                         stop: &stop,
+                        draining: &draining,
                         source_stall_timeout,
                         shared: &shared,
                     },
@@ -1821,6 +1847,7 @@ fn ramp_through_zero(samples: &mut [f32], ramp_in: bool) {
 struct BusContext<'a> {
     settings: &'a AudioProcessingSettingsHandle,
     stop: &'a AtomicBool,
+    draining: &'a AtomicBool,
     source_stall_timeout: Duration,
     shared: &'a std::sync::Mutex<AudioShared>,
 }
@@ -1855,6 +1882,56 @@ fn run_bus(
     result
 }
 
+fn cancel_drain_observation(observe: &mut Option<OutputObservation>) {
+    if let Some(mut observation) = observe.take()
+        && let Some(acknowledgement) = observation.acknowledgement.take()
+    {
+        let _ = acknowledgement.send(Err(anyhow::anyhow!(
+            "Session audio is draining after Stop."
+        )));
+    }
+}
+
+fn retire_draining_sources(
+    producer: &mut Option<ManagedProducer>,
+    pending: &mut Option<PendingHandoff>,
+    commands: &mpsc::Receiver<AudioSwitchCommand>,
+    shared: &std::sync::Mutex<AudioShared>,
+    retired: &mut Vec<CompletionTicket>,
+) {
+    let mut retire = |owner: ManagedProducer| {
+        let id = owner.device_id.clone();
+        let completion = owner.retire();
+        shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retiring
+            .push((id, completion.state.clone()));
+        retired.push(completion);
+    };
+    if let Some(owner) = producer.take() {
+        retire(owner);
+    }
+    let mut cancel = |mut command: AudioSwitchCommand| {
+        if let Some(owner) = command.candidate.take() {
+            retire(owner);
+        }
+        let _ = command.acknowledgement.send(Err(anyhow::anyhow!(
+            "Session audio is draining after Stop."
+        )));
+    };
+    if let Some(handoff) = pending.take() {
+        cancel(handoff.command);
+    }
+    while let Ok(command) = commands.try_recv() {
+        cancel(command);
+    }
+    shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .owner_present = false;
+}
+
 fn run_bus_owned(
     producer: &mut Option<ManagedProducer>,
     path: &std::path::Path,
@@ -1866,6 +1943,7 @@ fn run_bus_owned(
     let BusContext {
         settings,
         stop,
+        draining,
         source_stall_timeout,
         shared,
     } = context;
@@ -1929,7 +2007,15 @@ fn run_bus_owned(
         .as_ref()
         .map_or(0, |stats| stats.dropped_frames());
     while !stop.load(Ordering::Acquire) {
-        if pending.is_none()
+        if draining.load(Ordering::Acquire) {
+            retire_draining_sources(producer, &mut pending, &commands, shared, retired);
+            receiver = None;
+            producer_stats = None;
+            timeline.select_generation(generation);
+            cancel_drain_observation(&mut observe);
+        }
+        if !draining.load(Ordering::Acquire)
+            && pending.is_none()
             && let Ok(command) = commands.try_recv()
         {
             pending = Some(PendingHandoff::new(
@@ -2016,7 +2102,7 @@ fn run_bus_owned(
             match handoff.action(
                 timeline.cursor(),
                 Instant::now(),
-                stop.load(Ordering::Acquire),
+                stop.load(Ordering::Acquire) || draining.load(Ordering::Acquire),
             ) {
                 HandoffAction::Continue => {}
                 HandoffAction::RampOld => {
@@ -2024,8 +2110,20 @@ fn run_bus_owned(
                     ramp_old = true;
                 }
                 HandoffAction::Cancel => {
-                    let handoff = pending.take().expect("pending handoff");
+                    let mut handoff = pending.take().expect("pending handoff");
                     ramp_in = handoff.old_ramped_down;
+                    if draining.load(Ordering::Acquire)
+                        && let Some(owner) = handoff.command.candidate.take()
+                    {
+                        let id = owner.device_id.clone();
+                        let completion = owner.retire();
+                        shared
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .retiring
+                            .push((id, completion.state.clone()));
+                        retired.push(completion);
+                    }
                     let _ = handoff.command.acknowledgement.send(Err(anyhow::anyhow!("The prepared microphone became unavailable or the source change was cancelled before cutover.")));
                 }
                 HandoffAction::Commit => {
@@ -2059,6 +2157,18 @@ fn run_bus_owned(
                             .send(Err(anyhow::anyhow!(error.message())));
                     } else {
                         let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+                        if draining.load(Ordering::Acquire) {
+                            if let Some(owner) = handoff.command.candidate.take() {
+                                let id = owner.device_id.clone();
+                                let completion = owner.retire();
+                                shared.retiring.push((id, completion.state.clone()));
+                                retired.push(completion);
+                            }
+                            let _ = handoff.command.acknowledgement.send(Err(anyhow::anyhow!(
+                                "Session audio is draining after Stop."
+                            )));
+                            continue;
+                        }
                         // Selection, route and receipt share this linearization
                         // point with Stop. No write or native close under locks.
                         let previous_identity = (
@@ -2202,8 +2312,14 @@ fn run_bus_owned(
             &raw.samples,
             settings,
             stop,
+            draining,
             Instant::now,
             || {
+                if draining.load(Ordering::Acquire) {
+                    retire_draining_sources(producer, &mut pending, &commands, shared, retired);
+                    receiver = None;
+                    producer_stats = None;
+                }
                 // The FIFO reader is behind. Keep ingesting so a bursty reader
                 // never pushes the microphone into the timeline's drop path.
                 if let Some(receiver) = receiver.as_ref() {
@@ -2263,7 +2379,9 @@ fn run_bus_owned(
                 .iter()
                 .fold(0.0_f32, |peak, sample| peak.max(sample.abs())),
         );
-        crate::captions::offer_caption_frame(&frame);
+        if !draining.load(Ordering::Acquire) {
+            crate::captions::offer_caption_frame(&frame);
+        }
         let after = timeline.counters();
         stats.record_captured_frames(after.captured_frames - accounted.captured_frames);
         stats.record_generated_frames(after.generated_frames - accounted.generated_frames);
@@ -2277,6 +2395,9 @@ fn run_bus_owned(
             shared.status.sample_cursor = timeline.cursor();
             shared.status.counters = after;
         }
+        if draining.load(Ordering::Acquire) {
+            cancel_drain_observation(&mut observe);
+        }
         if let Some(OutputObservation {
             request,
             coordinator,
@@ -2285,6 +2406,14 @@ fn run_bus_owned(
         {
             let mut coordinator = coordinator.lock().unwrap_or_else(|p| p.into_inner());
             let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+            if draining.load(Ordering::Acquire) {
+                if let Some(acknowledgement) = acknowledgement.take() {
+                    let _ = acknowledgement.send(Err(anyhow::anyhow!(
+                        "Session audio is draining after Stop."
+                    )));
+                }
+                continue;
+            }
             if let Some(receipt) = shared.status.last_commit.as_mut() {
                 receipt.output_observed |= written.stale_from.is_none()
                     && (request.device_id.is_none()
@@ -2314,6 +2443,7 @@ fn write_chunk_with_clock(
     raw: &[f32],
     settings: &AudioProcessingSettingsHandle,
     stop: &AtomicBool,
+    draining: &AtomicBool,
     mut now: impl FnMut() -> Instant,
     mut wait: impl FnMut(),
 ) -> io::Result<WrittenChunk> {
@@ -2341,7 +2471,9 @@ fn write_chunk_with_clock(
         // unmuted speech when the reader resumes. Finish any partially written
         // stereo frame before changing controls so the stream stays well-formed.
         let replace_from = written.div_ceil(8) * 8;
-        if clock.duration_since(started) >= Duration::from_millis(100) {
+        if draining.load(Ordering::Acquire) {
+            bytes[replace_from..].fill(0);
+        } else if clock.duration_since(started) >= Duration::from_millis(100) {
             bytes[replace_from..].fill(0);
             stale_from.get_or_insert(replace_from / 8);
         } else {
@@ -2699,6 +2831,7 @@ mod tests {
             &[0.25; 960],
             &settings,
             &AtomicBool::new(false),
+            &AtomicBool::new(false),
             || now,
             || {},
         )
@@ -2758,6 +2891,7 @@ mod tests {
             &[0.8; 960],
             &settings,
             &AtomicBool::new(false),
+            &AtomicBool::new(false),
             || now.get(),
             || now.set(now.get() + Duration::from_millis(200)),
         )
@@ -2772,6 +2906,7 @@ mod tests {
             &mut writer,
             &[0.8; 960],
             &settings,
+            &AtomicBool::new(false),
             &AtomicBool::new(false),
             || now.get(),
             || now.set(now.get() + WRITE_DEADLINE),
@@ -2788,11 +2923,323 @@ mod tests {
             &[0.8; 960],
             &settings,
             &stop,
+            &AtomicBool::new(false),
             || now.get(),
             || stop.store(true, Ordering::Release),
         );
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Interrupted);
         assert!(writer.bytes.is_empty());
+    }
+
+    #[test]
+    fn silent_drain_overrides_late_unmute_and_preserves_partial_pcm_frame() {
+        struct Partial<'a> {
+            bytes: Vec<u8>,
+            draining: &'a AtomicBool,
+            settings: &'a AudioProcessingSettingsHandle,
+        }
+        impl Write for Partial<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let count = if self.bytes.is_empty() {
+                    3
+                } else {
+                    bytes.len()
+                };
+                self.bytes.extend_from_slice(&bytes[..count]);
+                self.draining.store(true, Ordering::Release);
+                self.settings.update(AudioProcessingSettings {
+                    gain_db: 24.0,
+                    muted: false,
+                });
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let draining = AtomicBool::new(false);
+        let settings = AudioProcessingSettingsHandle::new(AudioProcessingSettings::default());
+        let mut writer = Partial {
+            bytes: Vec::new(),
+            draining: &draining,
+            settings: &settings,
+        };
+        let now = Instant::now();
+        let written = write_chunk_with_clock(
+            &mut writer,
+            &[0.25; 960],
+            &settings,
+            &AtomicBool::new(false),
+            &draining,
+            || now,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(&written.samples[..2], &[0.25, 0.25]);
+        assert!(written.samples[2..].iter().all(|sample| *sample == 0.0));
+        assert_eq!(
+            written.stale_from, None,
+            "intentional stop silence is not stale capture"
+        );
+        let mut next = Vec::new();
+        let written = write_chunk_with_clock(
+            &mut next,
+            &[0.75; 960],
+            &settings,
+            &AtomicBool::new(false),
+            &draining,
+            || now,
+            || {},
+        )
+        .unwrap();
+        assert!(written.samples.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[tokio::test]
+    async fn silent_drain_cancels_pending_output_observation() {
+        let request = source_request("drain-observe", Some("microphone:coreaudio:7"));
+        let coordinator = source_coordinator(&request);
+        let (acknowledgement, receipt) = tokio::sync::oneshot::channel();
+        let mut observe = Some(OutputObservation {
+            request,
+            coordinator,
+            acknowledgement: Some(acknowledgement),
+        });
+        cancel_drain_observation(&mut observe);
+        assert!(observe.is_none());
+        assert!(
+            receipt
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("draining")
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_drain_real_bus_retires_capture_freezes_stats_and_cleans_each_exit() {
+        use std::io::Read;
+        let mut previous: Option<AudioSwitchHandle> = None;
+        for exit in [
+            "normal-stop",
+            "unexpected-reader-exit",
+            "forced-reader-exit",
+            "pending-switch-drain",
+        ] {
+            let path = crate::audio::native_audio_fifo_path(&format!(
+                "drain-bus-{}",
+                uuid::Uuid::new_v4()
+            ));
+            crate::audio::create_native_audio_fifo(&path).unwrap();
+            let reader_path = path.clone();
+            let close_reader = Arc::new(AtomicBool::new(false));
+            let reader_close = close_reader.clone();
+            let (chunks, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let (reader_finished, finished) = mpsc::sync_channel(1);
+            let reader = thread::spawn(move || {
+                let result = (|| -> io::Result<()> {
+                    let mut file = std::fs::File::open(reader_path)?;
+                    let mut cursor = 0_u64;
+                    while !reader_close.load(Ordering::Acquire) {
+                        let mut bytes = [0_u8; CHUNK_FRAMES * 8];
+                        match file.read_exact(&mut bytes) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                            Err(error) => return Err(error),
+                        }
+                        let samples: Vec<_> = bytes
+                            .chunks_exact(4)
+                            .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+                            .collect();
+                        cursor += CHUNK_FRAMES as u64;
+                        let _ = chunks.send((cursor, samples));
+                    }
+                    Ok(())
+                })();
+                let _ = reader_finished.send(result);
+            });
+            let count = Arc::new(AtomicU64::new(0));
+            let producer =
+                paced_test_producer("microphone:coreaudio:7", 0.5, count.clone(), None).await;
+            let session = attach_prepared(
+                Some(InitialAudioSource {
+                    source: InitialInput::Owned {
+                        producer,
+                        count: count.clone(),
+                    },
+                }),
+                path,
+                None,
+                AudioProcessingSettings::default(),
+                Duration::from_secs(1),
+            );
+            if let Some(old) = previous.take() {
+                old.draining.store(true, Ordering::Release);
+                old.stop.store(true, Ordering::Release);
+            }
+            let verified = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let (_, samples) = received
+                        .recv()
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("Reader ended before captured PCM"))?;
+                    if samples.iter().all(|sample| *sample > 0.1) {
+                        break;
+                    }
+                }
+                anyhow::ensure!(
+                    !session.handle.draining.load(Ordering::Acquire),
+                    "retired session affected replacement"
+                );
+                if exit != "unexpected-reader-exit" {
+                    if exit == "pending-switch-drain" {
+                        let old_stats = session.stats();
+                        let handle = session.switch_handle();
+                        session.handle.shared.lock().unwrap().after_ramp =
+                            Some(Arc::new(move |_| {
+                                handle.request_silent_drain();
+                            }));
+                        let coordinator = source_coordinator(&source_request("setup-drain", None));
+                        let result = send_test_switch(
+                            &session,
+                            &coordinator,
+                            "pending-drain",
+                            Some("microphone:coreaudio:8"),
+                            0.8,
+                            false,
+                            None,
+                        )
+                        .await
+                        .0;
+                        anyhow::ensure!(result.is_err(), "prepared source committed after drain");
+                        anyhow::ensure!(session.handle.draining.load(Ordering::Acquire));
+                        anyhow::ensure!(
+                            Arc::ptr_eq(&old_stats, &session.stats()),
+                            "drain replaced frozen stats"
+                        );
+                        anyhow::ensure!(
+                            session.status().device_id.as_deref() == Some("microphone:coreaudio:7")
+                        );
+                        session.handle.shared.lock().unwrap().after_ramp = None;
+                    } else {
+                        anyhow::ensure!(session.request_silent_drain());
+                    }
+                    anyhow::ensure!(!session.request_silent_drain(), "drain must be idempotent");
+                    let cutoff = session.status().sample_cursor + 2 * CHUNK_FRAMES as u64;
+                    let captured = session.stats().captured_frames();
+                    let elapsed = session.stats().recording_window_elapsed_secs();
+                    session.update_processing_settings(AudioProcessingSettings {
+                        gain_db: 24.0,
+                        muted: false,
+                    });
+                    let mut silent_chunks = 0;
+                    while silent_chunks < 5 {
+                        let (end, samples) = received
+                            .recv()
+                            .await
+                            .ok_or_else(|| anyhow::anyhow!("Drain closed PCM before owner exit"))?;
+                        if end > cutoff {
+                            anyhow::ensure!(
+                                samples.iter().all(|sample| *sample == 0.0),
+                                "Stop released captured speech"
+                            );
+                            silent_chunks += 1;
+                        }
+                    }
+                    anyhow::ensure!(session.stats().captured_frames() == captured);
+                    anyhow::ensure!(session.stats().recording_window_elapsed_secs() == elapsed);
+                    if exit == "pending-switch-drain" {
+                        let shared = session.handle.shared.lock().unwrap();
+                        for id in ["microphone:coreaudio:7", "microphone:coreaudio:8"] {
+                            anyhow::ensure!(
+                                shared
+                                    .retiring
+                                    .iter()
+                                    .any(|(retired_id, _)| retired_id == id),
+                                "Drain discarded the completion receipt for {id}"
+                            );
+                        }
+                    }
+                    let retired: Vec<_> = session
+                        .handle
+                        .shared
+                        .lock()
+                        .unwrap()
+                        .retiring
+                        .iter()
+                        .map(|(_, state)| state.clone())
+                        .collect();
+                    anyhow::ensure!(!retired.is_empty(), "Capture was not retired");
+                    for mut state in retired {
+                        while *state.borrow() == ProducerCompletion::Running {
+                            state.changed().await?;
+                        }
+                        anyhow::ensure!(*state.borrow() == ProducerCompletion::Closed);
+                    }
+                    anyhow::ensure!(
+                        count.load(Ordering::Acquire) == 0,
+                        "Capture owner survived drain"
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            session.handle.shared.lock().unwrap().after_ramp = None;
+            previous = Some(session.switch_handle());
+            let reader_result = if exit != "normal-stop" {
+                close_reader.store(true, Ordering::Release);
+                Some(finished.recv_timeout(Duration::from_secs(2)))
+            } else {
+                None
+            };
+            // Both explicit Stop and unsolicited/forced reader exit retain one
+            // final owner. Always clean it before asserting diagnostic failures.
+            drop(session);
+            let reader_result =
+                reader_result.unwrap_or_else(|| finished.recv_timeout(Duration::from_secs(2)));
+            if reader_result.is_ok() {
+                reader.join().unwrap();
+            }
+            reader_result.expect("Owned reader did not finish").unwrap();
+            verified.expect("Drain readiness/cleanup deadline").unwrap();
+            assert_eq!(count.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_drain_failed_start_drop_retires_source_without_a_reader() {
+        let path = crate::audio::native_audio_fifo_path(&format!(
+            "drain-unopened-{}",
+            uuid::Uuid::new_v4()
+        ));
+        crate::audio::create_native_audio_fifo(&path).unwrap();
+        let count = Arc::new(AtomicU64::new(0));
+        let producer =
+            paced_test_producer("microphone:coreaudio:7", 0.5, count.clone(), None).await;
+        let mut closed = producer.completion.as_ref().unwrap().state.clone();
+        let session = attach_prepared(
+            Some(InitialAudioSource {
+                source: InitialInput::Owned {
+                    producer,
+                    count: count.clone(),
+                },
+            }),
+            path,
+            None,
+            AudioProcessingSettings::default(),
+            Duration::from_secs(1),
+        );
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *closed.borrow() == ProducerCompletion::Running {
+                closed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("Failed start retained microphone owner");
+        assert_eq!(*closed.borrow(), ProducerCompletion::Closed);
+        assert_eq!(count.load(Ordering::Acquire), 0);
     }
 
     #[cfg(unix)]

@@ -1891,6 +1891,20 @@ enum FfmpegLiveAudioStopMode {
     CloseCommandPipe,
 }
 
+fn owned_pcm_silent_drain_policy(
+    windows: bool,
+    video_output: EncoderBridgeVideoOutput,
+    encoder: FfmpegH264Platform,
+    owned_pcm: bool,
+    owned_bridge: bool,
+) -> bool {
+    windows
+        && video_output == EncoderBridgeVideoOutput::RawYuv420p
+        && encoder == FfmpegH264Platform::WindowsSoftware
+        && owned_pcm
+        && owned_bridge
+}
+
 #[derive(Debug)]
 pub struct ActiveRecording {
     pub session_id: String,
@@ -1908,6 +1922,8 @@ pub struct ActiveRecording {
     pub mode: String,
     pub audio_tracks: Vec<AudioTrack>,
     pub pipeline: RecordingPipeline,
+    /// Keep only timed silence alive until video-owned FFmpeg exits.
+    native_audio_silent_drain: bool,
     pub native_audio: Option<NativeAudioCaptureSession>,
     ffmpeg_live_audio_session: Option<SharedFfmpegLiveAudioSession>,
     pub screen_overlay: Option<ScreenOverlaySession>,
@@ -2040,6 +2056,7 @@ pub(crate) fn test_active_recording_stub(session_id: &str) -> ActiveRecording {
         mode: "record".to_string(),
         audio_tracks: Vec::new(),
         pipeline: RecordingPipeline::new(false, true, &[]),
+        native_audio_silent_drain: false,
         native_audio: None,
         ffmpeg_live_audio_session: None,
         screen_overlay: None,
@@ -5134,6 +5151,15 @@ async fn start_session_with_timeline(
         mode: mode.to_string(),
         audio_tracks,
         pipeline,
+        native_audio_silent_drain: owned_pcm_silent_drain_policy(
+            cfg!(target_os = "windows"),
+            windows_encoded_bridge_decision.effective,
+            windows_encoded_bridge_decision
+                .fallback_ffmpeg_encoder
+                .platform,
+            attached_native_audio.is_some(),
+            encoder_bridge.is_some(),
+        ),
         native_audio: attached_native_audio,
         ffmpeg_live_audio_session,
         screen_overlay,
@@ -5583,6 +5609,7 @@ async fn stop_recording_serialized(state: AppState) -> Result<RecordingStatus> {
     let wait_session_id = session_id.clone();
     set_stop_timeline_session(&state, &session_id);
     let mut force_stop_now = false;
+    let mut native_audio_silent_drain_started = false;
     let mut ffmpeg_live_audio_stop_session = None;
     let mut legacy_ffmpeg_stdin = None;
     #[cfg(target_os = "windows")]
@@ -5623,7 +5650,11 @@ async fn stop_recording_serialized(state: AppState) -> Result<RecordingStatus> {
     #[cfg(target_os = "windows")]
     release_direct_d3d11_consumer(&state, active);
     if let Some(native_audio) = active.native_audio.as_ref() {
-        native_audio.request_stop();
+        if active.native_audio_silent_drain {
+            native_audio_silent_drain_started = native_audio.request_silent_drain();
+        } else {
+            native_audio.request_stop();
+        }
     }
     active
         .pipeline
@@ -5770,6 +5801,17 @@ async fn stop_recording_serialized(state: AppState) -> Result<RecordingStatus> {
         "Stop requested; waiting for FFmpeg to finalize outputs.",
         None,
     );
+
+    if native_audio_silent_drain_started {
+        let _ = emit_session_log(
+            &state,
+            &wait_session_id,
+            HealthLevel::Info,
+            "native-audio-silent-drain",
+            "Microphone capture stopped; timed silent PCM remains owned until video EOF closes FFmpeg.",
+            None,
+        );
+    }
 
     let mut stop_io_error = None;
     if let Some((session, stop_mode)) = ffmpeg_live_audio_stop_session {
@@ -23806,6 +23848,7 @@ mod tests {
             mode: "stream".to_string(),
             audio_tracks: Vec::new(),
             pipeline: RecordingPipeline::new(false, true, &[]),
+            native_audio_silent_drain: false,
             native_audio: None,
             ffmpeg_live_audio_session: None,
             screen_overlay: None,
@@ -26400,6 +26443,42 @@ mod tests {
             arg_value(&legacy_args, "-filter_complex")
                 .is_some_and(|filter| filter.contains("[v_preview]"))
         );
+    }
+
+    #[test]
+    fn owned_pcm_silent_drain_is_limited_to_windows_software_raw_owned_sessions() {
+        for windows in [false, true] {
+            for owned_pcm in [false, true] {
+                for owned_bridge in [false, true] {
+                    for output in [
+                        EncoderBridgeVideoOutput::RawYuv420p,
+                        EncoderBridgeVideoOutput::WindowsMediaFoundationH264MpegTs,
+                    ] {
+                        for encoder in [
+                            FfmpegH264Platform::WindowsSoftware,
+                            FfmpegH264Platform::WindowsHardware,
+                            FfmpegH264Platform::Macos,
+                            FfmpegH264Platform::LinuxSoftware,
+                        ] {
+                            assert_eq!(
+                                owned_pcm_silent_drain_policy(
+                                    windows,
+                                    output,
+                                    encoder,
+                                    owned_pcm,
+                                    owned_bridge
+                                ),
+                                windows
+                                    && owned_pcm
+                                    && owned_bridge
+                                    && output == EncoderBridgeVideoOutput::RawYuv420p
+                                    && encoder == FfmpegH264Platform::WindowsSoftware
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -29763,6 +29842,7 @@ mod tests {
             mode: "record".to_string(),
             audio_tracks: audio_tracks.clone(),
             pipeline: RecordingPipeline::new(true, false, &audio_tracks),
+            native_audio_silent_drain: false,
             native_audio: None,
             ffmpeg_live_audio_session: Some(live_audio_session.clone()),
             screen_overlay: None,
