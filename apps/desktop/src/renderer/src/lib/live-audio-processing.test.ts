@@ -5,7 +5,8 @@ import {
   LatestWinsLiveAudioProcessingQueue,
   liveAudioProcessingSessionSyncDecision,
   mergeAudioProcessingParams,
-  rejectedLiveAudioProcessingUpdate
+  rejectedLiveAudioProcessingUpdate,
+  systemAudioProcessingDelta
 } from './live-audio-processing'
 
 function deferred<T>(): {
@@ -575,5 +576,26 @@ describe('system audio on the latest-wins queue (plan 069)', () => {
       { ...mic, microphoneGainDb: 1 },
       { ...mic, systemAudioEnabled: true, systemAudioGainDb: -3 }
     ])
+  })
+})
+
+describe('systemAudioProcessingDelta (plan 069)', () => {
+  const off = { systemAudioEnabled: false, systemAudioGainDb: -6 }
+
+  it('sends nothing when the session already holds the state', () => {
+    expect(systemAudioProcessingDelta(off, off)).toStrictEqual({})
+  })
+
+  it('sends only the fields that changed', () => {
+    expect(systemAudioProcessingDelta({ ...off, systemAudioEnabled: true }, off)).toStrictEqual({
+      systemAudioEnabled: true
+    })
+    expect(systemAudioProcessingDelta({ ...off, systemAudioGainDb: -12 }, off)).toStrictEqual({
+      systemAudioGainDb: -12
+    })
+  })
+
+  it('sends both when the session state is unknown', () => {
+    expect(systemAudioProcessingDelta(off, null)).toStrictEqual(off)
   })
 })

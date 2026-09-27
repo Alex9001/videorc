@@ -41,6 +41,9 @@ export function mergeObsImportIntoConfig(
         : {}),
       ...(typeof plan.audio.microphoneMuted === 'boolean'
         ? { microphoneMuted: plan.audio.microphoneMuted }
+        : {}),
+      ...(typeof plan.audio.systemAudioEnabled === 'boolean'
+        ? { systemAudioEnabled: plan.audio.systemAudioEnabled }
         : {})
     }
   }

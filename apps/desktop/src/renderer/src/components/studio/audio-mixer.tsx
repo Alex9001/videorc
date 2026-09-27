@@ -1,9 +1,10 @@
-import { MicrophoneIcon, SpeakerOffIcon, SpeakerOnIcon } from '@/components/icons'
+import { DesktopIcon, MicrophoneIcon, SpeakerOffIcon, SpeakerOnIcon } from '@/components/icons'
 import { useEffect, useRef, useState, type ReactElement, type RefObject } from 'react'
 
 import { PanelSection } from '@/components/panel-section'
 import { BarVisualizer, paintBarVisualizer } from '@/components/ui/bar-visualizer'
 import { Button } from '@/components/ui/button'
+import { Switch } from '@/components/ui/switch'
 import { useWorkspaceNav } from '@/components/workspace-nav'
 import { useStudioAudio, useStudioCore, useStudioDiagnostics } from '@/hooks/use-studio'
 import {
@@ -11,12 +12,23 @@ import {
   useStudioMicVisualPainter,
   useStudioMicVisualPeakDb
 } from '@/hooks/use-studio-mic-visual'
-import type { AudioMeterStatus } from '@/lib/backend'
+import type { AudioMeterStatus, DiagnosticStats } from '@/lib/backend'
 import { formatDb } from '@/lib/format'
 import { resampleMicVisualLevelsInto } from '@/lib/mic-visual-frame'
 import { audioMixerMonitorLabel } from '@/lib/mic-visual-gate'
-import { advanceClipHoldDeadline, fallbackBandLevels } from '@/lib/mic-meter'
+import {
+  advanceClipHoldDeadline,
+  backendMeterReading,
+  fallbackBandLevels,
+  type BackendMeterReading
+} from '@/lib/mic-meter'
 import { systemAccessAction, systemAccessRows, type SystemAccessAction } from '@/lib/system-access'
+import {
+  systemAudioDevice,
+  systemAudioIssueCopy,
+  systemAudioSwitchView,
+  type SystemAudioSwitchView
+} from '@/lib/system-audio'
 import { cn } from '@/lib/utils'
 
 const MIXER_BAR_COUNT = 28
@@ -53,8 +65,10 @@ export function audioMixerSignalLive(
  * is a question people ask BEFORE recording, and a meter pinned at the floor
  * cannot answer it. The OS microphone indicator is therefore lit while the
  * mixer is visible; the stream releases as soon as the page or the window is
- * hidden (idle-CPU discipline). System audio has no row here until capture
- * exists (plans/017): a permanent "Unavailable" badge read as a broken app.
+ * hidden (idle-CPU discipline). System audio (plan 069) sits under the mic:
+ * one switch, its level from the backend's 1 Hz stats while a session mixes
+ * it, and no row at all where capture is unsupported (a permanent
+ * "Unavailable" badge read as a broken app, #375).
  */
 export function AudioMixer(): ReactElement {
   const {
@@ -71,7 +85,7 @@ export function AudioMixer(): ReactElement {
   } = useStudioCore()
   const { audioMeter, audioMeterLoading } = useStudioAudio()
   const { diagnosticStats } = useStudioDiagnostics()
-  const { openStudioPanel } = useWorkspaceNav()
+  const { openStudioPanel, openSettings } = useWorkspaceNav()
 
   const muted = captureConfig.audio.microphoneMuted
   const micVisual = useStudioMicVisualLifecycle()
@@ -242,7 +256,146 @@ export function AudioMixer(): ReactElement {
           <span className="text-xs text-warning">{microphoneAccess?.detail}</span>
         ) : null}
       </div>
+      <SystemAudioMixerRow
+        diagnosticStats={diagnosticStats}
+        onOpenPermissions={() => openSettings('permissions')}
+      />
     </PanelSection>
+  )
+}
+
+/**
+ * System audio (plan 069 S5): the switch shows what the session confirms, the
+ * meter runs only while the session mixes it, and a health issue keeps the
+ * switch where the user put it and says what happened, without a toast.
+ */
+function SystemAudioMixerRow({
+  diagnosticStats,
+  onOpenPermissions
+}: {
+  diagnosticStats: DiagnosticStats | null | undefined
+  onOpenPermissions: () => void
+}): ReactElement | null {
+  const {
+    captureConfig,
+    setCaptureConfig,
+    deviceList,
+    isSessionActive,
+    systemAudioConfirmed,
+    systemAudioIssue
+  } = useStudioCore()
+  const view = systemAudioSwitchView({
+    device: systemAudioDevice(deviceList),
+    requested: captureConfig.audio.systemAudioEnabled,
+    sessionActive: isSessionActive,
+    confirmed: systemAudioConfirmed,
+    issue: systemAudioIssue
+  })
+  if (!view.visible) return null
+
+  return (
+    <SystemAudioMixerRowView
+      reading={
+        view.meter
+          ? backendMeterReading(
+              diagnosticStats?.systemAudioLiveLevel,
+              diagnosticStats?.systemAudioLivePeakDb
+            )
+          : null
+      }
+      view={view}
+      onEnabledChange={(systemAudioEnabled) =>
+        setCaptureConfig((current) => ({
+          ...current,
+          audio: { ...current.audio, systemAudioEnabled }
+        }))
+      }
+      onOpenPermissions={onOpenPermissions}
+    />
+  )
+}
+
+/** The System audio row itself: props in, markup out (the state matrix test renders it). */
+export function SystemAudioMixerRowView({
+  view,
+  reading,
+  onEnabledChange,
+  onOpenPermissions
+}: {
+  view: SystemAudioSwitchView
+  reading: BackendMeterReading | null
+  onEnabledChange: (enabled: boolean) => void
+  onOpenPermissions: () => void
+}): ReactElement {
+  const readout = reading?.peakDb != null ? formatDb(reading.peakDb) : view.stateLabel
+
+  return (
+    <div
+      className="flex flex-col gap-2 rounded-row border bg-foreground/[0.03] p-3"
+      data-videorc-system-audio-row={
+        view.permissionRequired
+          ? 'permission-required'
+          : view.issue
+            ? `issue-${view.issue}`
+            : view.pending
+              ? `pending-${view.pending}`
+              : view.meter
+                ? 'live'
+                : view.checked
+                  ? 'on'
+                  : 'off'
+      }
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex min-w-0 items-center gap-2">
+          <DesktopIcon className="size-4 shrink-0 text-muted-foreground" weight="duotone" />
+          <span className="truncate text-sm font-medium">System audio</span>
+        </span>
+        <span className="flex shrink-0 items-center gap-2.5">
+          {view.permissionRequired ? null : (
+            <span className="text-xs tabular-nums text-muted-foreground">{readout}</span>
+          )}
+          <Switch
+            aria-label="System audio"
+            checked={view.checked}
+            disabled={view.disabled}
+            size="sm"
+            onCheckedChange={onEnabledChange}
+          />
+        </span>
+      </div>
+      {view.meter ? (
+        <div className="flex items-center gap-3">
+          <BarVisualizer
+            centerAlign
+            barCount={MIXER_BAR_COUNT}
+            className={cn(
+              'h-8 min-w-0 flex-1',
+              reading && reading.level > 0 ? 'text-foreground/80' : 'text-muted-foreground/60'
+            )}
+            data-videorc-system-audio-visualizer
+            levels={fallbackBandLevels(reading?.level ?? 0, MIXER_BAR_COUNT)}
+            minHeight={8}
+            state="speaking"
+          />
+          <span className="min-w-16 shrink-0 text-right text-xs text-muted-foreground">Live</span>
+        </div>
+      ) : null}
+      {view.permissionRequired || view.issue === 'unavailable' ? (
+        <div className="flex items-center justify-between gap-2 text-xs text-warning">
+          <span className="min-w-0">
+            {view.permissionRequired
+              ? 'Needs Screen Recording permission'
+              : systemAudioIssueCopy('unavailable')}
+          </span>
+          <Button className="shrink-0" size="xs" variant="ghost" onClick={onOpenPermissions}>
+            Open Settings
+          </Button>
+        </div>
+      ) : view.issue === 'lost' ? (
+        <span className="text-xs text-warning">{systemAudioIssueCopy('lost')}</span>
+      ) : null}
+    </div>
   )
 }
 

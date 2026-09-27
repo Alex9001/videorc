@@ -36,7 +36,7 @@ export interface ObsImportPlanResult {
     cameraAspect?: CameraAspect
   }
   video: { width: number; height: number; fps: number }
-  audio: { microphoneGainDb?: number; microphoneMuted?: boolean }
+  audio: { microphoneGainDb?: number; microphoneMuted?: boolean; systemAudioEnabled?: boolean }
   outputDirectory?: ResourceSelection
   stream?:
     | { kind: 'rtmp-custom'; serverUrl: string; hasKey: boolean }
@@ -384,12 +384,28 @@ export function mapObsSetup(setup: ObsSetup, devices: Device[]): ObsImportPlanRe
       report.push({ verdict: 'skipped', subject: source.name, note })
     }
   }
+  // --- desktop audio -----------------------------------------------------------
+  // Plan 069: OBS's Desktop Audio is Videorc's System audio. It turns on only
+  // where this computer can capture it; the row is hidden everywhere else.
   if (setup.hasDesktopAudio) {
-    report.push({
-      verdict: 'skipped',
-      subject: 'Desktop audio',
-      note: 'system-audio capture is on the Videorc roadmap'
-    })
+    const systemAudio = devices.find((device) => device.kind === 'system-audio')
+    if (systemAudio?.status === 'available') {
+      result.audio.systemAudioEnabled = true
+      report.push({ verdict: 'imported', subject: 'Desktop audio', note: '→ System audio (on)' })
+    } else if (systemAudio?.status === 'permission-required') {
+      result.audio.systemAudioEnabled = true
+      report.push({
+        verdict: 'approximated',
+        subject: 'Desktop audio',
+        note: '→ System audio (on) once Screen Recording is allowed'
+      })
+    } else {
+      report.push({
+        verdict: 'skipped',
+        subject: 'Desktop audio',
+        note: 'this computer cannot capture system audio yet'
+      })
+    }
   }
 
   // --- other scenes -------------------------------------------------------------

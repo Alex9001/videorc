@@ -40,6 +40,26 @@ describe('mergeObsImportIntoConfig', () => {
     expect(next.recordEnabled).toBe(base.recordEnabled)
   })
 
+  it('lands an imported System audio switch in captureConfig.audio (plan 069)', () => {
+    const on = mergeObsImportIntoConfig(
+      defaultCaptureConfig,
+      plan({ audio: { systemAudioEnabled: true } }),
+      null
+    )
+    expect(on.audio.systemAudioEnabled).toBe(true)
+    expect(on.audio.systemAudioGainDb).toBe(defaultCaptureConfig.audio.systemAudioGainDb)
+    // A plan without desktop audio leaves the user's own choice alone.
+    const kept = mergeObsImportIntoConfig(
+      {
+        ...defaultCaptureConfig,
+        audio: { ...defaultCaptureConfig.audio, systemAudioEnabled: true }
+      },
+      plan(),
+      null
+    )
+    expect(kept.audio.systemAudioEnabled).toBe(true)
+  })
+
   it('keeps preset camera mode when the plan carries no custom transform', () => {
     const next = mergeObsImportIntoConfig(
       defaultCaptureConfig,

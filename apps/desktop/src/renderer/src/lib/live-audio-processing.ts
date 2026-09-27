@@ -7,8 +7,13 @@ import type {
 
 export type LiveAudioProcessingValues = Pick<AudioSettings, 'microphoneGainDb' | 'microphoneMuted'>
 
+/** The system-audio switch and level (plan 069), sent only when they change. */
+export type LiveSystemAudioValues = Pick<AudioSettings, 'systemAudioEnabled' | 'systemAudioGainDb'>
+
 export interface LiveAudioProcessingSessionStartSnapshot extends LiveAudioProcessingValues {
   sessionId: string
+  /** What `session.start` sent for system audio; absent when it sent none. */
+  systemAudio?: LiveSystemAudioValues
 }
 
 export interface LiveAudioProcessingSessionSyncDecision {
@@ -162,6 +167,26 @@ export function activeAudioProcessingUpdateParams(
     microphoneGainDb: audio.microphoneGainDb,
     microphoneMuted: audio.microphoneMuted
   }
+}
+
+/**
+ * The system-audio fields a live update must carry: only those the session
+ * does not already hold. `known` is what the session was last sent (its start
+ * request, then each queued update); null means unknown, so both are sent.
+ * An empty result means the system audio state is already in step.
+ */
+export function systemAudioProcessingDelta(
+  desired: LiveSystemAudioValues,
+  known: LiveSystemAudioValues | null
+): Partial<LiveSystemAudioValues> {
+  const delta: Partial<LiveSystemAudioValues> = {}
+  if (known?.systemAudioEnabled !== desired.systemAudioEnabled) {
+    delta.systemAudioEnabled = desired.systemAudioEnabled
+  }
+  if (known?.systemAudioGainDb !== desired.systemAudioGainDb) {
+    delta.systemAudioGainDb = desired.systemAudioGainDb
+  }
+  return delta
 }
 
 /**

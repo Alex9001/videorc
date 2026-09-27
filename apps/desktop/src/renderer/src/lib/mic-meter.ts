@@ -40,6 +40,28 @@ export function dbToMeterLevel(db: number, floorDb: number = MIC_METER_FLOOR_DB)
   return Math.min(1, Math.max(0, (db - floorDb) / -floorDb))
 }
 
+export interface BackendMeterReading {
+  /** 0..1 on the meter's dB scale. */
+  level: number
+  peakDb: number | null
+}
+
+/**
+ * A meter reading from the backend's 1 Hz stats (the system audio row, plan
+ * 069): its level when sent, else one derived from the peak; null when the
+ * backend sent neither, so the UI never invents a level.
+ */
+export function backendMeterReading(
+  level: number | null | undefined,
+  peakDb: number | null | undefined
+): BackendMeterReading | null {
+  const peak = typeof peakDb === 'number' && Number.isFinite(peakDb) ? peakDb : null
+  if (typeof level === 'number' && Number.isFinite(level)) {
+    return { level: Math.min(1, Math.max(0, level)), peakDb: peak }
+  }
+  return peak === null ? null : { level: dbToMeterLevel(peak), peakDb: peak }
+}
+
 /** dBFS → meter level with the shared noise gate: below the gate reads as floor. */
 export function gatedDbToMeterLevel(
   db: number,

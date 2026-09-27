@@ -227,7 +227,7 @@ export function systemAccessRows({
     rows.push({
       id: 'screen-recording',
       label: 'Screen Recording',
-      purpose: 'Capture displays and app windows.',
+      purpose: 'Capture displays, app windows and system audio.',
       state: screen,
       detail: accessDetail(screen, 'screen capture', os)
     })

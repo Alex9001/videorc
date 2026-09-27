@@ -2,6 +2,7 @@ import {
   type AppIcon,
   CaptionsIcon,
   ChevronDownIcon,
+  DesktopIcon,
   DisplayIcon,
   MicrophoneIcon,
   RecordIcon,
@@ -14,6 +15,7 @@ import { GroupedList } from '@/components/list-row'
 import { PanelSection } from '@/components/panel-section'
 import { SourceSwitchStatus } from '@/components/studio/source-switch-status'
 import { SourceSelect } from '@/components/source-select'
+import { useWorkspaceNav } from '@/components/workspace-nav'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import {
@@ -37,6 +39,12 @@ import {
   layoutPresetOrientation,
   resolutionOptionsForOrientation
 } from '@/lib/capture'
+import {
+  systemAudioDevice,
+  systemAudioIssueCopy,
+  systemAudioSwitchView,
+  type SystemAudioSwitchView
+} from '@/lib/system-audio'
 
 function resolutionKey(width: number, height: number): string {
   return `${width}x${height}`
@@ -98,8 +106,18 @@ export function QuickSettings(): ReactElement {
     entitlements,
     captionsStatus,
     captionsCommandPending,
-    wsStatus
+    wsStatus,
+    systemAudioConfirmed,
+    systemAudioIssue
   } = useStudioCore()
+  const { openSettings } = useWorkspaceNav()
+  const systemAudio = systemAudioSwitchView({
+    device: systemAudioDevice(deviceList),
+    requested: captureConfig.audio.systemAudioEnabled,
+    sessionActive: isSessionActive,
+    confirmed: systemAudioConfirmed,
+    issue: systemAudioIssue
+  })
   // Q6 (plan 022): before the backend reports devices, selects say "Finding
   // devices…" instead of rendering blank.
   const discoveryPending = wsStatus !== 'connected'
@@ -235,6 +253,22 @@ export function QuickSettings(): ReactElement {
           </Popover>
         </InspectorRow>
 
+        {/* SYSTEM AUDIO: plan 069 On/Off, live-safe; hidden where unsupported. */}
+        {systemAudio.visible ? (
+          <InspectorRow icon={DesktopIcon} label="System audio">
+            <SystemAudioInspectorValue
+              view={systemAudio}
+              onEnabledChange={(systemAudioEnabled) =>
+                setCaptureConfig((current) => ({
+                  ...current,
+                  audio: { ...current.audio, systemAudioEnabled }
+                }))
+              }
+              onOpenPermissions={() => openSettings('permissions')}
+            />
+          </InspectorRow>
+        ) : null}
+
         {/* OUTPUT — recording resolution, mirroring the Output tab's options. */}
         <InspectorRow icon={RecordIcon} label="Output">
           <Select
@@ -299,6 +333,52 @@ export function QuickSettings(): ReactElement {
   )
 }
 
+/** Short state beside the switch; the full health copy lives in its tooltip. */
+export function SystemAudioInspectorValue({
+  view,
+  onEnabledChange,
+  onOpenPermissions
+}: {
+  view: SystemAudioSwitchView
+  onEnabledChange: (enabled: boolean) => void
+  onOpenPermissions: () => void
+}): ReactElement {
+  const status =
+    view.issue === 'lost' ? 'Stopped' : view.issue ? 'Could not start' : view.stateLabel
+  return (
+    <div className="flex h-control min-w-0 items-center justify-end gap-2.5 px-2">
+      {view.permissionRequired ? (
+        // The row is narrow: the permission route replaces the (disabled)
+        // switch here; the mixer and Sources show both.
+        <Button
+          className="min-w-0"
+          size="xs"
+          title="System audio needs Screen Recording permission."
+          variant="ghost"
+          onClick={onOpenPermissions}
+        >
+          <span className="truncate">Needs permission</span>
+        </Button>
+      ) : (
+        <>
+          <span
+            className="min-w-0 truncate text-sm font-medium"
+            title={view.issue ? systemAudioIssueCopy(view.issue) : undefined}
+          >
+            {status}
+          </span>
+          <Switch
+            aria-label="System audio"
+            checked={view.checked}
+            disabled={view.disabled}
+            onCheckedChange={onEnabledChange}
+          />
+        </>
+      )}
+    </div>
+  )
+}
+
 /** A label on the left, its value control filling the right (the inspector row). */
 function InspectorRow({
   icon: RowIcon,
@@ -312,7 +392,7 @@ function InspectorRow({
   return (
     <div className="flex min-h-row items-center gap-2.5 py-0.5 pr-1 pl-3" data-slot="inspector-row">
       <RowIcon className="size-4 shrink-0 text-muted-foreground" weight="duotone" />
-      <span className="w-16 shrink-0 text-sm text-muted-foreground">{label}</span>
+      <span className="w-22 shrink-0 truncate text-sm text-muted-foreground">{label}</span>
       <div className="flex min-w-0 flex-1 justify-end">{children}</div>
     </div>
   )
