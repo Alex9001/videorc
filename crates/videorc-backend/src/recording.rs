@@ -12093,11 +12093,21 @@ fn append_h264_encoding_args_for_platform_with_timing(
             }
         }
         FfmpegH264Platform::LinuxVaapi => match vaapi_profile {
+            // No B-frames on any VAAPI session, not just streaming. The
+            // bundled n8.1.2 `h264_vaapi` defaults to bf=2, and its reorder
+            // delay deadlocks the `-shortest` sync queue whenever audio
+            // reaches FFmpeg after the first video frames, which it always
+            // does behind the bridge's video epoch. Video stops at ~frame 4,
+            // the audio FIFO backs up until Stop, and when no packet escapes
+            // first the 8s output-progress gate fails (ogre renderD128,
+            // 2026-09-27; libopenh264 and `-bf 0` both run clean).
             LinuxVaapiArgProfile::Standard => {
-                args.extend(["-rc_mode".to_string(), "VBR".to_string()]);
-                if low_latency {
-                    args.extend(["-bf".to_string(), "0".to_string()]);
-                }
+                args.extend([
+                    "-rc_mode".to_string(),
+                    "VBR".to_string(),
+                    "-bf".to_string(),
+                    "0".to_string(),
+                ]);
             }
             // Driver-compat profile (Plan 053): chosen by the probe only after
             // the standard set was rejected on the same node (ogre's Coffee
@@ -21290,6 +21300,19 @@ mod tests {
         assert_eq!(arg_value(&linux_vaapi_args, "-pix_fmt"), Some("vaapi"));
         assert_eq!(arg_value(&linux_vaapi_args, "-rc_mode"), Some("VBR"));
         assert_eq!(arg_value(&linux_vaapi_args, "-bf"), Some("0"));
+
+        // Record-only sessions too: B-frames deadlock the `-shortest` sync
+        // queue behind late bridge audio (ogre renderD128, 2026-09-27).
+        let mut linux_vaapi_record_args = Vec::new();
+        append_h264_encoding_args_for_platform(
+            &mut linux_vaapi_record_args,
+            &video,
+            FfmpegH264Platform::LinuxVaapi,
+            false,
+            LinuxVaapiArgProfile::Standard,
+        );
+        assert_eq!(arg_value(&linux_vaapi_record_args, "-rc_mode"), Some("VBR"));
+        assert_eq!(arg_value(&linux_vaapi_record_args, "-bf"), Some("0"));
 
         let mut linux_software_args = Vec::new();
         append_h264_encoding_args_for_platform(
