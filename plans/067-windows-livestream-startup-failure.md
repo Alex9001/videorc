@@ -728,8 +728,10 @@ The `c3f7f38c` hosted native PCM matrix completed all 48 starts and owned cleanu
 with 18 artifact passes and 30 failures. The clock correction reduced generated
 silence in one representative 1080p attempt from about 10.4 seconds to about
 1 ms. Remaining failures include measured silence, repeated frames and audio
-tails; these are retained as failures. A representative 720p tail had all 378
-supplied frames encoded, so encoder frame dropping alone does not explain it.
+tails; these are retained as failures. A representative 720p tail had equal
+supplied and encoded frame counts (378). This does not establish frame identity:
+the intervening FPS filter can duplicate frames, so matching counts cannot
+rule out encoder skipping. The end-to-end tail mechanism remains unresolved.
 
 Review also corrected Windows sibling tool discovery: an explicitly selected
 `ffmpeg.exe` now resolves its matching `ffprobe.exe`, and the incident runner
@@ -745,3 +747,11 @@ with skipping enabled. Disabling it retained all 90 frames and reduced tails to
 exceeded the measured two-second rate-plus-buffer envelope. Neither setting is
 qualified by this diagnostic. Shipping frame-skipping policy is unchanged;
 the paired Windows run and the independent tone matrix remain separate evidence.
+
+The independent FFmpeg-tone control on `c3f7f38c` finished with 15/48 artifact
+passes and no silence failures, but retained excessive audio tails and repeated
+frames. All Windows source gates and installer checks passed on that commit.
+Review of an exactly 100 ms measured tail exposed floating-point rejection at
+the boundary. Packet ends now use safe integer microseconds; regressions accept
+100 ms and reject 100.001 ms in either direction. This corrects comparison
+precision without changing the limit or accepting the larger observed tails.

@@ -77,3 +77,26 @@ test(
     }
   }
 )
+
+test('packet-tail compares integer microseconds at the exact 100ms boundary in either direction', () => {
+  for (const [videoEnd, audioEnd, expected] of [
+    ['12.721000', '12.821000', true],
+    ['12.721000', '12.821001', false],
+    ['12.821000', '12.721000', true],
+    ['12.821001', '12.721000', false]
+  ]) {
+    const measured = incidentPacketTail([
+      { codec_type: 'video', pts_time: videoEnd, duration_time: '0.001000' },
+      { codec_type: 'audio', pts_time: audioEnd, duration_time: '0.001000' }
+    ])
+    assert.equal(measured.pass, expected, JSON.stringify(measured))
+    assert.equal(measured.tailMismatchMs, expected ? 100 : 100.001)
+  }
+  assert.equal(
+    incidentPacketTail([
+      { codec_type: 'video', pts_time: '9007199255', duration_time: '0.033000' },
+      { codec_type: 'audio', pts_time: '9007199255', duration_time: '0.021000' }
+    ]).pass,
+    false
+  )
+})
