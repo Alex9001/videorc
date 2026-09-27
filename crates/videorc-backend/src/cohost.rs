@@ -17,11 +17,12 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
 use crate::captions::{CaptionUpdateKind, CaptionsUpdate};
+use crate::cohost_ack::{AuthorLedger, DeadAirLane, GreetedHow, dead_air_due, dead_air_text};
 use crate::comment_highlight::{CommentHighlightPhase, CommentHighlightState};
 use crate::live_chat::{LiveChatEventType, LiveChatMessage};
 use crate::protocol::{
-    CohostFlagParams, CohostPromiseParams, CohostQuestionParams, CohostRecapParams,
-    CohostSettingsPatch, CohostStartParams, FeatureId,
+    CohostAuthorParams, CohostFlagParams, CohostPromiseParams, CohostQuestionParams,
+    CohostRecapParams, CohostSettingsPatch, CohostStartParams, FeatureId,
 };
 use crate::state::AppState;
 use crate::storage::Database;
@@ -597,6 +598,27 @@ pub struct CohostRecap {
     pub expires_at: String,
 }
 
+/// A first-time chatter nobody greeted yet (plan 068 D9): "Say hi".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostSayHi {
+    /// The engine's per-author key; `cohost.author.greeted` takes it back.
+    pub author_key: String,
+    pub name: String,
+    pub platform: StreamPlatform,
+    pub first_seen_at: String,
+}
+
+/// A private dead-air suggestion (plan 068 D9): the renderer toasts each
+/// `key` once. Gone from the state after `DEAD_AIR_NUDGE_TTL`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostDeadAirNudge {
+    pub key: String,
+    pub text: String,
+    pub at: String,
+}
+
 /// The v2 extras are absent keys when the server did not send them — never
 /// `null`: the renderer contract rejects null for optional fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -759,6 +781,13 @@ pub struct CohostState {
     /// Omitted while there is no recap, or once it expired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recap: Option<CohostRecap>,
+    /// First-time chatters not greeted yet, first seen within 15 minutes,
+    /// oldest first, at most five (plan 068 D9). Omitted while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub say_hi: Vec<CohostSayHi>,
+    /// The latest dead-air nudge while it is fresh; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_air_nudge: Option<CohostDeadAirNudge>,
 }
 
 impl CohostState {
@@ -790,6 +819,8 @@ impl CohostState {
             promises: Vec::new(),
             promise_reminder: None,
             recap: None,
+            say_hi: Vec::new(),
+            dead_air_nudge: None,
         }
     }
 }
@@ -800,7 +831,7 @@ pub enum CohostError {
     Disabled,
     #[error("Orcle needs the active live chat session; sessionId did not match.")]
     SessionMismatch,
-    #[error("sessionId and the question, message or promise id are required.")]
+    #[error("sessionId and the question, message, promise or author id are required.")]
     InvalidParams,
     #[error("Orcle has nothing to recap yet: no summary has arrived this session.")]
     NoSummary,
@@ -1038,14 +1069,21 @@ pub fn new_cohost_recent_speech_slot() -> CohostRecentSpeechSlot {
 
 /// What the caption task observed on the microphone frames it received.
 /// Computed on the caption task, never on the audio thread. The tap is
-/// post-mute, so a muted microphone reads as silence here; mute itself is not
-/// known at frame level.
+/// post-mute, so a muted microphone is exact digital silence here (so is a
+/// lost device's generated silence); a live microphone never is, even in a
+/// quiet room.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VoiceActivity {
     /// Last monotonic instant a frame carried speech-level energy.
     pub last_voice_at: Option<Instant>,
     /// Last monotonic instant any frame reached the caption task.
     pub last_frame_at: Option<Instant>,
+    /// Last monotonic instant a frame was not exact digital silence.
+    pub last_signal_at: Option<Instant>,
+    /// Start of the current run of live-signal frames (a gap longer than
+    /// `VOICE_FRAME_STALE` starts a new one): the dead-air clock never counts
+    /// a mute as quiet.
+    pub live_since: Option<Instant>,
 }
 
 pub type CohostVoiceSlot = Arc<std::sync::Mutex<VoiceActivity>>;
@@ -1054,19 +1092,28 @@ pub fn new_cohost_voice_slot() -> CohostVoiceSlot {
     Arc::new(std::sync::Mutex::new(VoiceActivity::default()))
 }
 
-/// Caption-task hook: one received frame, already downmixed to 16 kHz mono.
-pub(crate) fn note_voice_frame(state: &AppState, samples: &[i16], now: Instant) {
-    let voiced = crate::captions::pcm_has_voice(samples);
+/// Caption-task hook: one received frame, `raw` as the session bus emitted it
+/// (post gain and mute) and `mono` already downmixed to 16 kHz.
+pub(crate) fn note_voice_frame(state: &AppState, raw: &[f32], mono: &[i16], now: Instant) {
+    let voiced = crate::captions::pcm_has_voice(mono);
+    let signal = raw.iter().any(|sample| *sample != 0.0);
     if let Ok(mut voice) = state.cohost_voice.lock() {
         voice.last_frame_at = Some(now);
+        if signal {
+            if voice.last_signal_at.is_none_or(|last| {
+                now.saturating_duration_since(last) > crate::cohost_ack::VOICE_FRAME_STALE
+            }) {
+                voice.live_since = Some(now);
+            }
+            voice.last_signal_at = Some(now);
+        }
         if voiced {
             voice.last_voice_at = Some(now);
         }
     }
 }
 
-/// The latest voice-activity observation (S6 reads it for the dead-air nudge).
-#[allow(dead_code)]
+/// The latest voice-activity observation (the dead-air nudge reads it).
 pub fn voice_activity(state: &AppState) -> VoiceActivity {
     state
         .cohost_voice
@@ -1132,6 +1179,15 @@ pub(crate) struct SpotlightOutcome {
     pub(crate) resolved: Vec<String>,
     /// The breaker closed the lane for this long.
     pub(crate) lane_off_for: Option<Duration>,
+}
+
+/// What one "Say hi" / dead-air pass changed (plan 068 D9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AcknowledgementPass {
+    /// The state snapshot differs: "Say hi" changed or a nudge fired.
+    pub(crate) changed: bool,
+    /// The nudge that just fired, for the log.
+    pub(crate) nudge: Option<String>,
 }
 
 /// One viewer saying "something is broken" (`alerts[]`), kept until it expires
@@ -1234,6 +1290,10 @@ struct CohostSession {
     transcript_pending: String,
     /// What the outstanding tick sent, restored on a version fallback.
     in_flight_transcript: String,
+    /// Chat you haven't acknowledged (plan 068 D9): who chatted this session
+    /// and who was greeted, and the dead-air nudge.
+    ledger: AuthorLedger,
+    dead_air: DeadAirLane,
 }
 
 /// What the engine remembers about one chat row it noted.
@@ -1390,6 +1450,8 @@ impl CohostSession {
             speech_cursor: None,
             transcript_pending: String::new(),
             in_flight_transcript: String::new(),
+            ledger: AuthorLedger::default(),
+            dead_air: DeadAirLane::default(),
         }
     }
 
@@ -1433,6 +1495,8 @@ impl CohostSession {
             promises: self.promises.clone(),
             promise_reminder: self.promise_reminder.clone(),
             recap: self.recap_at(now),
+            say_hi: self.ledger.say_hi(now),
+            dead_air_nudge: self.dead_air.current(now),
         }
     }
 
@@ -1472,6 +1536,9 @@ impl CohostSession {
             if text.is_empty() {
                 continue;
             }
+            // Plan 068 D9: a viewer's name in what the streamer said greets
+            // them. Same fold as the tick transcript, one pass per final.
+            self.ledger.greet_by_voice(text, final_.at);
             if !self.transcript_pending.is_empty() {
                 self.transcript_pending.push(' ');
             }
@@ -1588,6 +1655,15 @@ impl CohostSession {
                 continue;
             }
             self.cursor = Some(key);
+            self.ledger.note_message(
+                &alert_author_key(message),
+                message,
+                message
+                    .author_roles
+                    .iter()
+                    .any(|role| normalize_role(role).as_deref() == Some("owner")),
+                now,
+            );
             let Some(mapped) = tick_message_from_chat(message) else {
                 continue;
             };
@@ -2091,6 +2167,61 @@ impl CohostSession {
         Ok(())
     }
 
+    // --- Chat you haven't acknowledged (plan 068 D9) ---------------------------
+
+    /// One scheduler pass: "Say hi" changed (a new first-timer, a greeting, an
+    /// entry aging out), or the dead-air nudge fired (its text returned).
+    fn refresh_acknowledgement(
+        &mut self,
+        voice: VoiceActivity,
+        now: Instant,
+        now_iso: &str,
+    ) -> AcknowledgementPass {
+        let say_hi_changed = self.ledger.say_hi_changed(now);
+        let say_hi = self.ledger.say_hi(now);
+        let waiting = !self.questions.is_empty() || !say_hi.is_empty();
+        let nudge = dead_air_due(voice, waiting, self.dead_air.last_at(), now)
+            .then(|| dead_air_text(&self.questions, &say_hi))
+            .flatten()
+            .map(|text| {
+                self.dead_air
+                    .fire(self.generation, text, now, now_iso)
+                    .text
+                    .clone()
+            });
+        AcknowledgementPass {
+            changed: say_hi_changed || nudge.is_some(),
+            nudge,
+        }
+    }
+
+    /// The streamer's own send landed (`sent` or `partial`). A reply to a
+    /// question answers it and greets whoever asked; the name or `@handle`
+    /// of anyone in the text greets them.
+    fn own_send_delivered(&mut self, text: &str, question_id: Option<&str>, now: Instant) -> bool {
+        let mut changed = false;
+        if let Some(question_id) = question_id {
+            let askers: Vec<String> = self
+                .questions
+                .iter()
+                .find(|question| question.id == question_id)
+                .map(|question| {
+                    question
+                        .message_ids
+                        .iter()
+                        .filter_map(|id| self.known.get(id).map(|known| known.author.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for author in askers {
+                changed |= self.ledger.greet(&author, GreetedHow::Chat, now);
+            }
+            changed |= self.mark_answered(question_id);
+        }
+        changed |= self.ledger.greet_by_chat(text, now) > 0;
+        changed
+    }
+
     fn apply_failure(&mut self, error: &CohostApiError, now: Instant) {
         self.in_flight = false;
         let batch = std::mem::take(&mut self.in_flight_messages);
@@ -2589,6 +2720,10 @@ impl CohostSession {
                     expires_at: observed_expiry,
                 });
                 self.auto.shown.insert(message_id.to_string());
+                // Plan 068 D9: their message on stream acknowledges them.
+                if let Some(author) = self.known.get(message_id).map(|known| known.author.clone()) {
+                    self.ledger.greet(&author, GreetedHow::Highlight, now);
+                }
             }
             None => {
                 if let Some(card) = self.auto.card.take() {
@@ -3598,6 +3733,59 @@ impl CohostEngine {
         }
     }
 
+    /// One pass of "Say hi" and the dead-air nudge (plan 068 D9).
+    pub(crate) fn refresh_acknowledgement(
+        &mut self,
+        generation: u64,
+        voice: VoiceActivity,
+        now: Instant,
+        now_iso: &str,
+    ) -> AcknowledgementPass {
+        match self.session.as_mut() {
+            Some(session) if session.generation == generation => {
+                session.refresh_acknowledgement(voice, now, now_iso)
+            }
+            _ => AcknowledgementPass::default(),
+        }
+    }
+
+    /// Greeting lines queued since the last call, for the backend log.
+    pub(crate) fn take_greeting_log(&mut self) -> Vec<String> {
+        self.session
+            .as_mut()
+            .map(|session| session.ledger.take_log())
+            .unwrap_or_default()
+    }
+
+    fn mark_author_greeted(
+        &mut self,
+        session_id: &str,
+        author_key: &str,
+        now: Instant,
+    ) -> Result<bool, CohostError> {
+        Ok(self
+            .session_for_mut(session_id)?
+            .ledger
+            .greet(author_key, GreetedHow::Manual, now))
+    }
+
+    fn note_own_send(&mut self, session_id: &str, text: &str, now: Instant) {
+        if let Ok(session) = self.session_for_mut(session_id) {
+            session.ledger.note_own_send(text, now);
+        }
+    }
+
+    fn own_send_delivered(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        question_id: Option<&str>,
+        now: Instant,
+    ) -> bool {
+        self.session_for_mut(session_id)
+            .is_ok_and(|session| session.own_send_delivered(text, question_id, now))
+    }
+
     fn session_for_mut(&mut self, session_id: &str) -> Result<&mut CohostSession, CohostError> {
         match self.session.as_mut() {
             Some(session) if session.session_id == session_id => Ok(session),
@@ -4036,24 +4224,65 @@ pub async fn restore_question(
     Ok(snapshot)
 }
 
+/// `liveChat.send` start hook: remember the text, so its echo in chat proves
+/// which author is the streamer (plan 068 D9). No emit.
+pub(crate) async fn note_own_send_started(state: &AppState, session_id: &str, text: &str) {
+    state
+        .cohost
+        .lock()
+        .await
+        .note_own_send(session_id, text, Instant::now());
+}
+
 /// `liveChat.send` completion hook: a terminal sent/partial delivery that
-/// carried `inReplyToQuestionId` clears that question. A mismatched session is
-/// not an error here — the send already succeeded.
-pub(crate) async fn mark_question_answered_after_send(
+/// carried `inReplyToQuestionId` clears that question and greets whoever
+/// asked it; a name or `@handle` in the text greets that viewer (plan 068
+/// D9). A mismatched session is not an error here — the send already
+/// succeeded.
+pub(crate) async fn note_own_send_delivered(
     state: &AppState,
     session_id: &str,
-    question_id: &str,
+    text: &str,
+    question_id: Option<&str>,
 ) {
     let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
     let mut engine = state.cohost.lock().await;
-    let changed = engine
-        .mark_answered(session_id, question_id)
-        .unwrap_or(false);
+    let changed = engine.own_send_delivered(session_id, text, question_id, Instant::now());
+    let log = engine.take_greeting_log();
     let snapshot = engine.snapshot();
     drop(engine);
+    for line in log {
+        state.emit_log("info", line);
+    }
     if changed {
         emit_state(state, &snapshot, &lifecycle_delivery);
     }
+}
+
+/// `cohost.author.greeted` (plan 068 D9): the streamer says they greeted a
+/// viewer; "Say hi" drops them. An unknown or already greeted key is a no-op
+/// with the current state.
+pub async fn mark_author_greeted(
+    state: &AppState,
+    params: CohostAuthorParams,
+) -> Result<CohostState, CohostError> {
+    if params.session_id.trim().is_empty() || params.author_key.trim().is_empty() {
+        return Err(CohostError::InvalidParams);
+    }
+    let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
+    let mut engine = state.cohost.lock().await;
+    let changed =
+        engine.mark_author_greeted(&params.session_id, &params.author_key, Instant::now())?;
+    let log = engine.take_greeting_log();
+    let snapshot = engine.snapshot();
+    drop(engine);
+    for line in log {
+        state.emit_log("info", line);
+    }
+    if changed {
+        emit_state(state, &snapshot, &lifecycle_delivery);
+    }
+    Ok(snapshot)
 }
 
 pub async fn dismiss_flag(
@@ -4201,26 +4430,39 @@ async fn run_scheduler_pass(state: &AppState, generation: u64) -> bool {
     };
     let speech = recent_speech_since(state, seen_speech);
     let viewers = current_viewer_total(state);
-    let reminder = {
+    // Plan 068 D9: the same fold greets viewers named out loud; then "Say hi"
+    // and the dead-air nudge read the caption task's voice activity (its own
+    // lock, never nested with the engine's).
+    let voice = voice_activity(state);
+    let (reminded, nudged, greetings, snapshot) = {
         let mut engine = state.cohost.lock().await;
         if let Some(snapshot) = &speech {
             engine.note_speech(generation, snapshot);
         }
-        engine
-            .check_promises(
-                generation,
-                viewers,
-                Instant::now(),
-                &chrono::Utc::now().to_rfc3339(),
-            )
-            .then(|| engine.snapshot())
+        let now = Instant::now();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let reminded = engine.check_promises(generation, viewers, now, &now_iso);
+        let acknowledged = engine.refresh_acknowledgement(generation, voice, now, &now_iso);
+        let snapshot = (reminded || acknowledged.changed).then(|| engine.snapshot());
+        (
+            reminded,
+            acknowledged.nudge,
+            engine.take_greeting_log(),
+            snapshot,
+        )
     };
-    if let Some(snapshot) = reminder {
-        if let Some(reminder) = &snapshot.promise_reminder {
+    for line in greetings {
+        state.emit_log("info", line);
+    }
+    if let Some(snapshot) = snapshot {
+        if reminded && let Some(reminder) = &snapshot.promise_reminder {
             state.emit_log(
                 "info",
                 format!("Orcle reminds you of a promise: {}", reminder.text),
             );
+        }
+        if let Some(text) = nudged {
+            state.emit_log("info", format!("Orcle nudges you: {text}"));
         }
         emit_state(state, &snapshot, &lifecycle_delivery);
     }
@@ -8376,7 +8618,7 @@ mod tests {
                 updated_at: "t".to_string(),
                 on_topic: false,
             });
-        mark_question_answered_after_send(&state, "session-1", "q_1").await;
+        note_own_send_delivered(&state, "session-1", "Keychron Q1!", Some("q_1")).await;
         assert!(cohost_status(&state).await.questions.is_empty());
 
         // Turning the setting off stops the session.
@@ -8869,15 +9111,30 @@ mod tests {
         let before = voice_activity(&state);
         assert_eq!(before, VoiceActivity::default());
         let t0 = Instant::now();
-        note_voice_frame(&state, &vec![0i16; 320], t0);
+        // A muted microphone: frames arrive, exact digital silence.
+        note_voice_frame(&state, &[0.0; 640], &vec![0i16; 320], t0);
         assert_eq!(voice_activity(&state).last_frame_at, Some(t0));
+        assert_eq!(voice_activity(&state).last_voice_at, None);
+        assert_eq!(voice_activity(&state).last_signal_at, None);
+        assert_eq!(voice_activity(&state).live_since, None);
+        // A quiet room is a live signal (the noise floor), not a voice.
+        let t_quiet = t0 + Duration::from_millis(10);
+        note_voice_frame(&state, &[0.000_01; 640], &vec![0i16; 320], t_quiet);
+        assert_eq!(voice_activity(&state).last_signal_at, Some(t_quiet));
+        assert_eq!(voice_activity(&state).live_since, Some(t_quiet));
         assert_eq!(voice_activity(&state).last_voice_at, None);
         let loud: Vec<i16> = (0..320)
             .map(|i| if i % 2 == 0 { 3_000 } else { -3_000 })
             .collect();
         let t1 = t0 + Duration::from_millis(20);
-        note_voice_frame(&state, &loud, t1);
+        note_voice_frame(&state, &[0.1; 640], &loud, t1);
         assert_eq!(voice_activity(&state).last_voice_at, Some(t1));
+        // The live run continues; a gap longer than the stale window (a
+        // mute) starts a new one.
+        assert_eq!(voice_activity(&state).live_since, Some(t_quiet));
+        let t2 = t1 + Duration::from_secs(10);
+        note_voice_frame(&state, &[0.1; 640], &loud, t2);
+        assert_eq!(voice_activity(&state).live_since, Some(t2));
     }
 
     #[tokio::test]
@@ -9012,5 +9269,350 @@ mod tests {
                 .iter()
                 .all(|s| s["listening"].is_null())
         );
+    }
+
+    // --- Plan 068 S6: chat you haven't acknowledged ---------------------------
+
+    fn first_timer(seq: u32, name: &str) -> LiveChatMessage {
+        let mut message = chat_message("session-1", seq, &format!("2026-09-27T10:00:{seq:02}Z"));
+        message.author_id = Some(format!("id-{name}"));
+        message.author_name = name.to_string();
+        message.author_roles = Vec::new();
+        message.message_text = format!("first time here #{seq}");
+        message.first_message = true;
+        message
+    }
+
+    fn say_hi_names(engine: &CohostEngine, at: Instant) -> Vec<String> {
+        engine
+            .snapshot_at_for_test(at)
+            .say_hi
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    #[test]
+    fn say_hi_follows_voice_highlight_reply_mention_and_the_greeted_button() {
+        let start = Instant::now();
+        let (mut engine, generation) = running_engine(start);
+        let knight = first_timer(1, "x_Dark_Knight_x");
+        let bo = first_timer(2, "Bo");
+        let anna = first_timer(3, "Anna");
+        let sam = first_timer(4, "Sam");
+        let dee = first_timer(5, "Dee");
+        let mut owner = first_timer(6, "TheStreamer");
+        owner.author_roles = vec!["broadcaster".to_string()];
+        let mut regular = first_timer(7, "Regular");
+        regular.first_message = false;
+        for (index, row) in [&knight, &bo, &anna, &sam, &dee, &owner, &regular]
+            .into_iter()
+            .enumerate()
+        {
+            engine.note_messages_at(std::slice::from_ref(row), start + secs(index as u64));
+        }
+        // Oldest first; never the broadcaster, never a returning chatter.
+        assert_eq!(
+            say_hi_names(&engine, start + secs(8)),
+            ["x_Dark_Knight_x", "Bo", "Anna", "Sam", "Dee"]
+        );
+        let wire = serde_json::to_value(engine.snapshot_at_for_test(start + secs(8))).unwrap();
+        assert_eq!(
+            wire["sayHi"][0],
+            serde_json::json!({
+                "authorKey": "\"twitch\":id-x_Dark_Knight_x",
+                "name": "x_Dark_Knight_x",
+                "platform": "twitch",
+                "firstSeenAt": "2026-09-27T10:00:01Z"
+            })
+        );
+        assert!(wire.get("deadAirNudge").is_none());
+
+        // Voice: the same fold as the tick transcript greets by name.
+        engine.note_speech(
+            generation,
+            &speech(&[(start + secs(10), "Oh hey Dark Night, welcome in")]),
+        );
+        assert_eq!(
+            say_hi_names(&engine, start + secs(10)),
+            ["Bo", "Anna", "Sam", "Dee"]
+        );
+        // The transcript still reaches the tick.
+        assert!(
+            engine
+                .session
+                .as_ref()
+                .unwrap()
+                .transcript_pending
+                .contains("Dark Night")
+        );
+
+        // Their message on stream greets them.
+        engine.evaluate_auto_highlight(generation, &live_card(&bo.id, secs(8)), start + secs(11));
+        assert_eq!(
+            say_hi_names(&engine, start + secs(11)),
+            ["Anna", "Sam", "Dee"]
+        );
+
+        // A reply to their question greets whoever asked, and answers it.
+        engine
+            .session
+            .as_mut()
+            .unwrap()
+            .questions
+            .push(CohostQuestion {
+                id: "q_anna".to_string(),
+                text: "Which switches?".to_string(),
+                message_ids: vec![anna.id.clone()],
+                askers: vec!["Anna".to_string()],
+                platforms: vec![StreamPlatform::Twitch],
+                priority: CohostPriority::Normal,
+                suggested_reply: String::new(),
+                from_notes: false,
+                first_seen_at: ISO.to_string(),
+                updated_at: ISO.to_string(),
+                on_topic: false,
+            });
+        assert!(engine.own_send_delivered(
+            "session-1",
+            "Gateron browns!",
+            Some("q_anna"),
+            start + secs(12)
+        ));
+        assert!(engine.snapshot().questions.is_empty());
+        assert_eq!(say_hi_names(&engine, start + secs(12)), ["Sam", "Dee"]);
+
+        // A name or @handle in the streamer's own send greets them.
+        assert!(engine.own_send_delivered("session-1", "welcome in @Sam!", None, start + secs(13)));
+        assert!(!engine.own_send_delivered("session-1", "thanks chat", None, start + secs(13)));
+        assert!(!engine.own_send_delivered("other", "hi Dee", None, start + secs(13)));
+        assert_eq!(say_hi_names(&engine, start + secs(13)), ["Dee"]);
+
+        // The Greeted button.
+        let dee_key = alert_author_key(&dee);
+        assert_eq!(
+            engine.mark_author_greeted("other", &dee_key, start + secs(14)),
+            Err(CohostError::SessionMismatch)
+        );
+        assert_eq!(
+            engine.mark_author_greeted("session-1", "nobody", start + secs(14)),
+            Ok(false)
+        );
+        assert_eq!(
+            engine.mark_author_greeted("session-1", &dee_key, start + secs(14)),
+            Ok(true)
+        );
+        assert_eq!(
+            engine.mark_author_greeted("session-1", &dee_key, start + secs(14)),
+            Ok(false)
+        );
+        assert!(say_hi_names(&engine, start + secs(14)).is_empty());
+        let log = engine.take_greeting_log();
+        assert_eq!(log.len(), 5, "{log:?}");
+        assert!(log[0].contains("x_Dark_Knight_x (twitch) was greeted by voice"));
+        assert!(log[1].contains("Bo (twitch) was greeted on stream"));
+        assert!(log[2].contains("Anna (twitch) was greeted in chat"));
+        assert!(log[4].contains("Dee (twitch) was greeted by hand"));
+        assert!(
+            serde_json::to_value(engine.snapshot())
+                .unwrap()
+                .get("sayHi")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_echo_of_the_streamers_own_send_never_asks_to_say_hi() {
+        let start = Instant::now();
+        let (mut engine, _) = running_engine(start);
+        engine.note_own_send("session-1", "Welcome in everyone, great to see you", start);
+        let mut echo = first_timer(1, "StreamerOnX");
+        echo.platform = StreamPlatform::X;
+        echo.message_text = "Welcome in everyone, great to see you".to_string();
+        engine.note_messages_at(&[echo], start + secs(2));
+        assert!(say_hi_names(&engine, start + secs(2)).is_empty());
+    }
+
+    #[test]
+    fn dead_air_nudge_fires_once_per_two_minutes_with_a_fresh_key() {
+        let start = Instant::now();
+        let (mut engine, generation) = running_engine(start);
+        engine.note_messages_at(&[first_timer(1, "Sam")], start);
+        let quiet = |now: Instant| VoiceActivity {
+            last_voice_at: Some(start),
+            last_frame_at: Some(now),
+            last_signal_at: Some(now),
+            live_since: Some(start),
+        };
+        // The first pass publishes "Say hi"; nothing to nudge yet.
+        let first = engine.refresh_acknowledgement(
+            generation,
+            quiet(start + secs(1)),
+            start + secs(1),
+            ISO,
+        );
+        assert_eq!(
+            first,
+            AcknowledgementPass {
+                changed: true,
+                nudge: None
+            }
+        );
+        assert_eq!(
+            engine.refresh_acknowledgement(
+                generation,
+                quiet(start + secs(2)),
+                start + secs(2),
+                ISO
+            ),
+            AcknowledgementPass::default()
+        );
+        // Twenty quiet seconds with a first-timer waiting.
+        let at = start + secs(20);
+        let pass = engine.refresh_acknowledgement(generation, quiet(at), at, ISO);
+        assert!(pass.changed);
+        assert_eq!(
+            pass.nudge.as_deref(),
+            Some("Dead air: say hi to Sam, it's their first chat.")
+        );
+        let nudge = engine.snapshot_at_for_test(at).dead_air_nudge.unwrap();
+        assert_eq!(nudge.at, ISO);
+        // Not again within two minutes; the nudge leaves the state on its own.
+        let later = at + secs(60);
+        assert!(
+            !engine
+                .refresh_acknowledgement(generation, quiet(later), later, ISO)
+                .changed
+        );
+        assert_eq!(engine.snapshot_at_for_test(later).dead_air_nudge, None);
+        // A question now waits: it wins over saying hi, with a new key.
+        engine
+            .session
+            .as_mut()
+            .unwrap()
+            .questions
+            .push(CohostQuestion {
+                id: "q_1".to_string(),
+                text: "What keyboard is that?".to_string(),
+                message_ids: Vec::new(),
+                askers: vec!["Sam".to_string()],
+                platforms: vec![StreamPlatform::Twitch],
+                priority: CohostPriority::High,
+                suggested_reply: String::new(),
+                from_notes: false,
+                first_seen_at: ISO.to_string(),
+                updated_at: ISO.to_string(),
+                on_topic: false,
+            });
+        let again = at + secs(120);
+        let pass = engine.refresh_acknowledgement(generation, quiet(again), again, ISO);
+        assert_eq!(
+            pass.nudge.as_deref(),
+            Some("Dead air: answer Sam's question: “What keyboard is that?”")
+        );
+        let second = engine.snapshot_at_for_test(again).dead_air_nudge.unwrap();
+        assert_ne!(second.key, nudge.key);
+        // No frames (listening and captions off): no signal, no nudge.
+        let silent = VoiceActivity::default();
+        let much_later = again + secs(600);
+        assert_eq!(
+            engine
+                .refresh_acknowledgement(generation, silent, much_later, ISO)
+                .nudge,
+            None
+        );
+        // A replaced generation changes nothing.
+        assert_eq!(
+            engine.refresh_acknowledgement(generation + 1, quiet(much_later), much_later, ISO),
+            AcknowledgementPass::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn author_greeted_rpc_validates_and_publishes() {
+        let state = test_state();
+        let mut events = state.events.subscribe();
+        state
+            .live_chat
+            .lock()
+            .await
+            .start_session("session-1".to_string(), Vec::new());
+        set_cohost_settings(
+            &state,
+            CohostSettingsPatch {
+                enabled: Some(true),
+                ..CohostSettingsPatch::default()
+            },
+        )
+        .await
+        .unwrap();
+        start_cohost(
+            &state,
+            CohostStartParams {
+                session_id: "session-1".to_string(),
+                consent_to_process_chat: true,
+                stream_title: None,
+            },
+        )
+        .await
+        .unwrap();
+        note_messages(&state, &[first_timer(1, "Sam")]).await;
+        let key = cohost_status(&state).await.say_hi[0].author_key.clone();
+        assert_eq!(
+            mark_author_greeted(
+                &state,
+                CohostAuthorParams {
+                    session_id: "session-1".to_string(),
+                    author_key: " ".to_string(),
+                },
+            )
+            .await,
+            Err(CohostError::InvalidParams)
+        );
+        assert_eq!(
+            mark_author_greeted(
+                &state,
+                CohostAuthorParams {
+                    session_id: "other".to_string(),
+                    author_key: key.clone(),
+                },
+            )
+            .await,
+            Err(CohostError::SessionMismatch)
+        );
+        while events.try_recv().is_ok() {}
+        let greeted = mark_author_greeted(
+            &state,
+            CohostAuthorParams {
+                session_id: "session-1".to_string(),
+                author_key: key.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(greeted.say_hi.is_empty());
+        let mut saw_state = false;
+        while let Ok(event) = events.try_recv() {
+            if event.event == COHOST_STATE_EVENT {
+                saw_state = true;
+                assert!(event.payload.get("sayHi").is_none());
+            }
+        }
+        assert!(saw_state, "a greeting publishes the state");
+        // Again: a no-op, no emit.
+        mark_author_greeted(
+            &state,
+            CohostAuthorParams {
+                session_id: "session-1".to_string(),
+                author_key: key,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok())
+                .all(|event| event.event != COHOST_STATE_EVENT)
+        );
+        stop_cohost(&state).await;
     }
 }

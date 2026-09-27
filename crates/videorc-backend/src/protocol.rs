@@ -4100,6 +4100,14 @@ pub struct CohostRecapParams {
     pub session_id: String,
 }
 
+/// `cohost.author.greeted` (plan 068 D9): `authorKey` as `sayHi` carries it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostAuthorParams {
+    pub session_id: String,
+    pub author_key: String,
+}
+
 /// `cohost.settings.set`: every field optional; absent fields are unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -5664,6 +5672,24 @@ mod tests {
         assert!(legacy.promises.is_empty());
         assert_eq!(legacy.promise_reminder, None);
         assert_eq!(legacy.recap, None);
+        // Plan 068 S6: the Greeted params, "Say hi" and the dead-air nudge;
+        // both absent (never null) on the legacy payload.
+        let author_wire = shared_high_risk_contract_fixture_value("/cohost/authorParams");
+        let author: CohostAuthorParams = serde_json::from_value(author_wire.clone()).unwrap();
+        assert_eq!(author.author_key, "\"twitch\":viewer-fixture");
+        assert_eq!(serde_json::to_value(author).unwrap(), author_wire);
+        assert_eq!(v2.say_hi.len(), 1);
+        assert_eq!(v2.say_hi[0].name, "x_Dark_Knight_x");
+        assert_eq!(
+            v2.say_hi[0].platform,
+            crate::streaming::StreamPlatform::Twitch
+        );
+        assert_eq!(
+            v2.dead_air_nudge.as_ref().map(|nudge| nudge.key.as_str()),
+            Some("dead-air-1-1")
+        );
+        assert!(legacy.say_hi.is_empty());
+        assert_eq!(legacy.dead_air_nudge, None);
     }
 
     #[test]

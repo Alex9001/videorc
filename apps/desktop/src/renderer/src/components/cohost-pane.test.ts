@@ -265,6 +265,52 @@ describe('CohostPane', () => {
     expect(markup).not.toContain('>Send<')
   })
 
+  it('lists first-time chatters to say hi to, each with a Greeted button (plan 068 D9)', () => {
+    const markup = renderPane({
+      state: state({
+        sayHi: [
+          {
+            authorKey: '"twitch":id-sam',
+            name: 'x_Dark_Knight_x',
+            platform: 'twitch',
+            firstSeenAt: '2026-08-22T11:57:00.000Z'
+          },
+          {
+            authorKey: '"youtube":id-bo',
+            name: 'Bo',
+            platform: 'youtube',
+            firstSeenAt: '2026-08-22T11:59:40.000Z'
+          }
+        ]
+      }),
+      onSayHiGreeted: () => undefined
+    })
+    expect(markup).toContain('data-slot="cohost-say-hi"')
+    expect(markup).toContain('>Say hi<')
+    expect(markup.split('data-slot="cohost-say-hi-row"')).toHaveLength(3)
+    expect(markup).toContain('x_Dark_Knight_x')
+    expect(markup).toContain('aria-label="Twitch"')
+    expect(markup).toContain('aria-label="YouTube"')
+    expect(markup).toContain('>Greeted<')
+    // Nothing waiting: no section at all.
+    expect(renderPane({ state: state() })).not.toContain('data-slot="cohost-say-hi"')
+    // Without the relay the button cannot act.
+    expect(
+      renderPane({
+        state: state({
+          sayHi: [
+            {
+              authorKey: 'k',
+              name: 'Sam',
+              platform: 'kick',
+              firstSeenAt: '2026-08-22T11:59:00.000Z'
+            }
+          ]
+        })
+      })
+    ).toMatch(/disabled=""[^>]*>Greeted</)
+  })
+
   it('offers a recap draft while none is shown, and hides an expired recap', () => {
     const drafting = renderPane({ state: state(), onRecapDraft: () => undefined })
     expect(drafting).toContain('data-slot="cohost-recap-draft"')

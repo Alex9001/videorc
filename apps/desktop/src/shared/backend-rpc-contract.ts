@@ -10,6 +10,7 @@ import type {
   ScheduledStreamCandidate,
   CaptureRecoveryStatus,
   CohostFlagParams,
+  CohostAuthorParams,
   CohostPromiseParams,
   CohostRecapParams,
   CohostQuestionParams,
@@ -247,6 +248,7 @@ export interface BackendRpcMethodMap {
   'cohost.promise.dismiss': BackendRpcDefinition<CohostPromiseParams, CohostState>
   'cohost.recap.dismiss': BackendRpcDefinition<CohostRecapParams, CohostState>
   'cohost.recap.draft': BackendRpcDefinition<CohostRecapParams, CohostState>
+  'cohost.author.greeted': BackendRpcDefinition<CohostAuthorParams, CohostState>
   'cohost.settings.get': BackendRpcDefinition<undefined, CohostSettings>
   'cohost.settings.set': BackendRpcDefinition<CohostSettingsPatch, CohostSettings>
 }
@@ -1889,6 +1891,20 @@ const cohostRecapSchema = objectSchema(
   { text: stringSchema({ maxLength: 140 }), at: timestamp, expiresAt: timestamp },
   { allowUnknown: false }
 )
+// Plan 068 D9: "Say hi" and the dead-air nudge.
+const cohostSayHiSchema = objectSchema(
+  {
+    authorKey: boundedString,
+    name: stringSchema({ minLength: 1, maxLength: 512 }),
+    platform: streamPlatformSchema,
+    firstSeenAt: timestamp
+  },
+  { allowUnknown: false }
+)
+const cohostDeadAirNudgeSchema = objectSchema(
+  { key: boundedString, text: stringSchema({ minLength: 1, maxLength: 1024 }), at: timestamp },
+  { allowUnknown: false }
+)
 // `unknown` is the backend's serde catch-all for a kind newer than this build;
 // it must validate, or one new server kind would drop the whole state event.
 const cohostFlagKindSchema = enumSchema([
@@ -2042,7 +2058,9 @@ const cohostStateSchema = objectSchema(
     topic: optionalSchema(stringSchema({ maxLength: 60 })),
     promises: optionalSchema(arraySchema(cohostPromiseSchema, { maxLength: 20 })),
     promiseReminder: optionalSchema(cohostPromiseReminderSchema),
-    recap: optionalSchema(cohostRecapSchema)
+    recap: optionalSchema(cohostRecapSchema),
+    sayHi: optionalSchema(arraySchema(cohostSayHiSchema, { maxLength: 5 })),
+    deadAirNudge: optionalSchema(cohostDeadAirNudgeSchema)
   },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostState>
@@ -2070,6 +2088,10 @@ const cohostRecapParamsSchema = objectSchema(
   { sessionId: boundedString },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostRecapParams>
+const cohostAuthorParamsSchema = objectSchema(
+  { sessionId: boundedString, authorKey: boundedString },
+  { allowUnknown: false }
+) as RuntimeSchema<CohostAuthorParams>
 
 const scheduledMutationSchema = objectSchema(
   {
@@ -2509,6 +2531,7 @@ const runtimeContracts = {
   'cohost.promise.dismiss': { params: cohostPromiseParamsSchema, result: cohostStateSchema },
   'cohost.recap.dismiss': { params: cohostRecapParamsSchema, result: cohostStateSchema },
   'cohost.recap.draft': { params: cohostRecapParamsSchema, result: cohostStateSchema },
+  'cohost.author.greeted': { params: cohostAuthorParamsSchema, result: cohostStateSchema },
   'cohost.settings.get': { params: undefinedSchema, result: cohostSettingsSchema },
   'cohost.settings.set': { params: cohostSettingsPatchSchema, result: cohostSettingsSchema }
 } satisfies Record<BackendRpcMethod, RuntimeBackendRpcContract>

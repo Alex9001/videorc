@@ -19,6 +19,7 @@ mod capture_input;
 mod capture_interruption;
 mod capture_recovery;
 mod cohost;
+mod cohost_ack;
 mod color;
 mod comment_highlight;
 mod compositor;
@@ -5035,6 +5036,7 @@ fn websocket_method_execution_policy(method: &str) -> Option<WebSocketMethodExec
         | "cohost.promise.dismiss"
         | "cohost.recap.dismiss"
         | "cohost.recap.draft"
+        | "cohost.author.greeted"
         | "cohost.settings.set"
         | "captions.overlay.clear"
         | "captions.cues.submit"
@@ -8726,6 +8728,19 @@ async fn handle_text_message_with_role(
         "cohost.recap.draft" => {
             match serde_json::from_value::<protocol::CohostRecapParams>(command.params) {
                 Ok(params) => match cohost::draft_recap(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => {
+                        ServerResponse::error(command.id, error.code(), error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "cohost.author.greeted" => {
+            match serde_json::from_value::<protocol::CohostAuthorParams>(command.params) {
+                Ok(params) => match cohost::mark_author_greeted(state, params).await {
                     Ok(status) => ServerResponse::ok(command.id, status),
                     Err(error) => {
                         ServerResponse::error(command.id, error.code(), error.to_string())

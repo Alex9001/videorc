@@ -29,6 +29,7 @@ import type {
   CohostFlag,
   CohostPromise,
   CohostQuestion,
+  CohostSayHi,
   CohostState,
   CommentHighlightAnchor,
   CommentHighlightState,
@@ -44,11 +45,13 @@ import { useCohostSensitivity } from '@/hooks/use-cohost-sensitivity'
 import { cohostGroupedDeltaFlash } from '@/lib/cohost-presence'
 import { activeCohostSpotlight, cohostCommentMarks } from '@/lib/cohost-marks'
 import {
+  cohostDeadAirToast,
   cohostNudgeVisible,
   cohostPromiseReminderToast,
   cohostQuestionToast,
   cohostStateForSensitivity,
   draftForQuestion,
+  COHOST_DEAD_AIR_TOAST_ID,
   COHOST_PROMISE_TOAST_ID,
   COHOST_QUESTION_TOAST_ID
 } from '@/lib/cohost-view'
@@ -195,6 +198,8 @@ export interface StreamManagerProps {
   onCohostPromiseDismiss?: (promise: CohostPromise) => void
   onCohostRecapDismiss?: () => void
   onCohostRecapDraft?: () => Promise<CohostState | null>
+  /** The Greeted button on a "Say hi" row (plan 068 D9). */
+  onCohostAuthorGreeted?: (entry: CohostSayHi) => void
   onCohostEnableConsent?: () => void
   onCohostUpgrade?: (url: string) => void
 }
@@ -244,6 +249,7 @@ export function StreamManager({
   onCohostPromiseDismiss,
   onCohostRecapDismiss,
   onCohostRecapDraft,
+  onCohostAuthorGreeted,
   onCohostEnableConsent,
   onCohostUpgrade
 }: StreamManagerProps): ReactElement {
@@ -283,6 +289,7 @@ export function StreamManager({
   const cohostPaneOpenRef = useRef(true)
   const previousCohostStateRef = useRef<CohostState | null>(null)
   const cohostToastAtRef = useRef<number | null>(null)
+  const deadAirToastKeyRef = useRef<string | null>(null)
   const [cohostNudgeDismissedSessionId, setCohostNudgeDismissedSessionId] = useState<string | null>(
     null
   )
@@ -305,6 +312,12 @@ export function StreamManager({
     // A met promise trigger (plan 068 D8): private, keyed, once per promise.
     const reminder = cohostPromiseReminderToast({ previous, next: cohostState })
     if (reminder) toast(reminder, { id: COHOST_PROMISE_TOAST_ID })
+    // Dead air (plan 068 D9): private, keyed, each nudge once.
+    const deadAir = cohostDeadAirToast(cohostState, deadAirToastKeyRef.current)
+    if (deadAir) {
+      deadAirToastKeyRef.current = deadAir.key
+      toast(deadAir.text, { id: COHOST_DEAD_AIR_TOAST_ID })
+    }
     const delta = cohostGroupedDeltaFlash(previous, cohostState)
     if (delta) setCohostFlash(delta)
   }, [cohostState])
@@ -507,6 +520,7 @@ export function StreamManager({
             }}
             onPromiseDismiss={onCohostPromiseDismiss}
             onPromiseDone={onCohostPromiseDone}
+            onSayHiGreeted={onCohostAuthorGreeted}
             onRecapDismiss={onCohostRecapDismiss}
             onRecapDraft={
               onCohostRecapDraft

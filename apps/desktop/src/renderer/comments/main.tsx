@@ -360,6 +360,7 @@ function CommentsWindowApp(): ReactElement {
           void sendCohostAction('recap-dismiss')(snapshot.sessionId ?? '')
         }
         onCohostRecapDraft={() => sendCohostAction('recap-draft')(snapshot.sessionId ?? '')}
+        onCohostAuthorGreeted={(entry) => void sendCohostAction('author-greeted')(entry.authorKey)}
         onCohostEnable={(enabled) => setCohostEnabled(enabled)}
         onCohostEnableConsent={() => setCohostEnabled(true, true)}
         onCohostListenOn={() => setCohostEnabled(true, false, true)}

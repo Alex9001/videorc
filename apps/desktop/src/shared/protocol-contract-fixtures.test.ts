@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 import { normalizeLayoutSettings } from '../renderer/src/lib/capture'
 import type {
   AccountCallbackEnvelope,
+  CohostAuthorParams,
   CohostFlagParams,
   CohostPromiseParams,
   CohostQuestionParams,
@@ -72,6 +73,7 @@ interface HighRiskContractFixtures {
     flagParams: CohostFlagParams
     promiseParams: CohostPromiseParams
     recapParams: CohostRecapParams
+    authorParams: CohostAuthorParams
     settingsPatch: CohostSettingsPatch
     settings: CohostSettings
     state: CohostState
@@ -183,6 +185,15 @@ describe('shared high-risk protocol fixture', () => {
       )
     }
     expect(
+      validateBackendRpcParams('cohost.author.greeted', fixtures.cohost.authorParams)
+    ).toStrictEqual(fixtures.cohost.authorParams)
+    expect(() =>
+      validateBackendRpcParams('cohost.author.greeted', {
+        ...fixtures.cohost.authorParams,
+        extra: true
+      })
+    ).toThrow()
+    expect(
       validateBackendRpcParams('cohost.settings.set', fixtures.cohost.settingsPatch)
     ).toStrictEqual(fixtures.cohost.settingsPatch)
     expect(validateBackendRpcResult('cohost.settings.get', fixtures.cohost.settings)).toStrictEqual(
@@ -199,7 +210,8 @@ describe('shared high-risk protocol fixture', () => {
       'cohost.promise.done',
       'cohost.promise.dismiss',
       'cohost.recap.dismiss',
-      'cohost.recap.draft'
+      'cohost.recap.draft',
+      'cohost.author.greeted'
     ] as const) {
       expect(validateBackendRpcResult(method, fixtures.cohost.state)).toStrictEqual(
         fixtures.cohost.state
@@ -250,12 +262,32 @@ describe('shared high-risk protocol fixture', () => {
       'topic',
       'promises',
       'promiseReminder',
-      'recap'
+      'recap',
+      'sayHi',
+      'deadAirNudge'
     ] as const) {
       expect(() =>
         validateBackendEventPayload('cohost.state', { ...fixtures.cohost.stateV2, [key]: null })
       ).toThrow('cohost.state')
     }
+    // Plan 068 S6: "Say hi" and the dead-air nudge ride the state; absent on
+    // the legacy payload; an extra key on an entry is refused.
+    expect(fixtures.cohost.stateV2.sayHi?.[0]).toStrictEqual({
+      authorKey: '"twitch":viewer-fixture',
+      name: 'x_Dark_Knight_x',
+      platform: 'twitch',
+      firstSeenAt: '2026-08-22T10:00:05Z'
+    })
+    expect(fixtures.cohost.stateV2.deadAirNudge?.key).toBe('dead-air-1-1')
+    for (const key of ['sayHi', 'deadAirNudge'] as const) {
+      expect(fixtures.cohost.legacyState).not.toHaveProperty(key)
+    }
+    expect(() =>
+      validateBackendEventPayload('cohost.state', {
+        ...fixtures.cohost.stateV2,
+        sayHi: [{ ...fixtures.cohost.stateV2.sayHi![0], greeted: true }]
+      })
+    ).toThrow('cohost.state')
     // Tick v3 (plan 068 S5): topic, promises, reminder, recap and the
     // on-topic flag ride the state; absent on the legacy payload; an unknown
     // trigger kind still validates.

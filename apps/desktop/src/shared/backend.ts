@@ -4324,6 +4324,22 @@ export interface CohostRecap {
   expiresAt: string
 }
 
+/** A first-time chatter nobody greeted yet (plan 068 D9). */
+export interface CohostSayHi {
+  /** The engine's author key; `cohost.author.greeted` takes it back. */
+  authorKey: string
+  name: string
+  platform: StreamPlatform
+  firstSeenAt: string
+}
+
+/** A private dead-air suggestion (plan 068 D9): toast each `key` once. */
+export interface CohostDeadAirNudge {
+  key: string
+  text: string
+  at: string
+}
+
 export interface CohostFlag {
   messageId: string
   kind: CohostFlagKind
@@ -4498,6 +4514,13 @@ export interface CohostState {
   promises?: CohostPromise[]
   promiseReminder?: CohostPromiseReminder
   recap?: CohostRecap
+  /**
+   * Plan 068 D9, both absent (never null) while empty: first-time chatters
+   * not greeted yet (oldest first, at most five, gone after 15 minutes) and
+   * the latest dead-air nudge while it is fresh.
+   */
+  sayHi?: CohostSayHi[]
+  deadAirNudge?: CohostDeadAirNudge
 }
 
 /**
@@ -4559,6 +4582,12 @@ export interface CohostRecapParams {
   sessionId: string
 }
 
+/** `cohost.author.greeted` (plan 068 D9). */
+export interface CohostAuthorParams {
+  sessionId: string
+  authorKey: string
+}
+
 /**
  * What the detached Comments window needs to render the Co-host segment. The
  * MAIN renderer owns the backend socket, the entitlement snapshot and the
@@ -4608,6 +4637,7 @@ export type CohostActionKind =
   | 'promise-dismiss'
   | 'recap-dismiss'
   | 'recap-draft'
+  | 'author-greeted'
 
 /** Every action kind the relay accepts; main validates against it. */
 export const COHOST_ACTION_KINDS: readonly CohostActionKind[] = [
@@ -4618,7 +4648,8 @@ export const COHOST_ACTION_KINDS: readonly CohostActionKind[] = [
   'promise-done',
   'promise-dismiss',
   'recap-dismiss',
-  'recap-draft'
+  'recap-draft',
+  'author-greeted'
 ]
 
 /** Correlated co-host action from the Comments window, brokered through main
@@ -4629,7 +4660,7 @@ export interface CohostActionCommand {
   kind: CohostActionKind
   /** Question id for question actions; the flagged message id for flags; the
    * promise id for promise actions; the session id again for recap actions
-   * (they have no target of their own). */
+   * (they have no target of their own); the author key for `author-greeted`. */
   targetId: string
 }
 

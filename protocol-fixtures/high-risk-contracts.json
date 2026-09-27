@@ -407,6 +407,10 @@
     "recapParams": {
       "sessionId": "session-fixture"
     },
+    "authorParams": {
+      "sessionId": "session-fixture",
+      "authorKey": "\"twitch\":viewer-fixture"
+    },
     "settingsPatch": {
       "enabled": true,
       "tone": "short",
@@ -656,6 +660,19 @@
         "text": "So far: unboxed the Q1, compared switches.",
         "at": "2026-08-22T10:00:20Z",
         "expiresAt": "2026-08-22T10:05:20Z"
+      },
+      "sayHi": [
+        {
+          "authorKey": "\"twitch\":viewer-fixture",
+          "name": "x_Dark_Knight_x",
+          "platform": "twitch",
+          "firstSeenAt": "2026-08-22T10:00:05Z"
+        }
+      ],
+      "deadAirNudge": {
+        "key": "dead-air-1-1",
+        "text": "Dead air: say hi to x_Dark_Knight_x, it's their first chat.",
+        "at": "2026-08-22T10:00:25Z"
       }
     },
     "legacyState": {

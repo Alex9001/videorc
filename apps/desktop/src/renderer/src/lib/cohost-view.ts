@@ -627,6 +627,25 @@ export function cohostPromiseReminderToast({
   return cohostPromiseReminderMessage(reminder.text)
 }
 
+// --- Chat you haven't acknowledged (plan 068 D9) -----------------------------
+
+/** One keyed toast slot for dead-air nudges: a newer one replaces it in place. */
+export const COHOST_DEAD_AIR_TOAST_ID = 'cohost-dead-air'
+
+/**
+ * The dead-air nudge to toast, or null. Private and keyed: each key toasts
+ * once (`lastKey` is the last one toasted); the backend spaces them at least
+ * two minutes apart and drops each from the state after 30 seconds.
+ */
+export function cohostDeadAirToast(
+  state: CohostState | null,
+  lastKey: string | null
+): { key: string; text: string } | null {
+  const nudge = state?.deadAirNudge
+  if (!nudge || nudge.key === lastKey || !nudge.text.trim()) return null
+  return { key: nudge.key, text: nudge.text }
+}
+
 /** The recap while it is current: the backend drops it after five minutes,
  * and this keeps a quiet chat honest between state events. */
 export function activeCohostRecap(state: CohostState | null, nowMs: number): CohostRecap | null {

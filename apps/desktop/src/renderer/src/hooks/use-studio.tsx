@@ -194,6 +194,7 @@ import type {
   AccountCallbackEnvelope,
   AiCapabilities,
   CohostActionCommand,
+  CohostAuthorParams,
   CohostEnableCommand,
   CohostFlagParams,
   CohostPromiseParams,
@@ -3787,8 +3788,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         | 'cohost.promise.done'
         | 'cohost.promise.dismiss'
         | 'cohost.recap.dismiss'
-        | 'cohost.recap.draft',
-      params: CohostQuestionParams | CohostFlagParams | CohostPromiseParams | CohostRecapParams
+        | 'cohost.recap.draft'
+        | 'cohost.author.greeted',
+      params:
+        | CohostQuestionParams
+        | CohostFlagParams
+        | CohostPromiseParams
+        | CohostRecapParams
+        | CohostAuthorParams
     ): Promise<CohostState> => {
       if (!client) throw new Error('Backend socket is not connected.')
       setCohostActionPending(true)
@@ -3988,6 +3995,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             command.kind === 'recap-draft' ? 'cohost.recap.draft' : 'cohost.recap.dismiss',
             { sessionId: command.sessionId }
           )
+        }
+        // Plan 068 D9: the Greeted button on a "Say hi" row.
+        if (command.kind === 'author-greeted') {
+          return runCohostAction('cohost.author.greeted', {
+            sessionId: command.sessionId,
+            authorKey: command.targetId
+          })
         }
         const method =
           command.kind === 'answered'

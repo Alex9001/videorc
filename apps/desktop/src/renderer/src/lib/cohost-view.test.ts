@@ -42,6 +42,7 @@ import {
   cohostPaneMode,
   persistCohostListenPromptDismissed,
   readCohostListenPromptDismissed,
+  cohostDeadAirToast,
   cohostPromiseReminderToast,
   cohostPromiseTriggerLabel,
   cohostQuestionRowKey,
@@ -1012,5 +1013,25 @@ describe('promises and recaps (plan 068 D8)', () => {
     expect(activeCohostRecap(current, Date.parse('2026-08-22T12:05:00Z'))).toBeNull()
     expect(activeCohostRecap(state(), Date.parse('2026-08-22T12:00:00Z'))).toBeNull()
     expect(activeCohostRecap(null, 0)).toBeNull()
+  })
+
+  it('toasts each dead-air nudge once, by key (plan 068 D9)', () => {
+    const nudge = {
+      key: 'dead-air-1-1',
+      text: "Dead air: say hi to Sam, it's their first chat.",
+      at: '2026-08-22T12:00:00Z'
+    }
+    expect(cohostDeadAirToast(null, null)).toBeNull()
+    expect(cohostDeadAirToast(state(), null)).toBeNull()
+    expect(cohostDeadAirToast(state({ deadAirNudge: nudge }), null)).toEqual({
+      key: 'dead-air-1-1',
+      text: nudge.text
+    })
+    // The same key again (another state event while it is fresh) is quiet.
+    expect(cohostDeadAirToast(state({ deadAirNudge: nudge }), 'dead-air-1-1')).toBeNull()
+    expect(
+      cohostDeadAirToast(state({ deadAirNudge: { ...nudge, key: 'dead-air-1-2' } }), 'dead-air-1-1')
+    ).toEqual({ key: 'dead-air-1-2', text: nudge.text })
+    expect(cohostDeadAirToast(state({ deadAirNudge: { ...nudge, text: ' ' } }), null)).toBeNull()
   })
 })

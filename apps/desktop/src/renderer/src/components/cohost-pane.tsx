@@ -9,6 +9,7 @@ import {
   type ReactNode
 } from 'react'
 
+import { ChatPlatformIcon } from '@/components/chat-platform-icon'
 import { CohostFlagRow } from '@/components/cohost-flag-row'
 import { CohostQuestionRow } from '@/components/cohost-question-row'
 import { CohostPresenceDot, CohostTypingDots } from '@/components/cohost-status'
@@ -25,6 +26,7 @@ import type {
   CohostQuestion,
   CohostRecap,
   CohostRecentlyResolved,
+  CohostSayHi,
   CohostState
 } from '@/lib/backend'
 import { cohostEmptyStateCopy, cohostPresenceView, cohostQuestionIds } from '@/lib/cohost-presence'
@@ -32,6 +34,7 @@ import { activeCohostSpotlight } from '@/lib/cohost-marks'
 import {
   activeCohostAlerts,
   activeCohostRecap,
+  cohostAgeLabel,
   cohostAlertLabel,
   cohostErrorDetail,
   cohostErrorDetailText,
@@ -89,6 +92,7 @@ export function CohostPane({
   onRecapPost,
   onRecapDismiss,
   onRecapDraft,
+  onSayHiGreeted,
   onJumpToMessage,
   onEnableConsent,
   onOpenChange,
@@ -120,6 +124,8 @@ export function CohostPane({
   onRecapPost?: (recap: CohostRecap) => void
   onRecapDismiss?: () => void
   onRecapDraft?: () => void
+  /** "Say hi" (plan 068 D9): the streamer greeted this first-timer. */
+  onSayHiGreeted?: (entry: CohostSayHi) => void
   onJumpToMessage?: (messageId: string) => void
   onEnableConsent?: () => void
   /** Reports the segment's open/closed state so the owner can throttle the
@@ -156,6 +162,7 @@ export function CohostPane({
   )
   const spotlightQuestionId = activeCohostSpotlight(state, nowMs)?.questionId ?? null
   const promises = state?.promises ?? []
+  const sayHi = state?.sayHi ?? []
   const recap = activeCohostRecap(state, nowMs)
   const topic = state?.topic?.trim() || null
   // Viewers saying something is broken. A persistent chip, never a toast: it
@@ -187,11 +194,12 @@ export function CohostPane({
   // slow tick keeps them honest without re-rendering the message list
   // underneath.
   const recapPresent = state?.recap !== undefined
+  const sayHiCount = sayHi.length
   useEffect(() => {
-    if (rows.length === 0 && alertCount === 0 && !recapPresent) return
+    if (rows.length === 0 && alertCount === 0 && !recapPresent && sayHiCount === 0) return
     const timer = setInterval(() => setNowMs(Date.now()), 30_000)
     return () => clearInterval(timer)
-  }, [alertCount, recapPresent, rows.length])
+  }, [alertCount, recapPresent, rows.length, sayHiCount])
 
   useEffect(() => {
     onOpenChange?.(open)
@@ -475,6 +483,14 @@ export function CohostPane({
             disabled={actionPending || !onRestoreQuestion}
             items={answeredOnAir}
             onRestore={(question) => onRestoreQuestion?.(question)}
+          />
+        ) : null}
+        {sayHi.length > 0 ? (
+          <CohostSayHiList
+            disabled={actionPending}
+            items={sayHi}
+            nowMs={nowMs}
+            onGreeted={onSayHiGreeted}
           />
         ) : null}
         {promises.length > 0 ? (
@@ -783,6 +799,71 @@ function CohostPromises({
               onClick={() => onDismiss?.(promise)}
             >
               Dismiss
+            </Button>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * First-time chatters nobody greeted yet (plan 068 D9): name, platform, how
+ * long they have waited. Saying their name out loud, @-ing them, replying to
+ * their question or putting their message on stream all take them off; so
+ * does Greeted. The backend drops them after 15 minutes.
+ */
+function CohostSayHiList({
+  items,
+  nowMs,
+  disabled,
+  onGreeted
+}: {
+  items: readonly CohostSayHi[]
+  nowMs: number
+  disabled: boolean
+  onGreeted?: (entry: CohostSayHi) => void
+}): ReactElement {
+  return (
+    <div data-slot="cohost-say-hi">
+      <Separator />
+      <p
+        className="px-2 pt-1.5 pb-0.5 text-[11px] font-semibold text-subtle"
+        title="First time in your chat. Say their name and Orcle takes them off."
+      >
+        Say hi
+      </p>
+      {items.map((entry) => {
+        const age = cohostAgeLabel(entry.firstSeenAt, nowMs)
+        return (
+          <div
+            key={entry.authorKey}
+            className="flex h-7 min-w-0 items-center gap-1.5 px-2 text-xs"
+            data-slot="cohost-say-hi-row"
+          >
+            <ChatPlatformIcon platform={entry.platform} />
+            <span className="min-w-0 flex-1 truncate text-foreground" title={entry.name}>
+              {entry.name}
+            </span>
+            {age ? (
+              <span
+                className={cn(
+                  'shrink-0 text-[11px] text-muted-foreground tabular-nums',
+                  PANE_NARROW_HIDDEN
+                )}
+              >
+                {age}
+              </span>
+            ) : null}
+            <Button
+              className="shrink-0"
+              disabled={disabled || !onGreeted}
+              size="xs"
+              type="button"
+              variant="ghost"
+              onClick={() => onGreeted?.(entry)}
+            >
+              Greeted
             </Button>
           </div>
         )

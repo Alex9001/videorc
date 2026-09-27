@@ -4888,7 +4888,12 @@ async fn run_realtime_caption_session(
                     if mono.is_empty() {
                         continue;
                     }
-                    crate::cohost::note_voice_frame(&session.state, &mono, std::time::Instant::now());
+                    crate::cohost::note_voice_frame(
+                        &session.state,
+                        &frame.samples,
+                        &mono,
+                        std::time::Instant::now(),
+                    );
                     if provider_ready
                         && speech_watchdog_since.is_none()
                         && pcm_has_speech_energy(&mono)
@@ -5749,7 +5754,12 @@ async fn run_chunked_caption_session(
                     frame.channels,
                     frame.sample_rate,
                 );
-                crate::cohost::note_voice_frame(&session.state, &mono, std::time::Instant::now());
+                crate::cohost::note_voice_frame(
+                    &session.state,
+                    &frame.samples,
+                    &mono,
+                    std::time::Instant::now(),
+                );
                 let dropped_seconds = buffer.push_samples(
                     mono,
                     capture_epoch,

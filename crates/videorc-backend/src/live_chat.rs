@@ -2114,6 +2114,9 @@ async fn execute_send_live_chat_message(
         .save_chat_send_operation(&operation)
         .map_err(|error| format!("Could not persist send operation: {error}"))?;
     state.emit_event("liveChat.sendOperation", operation.clone());
+    // Plan 068 D9: the echo of this text in chat is the streamer, never a
+    // viewer to greet.
+    crate::cohost::note_own_send_started(state, &operation.session_id, &operation.text).await;
 
     let client = reqwest::Client::new();
     let pending = operation
@@ -2177,16 +2180,15 @@ async fn execute_send_live_chat_message(
         .save_chat_send_operation(&operation)
         .map_err(|error| format!("Could not persist send result: {error}"))?;
     state.emit_event("liveChat.sendOperation", operation.clone());
-    if let Some(question_id) = in_reply_to_question_id
-        && matches!(
-            operation.phase,
-            CommentsSendOperationPhase::Sent | CommentsSendOperationPhase::Partial
-        )
-    {
-        crate::cohost::mark_question_answered_after_send(
+    if matches!(
+        operation.phase,
+        CommentsSendOperationPhase::Sent | CommentsSendOperationPhase::Partial
+    ) {
+        crate::cohost::note_own_send_delivered(
             state,
             &operation.session_id,
-            &question_id,
+            &operation.text,
+            in_reply_to_question_id.as_deref(),
         )
         .await;
     }
