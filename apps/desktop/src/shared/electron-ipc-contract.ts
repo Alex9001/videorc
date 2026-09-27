@@ -12,6 +12,7 @@ import type {
   CohostWindowState,
   CommentHighlightCommand,
   CommentHighlightState,
+  ClipMarkCommand,
   CommentsClearCommand,
   CommentsSendCommand,
   CommentsSnapshotDelta,
@@ -124,6 +125,8 @@ export const electronInvokeApiMethods = {
   'comments-window:send-result-push': 'pushChatSendResult',
   'comments-window:clear': 'clearComments',
   'comments-window:clear-result-push': 'pushCommentsClearResult',
+  'comments-window:clip-mark': 'markClipFromCommentsWindow',
+  'comments-window:clip-mark-result-push': 'pushClipMarkResult',
   'comments-window:viewers-push': 'pushViewerSample',
   'comments-window:viewers-get': 'getViewerSample',
   'comments-window:dashboard-push': 'pushDashboard',
@@ -196,6 +199,7 @@ export interface ElectronIpcEventMap {
   'comments-window:highlight-state': CommentHighlightState
   'comments-window:send-request': CommentsSendCommand
   'comments-window:clear-request': CommentsClearCommand
+  'comments-window:clip-mark-request': ClipMarkCommand
   'comments-window:viewers': ViewerSample | null
   'comments-window:dashboard': LiveDashboardState | null
   'comments-window:cohost': CohostWindowState
@@ -234,6 +238,7 @@ export const electronEventChannels = [
   'comments-window:highlight-state',
   'comments-window:send-request',
   'comments-window:clear-request',
+  'comments-window:clip-mark-request',
   'comments-window:viewers',
   'comments-window:dashboard',
   'comments-window:cohost',
@@ -1041,6 +1046,8 @@ export const boundedPassthroughElectronInvokeChannels = [
   'comments-window:send-result-push',
   'comments-window:clear',
   'comments-window:clear-result-push',
+  'comments-window:clip-mark',
+  'comments-window:clip-mark-result-push',
   'comments-window:viewers-push',
   'comments-window:viewers-get',
   'comments-window:dashboard-push',
@@ -1180,6 +1187,7 @@ export const boundedPassthroughElectronEventChannels = [
   'comments-window:highlight-state',
   'comments-window:send-request',
   'comments-window:clear-request',
+  'comments-window:clip-mark-request',
   'comments-window:viewers',
   'comments-window:dashboard',
   'comments-window:cohost',

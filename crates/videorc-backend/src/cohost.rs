@@ -3851,6 +3851,13 @@ pub(crate) fn note_transcript_final(
     if final_.text.trim().is_empty() {
         return;
     }
+    // Clip that (plan 068 D6): the same lock-match-return discipline.
+    crate::clip_marks::note_transcript_final(
+        state,
+        &final_.text,
+        &final_.segments,
+        final_.offset_seconds,
+    );
     if let Ok(mut speech) = state.cohost_recent_speech.lock() {
         speech.push(final_);
     }

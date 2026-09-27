@@ -18,6 +18,7 @@ mod capture_health;
 mod capture_input;
 mod capture_interruption;
 mod capture_recovery;
+mod clip_marks;
 mod cohost;
 mod cohost_ack;
 mod color;
@@ -5038,6 +5039,7 @@ fn websocket_method_execution_policy(method: &str) -> Option<WebSocketMethodExec
         | "cohost.recap.draft"
         | "cohost.author.greeted"
         | "cohost.settings.set"
+        | "clip.mark"
         | "captions.overlay.clear"
         | "captions.cues.submit"
         | "capture.recovery.retry"
@@ -5245,6 +5247,7 @@ fn websocket_method_execution_policy(method: &str) -> Option<WebSocketMethodExec
         | "repair.assess_file"
         | "noiseCleanup.list"
         | "ai.artifacts.list"
+        | "clip.marks.list"
         | "preview.live.status"
         | "session.sources.get"
         | "recording.status"
@@ -11246,6 +11249,23 @@ async fn handle_text_message_with_role(
                     Ok(result) => ServerResponse::ok(command.id, result),
                     Err(error) => {
                         ServerResponse::error(command.id, "clip-export-failed", error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "clip.mark" => match clip_marks::mark_manual(state).await {
+            Ok(event) => ServerResponse::ok(command.id, event),
+            Err(error) => ServerResponse::error(command.id, error.code(), error.to_string()),
+        },
+        "clip.marks.list" => {
+            match serde_json::from_value::<protocol::ClipMarksListParams>(command.params) {
+                Ok(params) => match clip_marks::list_marks(state, &params.session_id) {
+                    Ok(marks) => ServerResponse::ok(command.id, marks),
+                    Err(error) => {
+                        ServerResponse::error(command.id, "clip-marks-failed", error.to_string())
                     }
                 },
                 Err(error) => {

@@ -169,6 +169,8 @@ export interface StreamManagerProps {
   onBackToLive?: () => void
   onHighlight?: (message: LiveChatMessage) => void
   onClear?: () => void
+  /** Mark the current moment for a clip (plan 068 D6); shown only on air. */
+  onMarkClip?: () => void
   onOpenPreview?: () => void
   sendPending?: boolean
   sendOperation?: CommentsSendOperation | null
@@ -224,6 +226,7 @@ export function StreamManager({
   onBackToLive,
   onHighlight,
   onClear,
+  onMarkClip,
   onOpenPreview,
   sendPending = false,
   sendOperation = null,
@@ -723,6 +726,7 @@ export function StreamManager({
         providers={snapshot.providers}
         onClear={onClear}
         onHighlightAnchorChange={onHighlightAnchorChange}
+        onMarkClip={onAir ? onMarkClip : undefined}
         onOpenPreview={onOpenPreview}
         onToggleAlwaysOnTop={onToggleAlwaysOnTop}
       />

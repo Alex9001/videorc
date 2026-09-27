@@ -22,6 +22,7 @@ const GLOBAL_ACTION_ROWS = [
   'record-toggle',
   'stream-toggle',
   'mic-toggle',
+  'clip-mark',
   'layout-next',
   'layout-previous'
 ] as const satisfies readonly GlobalShortcutAction[]
@@ -30,6 +31,7 @@ const GLOBAL_ACTION_LABELS: Record<(typeof GLOBAL_ACTION_ROWS)[number], string> 
   'record-toggle': 'Start / stop recording',
   'stream-toggle': 'Go live / end stream',
   'mic-toggle': 'Mute / unmute mic',
+  'clip-mark': 'Mark a clip',
   'layout-next': 'Next layout',
   'layout-previous': 'Previous layout'
 }

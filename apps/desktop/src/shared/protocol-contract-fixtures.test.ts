@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest'
 import { normalizeLayoutSettings } from '../renderer/src/lib/capture'
 import type {
   AccountCallbackEnvelope,
+  ClipMark,
+  ClipMarkedEvent,
   CohostAuthorParams,
   CohostFlagParams,
   CohostPromiseParams,
@@ -82,6 +84,12 @@ interface HighRiskContractFixtures {
     timeoutState: CohostState
     stateV2: CohostState
     legacyState: CohostState
+  }
+  clip: {
+    markedSaved: ClipMarkedEvent
+    markedUnsaved: ClipMarkedEvent
+    listParams: BackendRpcParams<'clip.marks.list'>
+    marks: ClipMark[]
   }
 }
 
@@ -451,6 +459,22 @@ describe('shared high-risk protocol fixture', () => {
         [fixtures.comments.deletionOperation]
       )
     }
+  })
+
+  it('keeps clip marks and the marked event identical across languages (plan 068 D6)', () => {
+    for (const event of [fixtures.clip.markedSaved, fixtures.clip.markedUnsaved]) {
+      expect(validateBackendEventPayload('clip.marked', event)).toStrictEqual(event)
+      expect(validateBackendRpcResult('clip.mark', event)).toStrictEqual(event)
+    }
+    expect(fixtures.clip.markedSaved).not.toHaveProperty('reason')
+    expect(fixtures.clip.markedUnsaved.reason).toBe('recording-off')
+    expect(validateBackendRpcParams('clip.marks.list', fixtures.clip.listParams)).toStrictEqual(
+      fixtures.clip.listParams
+    )
+    expect(validateBackendRpcResult('clip.marks.list', fixtures.clip.marks)).toStrictEqual(
+      fixtures.clip.marks
+    )
+    expect(fixtures.clip.marks[1]).not.toHaveProperty('phrase')
   })
 
   it('loads chat rows with and without structured event details', () => {

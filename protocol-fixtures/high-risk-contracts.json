@@ -686,5 +686,38 @@
       "tickSeq": 0,
       "partial": false
     }
+  },
+  "clip": {
+    "markedSaved": {
+      "sessionId": "session-fixture",
+      "atSeconds": 754.2,
+      "source": "manual",
+      "saved": true
+    },
+    "markedUnsaved": {
+      "sessionId": "session-fixture",
+      "atSeconds": 61.5,
+      "source": "voice",
+      "saved": false,
+      "reason": "recording-off"
+    },
+    "listParams": { "sessionId": "session-fixture" },
+    "marks": [
+      {
+        "id": "mark-fixture-1",
+        "sessionId": "session-fixture",
+        "atSeconds": 61.5,
+        "source": "voice",
+        "phrase": "clip that",
+        "createdAt": "2026-09-27T10:01:01Z"
+      },
+      {
+        "id": "mark-fixture-2",
+        "sessionId": "session-fixture",
+        "atSeconds": 754.2,
+        "source": "manual",
+        "createdAt": "2026-09-27T10:12:34Z"
+      }
+    ]
   }
 }

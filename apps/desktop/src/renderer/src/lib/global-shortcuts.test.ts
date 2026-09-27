@@ -19,18 +19,25 @@ describe('global layout shortcuts', () => {
       startSession: vi.fn(),
       stopSession: vi.fn(),
       toggleMicrophoneMute: vi.fn(),
+      markClip: vi.fn(),
       switchLayout: vi.fn()
     }
     for (const action of GLOBAL_SHORTCUT_ACTIONS.filter((action) => action.startsWith('layout')))
       executeGlobalShortcut(action, context)
     expect(context.switchLayout).toHaveBeenCalledTimes(12)
     expect(context.toggleMicrophoneMute).not.toHaveBeenCalled()
+    executeGlobalShortcut('clip-mark', context)
+    expect(context.markClip).toHaveBeenCalledOnce()
+    expect(context.toggleMicrophoneMute).not.toHaveBeenCalled()
     executeGlobalShortcut('invalid' as GlobalShortcutAction, context)
     expect(context.toggleMicrophoneMute).not.toHaveBeenCalled()
     expect(context.switchLayout).toHaveBeenCalledTimes(12)
   })
   it('keeps stable IDs, unassigned defaults and validates unknown actions', () => {
-    expect(globalShortcutEntries({})).toHaveLength(15)
+    expect(globalShortcutEntries({})).toHaveLength(16)
+    // Plan 068 D6: Mark clip ships unbound.
+    expect(globalShortcutEntries({}).find(([id]) => id === 'clip-mark')?.[1]).toBeUndefined()
+    expect(withGlobalShortcut({}, 'clip-mark', 'Cmd+Shift+K').clipMark).toBe('Cmd+Shift+K')
     expect(
       globalShortcutEntries({ layouts: { 'camera-only': 'Control+Alt+C' } }).find(
         ([id]) => id === 'layout:camera-only'

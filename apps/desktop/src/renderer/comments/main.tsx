@@ -28,6 +28,7 @@ import {
   COHOST_NUDGE_STORAGE_KEY
 } from '@/lib/cohost-view'
 import { Toaster } from '@/components/ui/sonner'
+import { clipMarkedToast } from '../../shared/clip-marks'
 import type { EntitlementUiGate } from '@/lib/entitlement-ui'
 import { chatSendFailures, pendingCommentsSendOperation } from '@/lib/chat-send'
 import type { ChatSendFailure } from '@/lib/chat-send'
@@ -403,6 +404,29 @@ function CommentsWindowApp(): ReactElement {
             : undefined
         }
         onHighlight={live ? requestHighlight : undefined}
+        onMarkClip={
+          live
+            ? () => {
+                void window.videorc
+                  ?.markClipFromCommentsWindow?.({ requestId: crypto.randomUUID() })
+                  .then((event) => {
+                    const copy = clipMarkedToast(event)
+                    ;(copy.kind === 'success' ? toast.success : toast.warning)(copy.title, {
+                      id: 'clip-marked',
+                      description: copy.description
+                    })
+                  })
+                  .catch((error) =>
+                    toast.error(
+                      error instanceof Error ? error.message : 'Could not mark the clip.',
+                      {
+                        id: 'clip-marked'
+                      }
+                    )
+                  )
+              }
+            : undefined
+        }
         onOpenPreview={() => void window.videorc?.openPreviewWindow?.()}
         onSend={(text, options) => {
           if (!snapshot.sessionId) return

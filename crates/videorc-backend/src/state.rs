@@ -1155,6 +1155,9 @@ pub struct AppState {
     /// Voice activity the caption task computed from the frames it received
     /// (plan 068 D9). Never touched by the audio thread.
     pub cohost_voice: crate::cohost::CohostVoiceSlot,
+    /// Clip-that phrase matcher state (plan 068 D6). Std mutex: the caption
+    /// task matches and returns.
+    pub clip_marks: crate::clip_marks::ClipMarkDetectorSlot,
 }
 
 /// Masks the path of every `rtmp://` / `rtmps://` URL in a log line. FFmpeg
@@ -1339,6 +1342,7 @@ impl AppState {
             cohost_transcript: crate::cohost::new_cohost_transcript_slot(),
             cohost_recent_speech: crate::cohost::new_cohost_recent_speech_slot(),
             cohost_voice: crate::cohost::new_cohost_voice_slot(),
+            clip_marks: crate::clip_marks::new_clip_mark_detector_slot(),
         }
     }
 

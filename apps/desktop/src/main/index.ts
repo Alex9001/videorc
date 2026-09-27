@@ -413,6 +413,8 @@ import type {
   CohostWindowState,
   CommentHighlightCommand,
   CommentHighlightState,
+  ClipMarkCommand,
+  ClipMarkedEvent,
   CommentsClearCommand,
   CommentsCommandResolution,
   CommentsSendCommand,
@@ -13527,6 +13529,30 @@ app.whenReady().then(async () => {
         emitCommentsView()
       }
       return accepted
+    }
+  )
+  // Mark clip relay (plan 068 D6): the Stream Manager asks, the MAIN renderer
+  // owns the `clip.mark` RPC, and the marked event comes back as the reply.
+  secureIpcHandle(
+    'comments-window:clip-mark',
+    (event, value: unknown): Promise<ClipMarkedEvent> => {
+      if (!commentsWindow || event.sender.id !== commentsWindow.webContents.id) {
+        return Promise.reject(new Error('Only the Chat window can mark clips from here.'))
+      }
+      const requestId = commentsCommandRequestId(value)
+      const command: ClipMarkCommand = { requestId }
+      return commentsCommandBroker.request(requestId, () => {
+        if (!mainWindow || mainWindow.webContents.isDestroyed()) return false
+        sendElectronEvent(mainWindow.webContents, 'comments-window:clip-mark-request', command)
+        return true
+      })
+    }
+  )
+  secureIpcHandle(
+    'comments-window:clip-mark-result-push',
+    (event, resolution: CommentsCommandResolution<ClipMarkedEvent>) => {
+      if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false
+      return commentsCommandBroker.resolve(resolution)
     }
   )
   secureIpcHandle('captions-window:open', () => openCaptionsWindow())

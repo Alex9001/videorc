@@ -4175,6 +4175,63 @@ pub struct ClipMoment {
     pub end_ms: u64,
     pub reason: String,
     pub excerpt: String,
+    /// Where the moment came from (plan 068 D6). Omitted, never null, so an
+    /// older renderer keeps loading the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ClipMomentSource>,
+}
+
+/// What produced a clip suggestion: a spoken "clip that", a manual mark, or
+/// a chat spike.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipMomentSource {
+    Voice,
+    Manual,
+    Chat,
+}
+
+/// Who placed a clip mark (plan 068 D6).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipMarkSource {
+    Voice,
+    Manual,
+}
+
+/// One persisted clip mark: a recording-file time the streamer wants clipped.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipMark {
+    pub id: String,
+    pub session_id: String,
+    /// Recording-file time in seconds (capture-relative).
+    pub at_seconds: f64,
+    pub source: ClipMarkSource,
+    /// The spoken phrase for a voice mark ("clip that"). Omitted, never null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phrase: Option<String>,
+    pub created_at: String,
+}
+
+/// `clip.marked` event and the `clip.mark` reply: where the mark landed and
+/// whether it was stored. `saved: false` carries a `reason` code
+/// (`recording-off`) so the toast can say why nothing was kept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipMarkedEvent {
+    pub session_id: String,
+    pub at_seconds: f64,
+    pub source: ClipMarkSource,
+    pub saved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipMarksListParams {
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5472,6 +5529,34 @@ mod tests {
                 gift_name: Some("Rage Quit".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn shared_high_risk_contract_fixture_matches_clip_mark_dtos() {
+        let saved_wire = shared_high_risk_contract_fixture_value("/clip/markedSaved");
+        let saved: ClipMarkedEvent = serde_json::from_value(saved_wire.clone()).unwrap();
+        assert!(saved.saved);
+        assert_eq!(saved.source, ClipMarkSource::Manual);
+        assert_eq!(saved.reason, None);
+        // Omitted, never null: the serde-null trap.
+        assert_eq!(serde_json::to_value(saved).unwrap(), saved_wire);
+
+        let unsaved_wire = shared_high_risk_contract_fixture_value("/clip/markedUnsaved");
+        let unsaved: ClipMarkedEvent = serde_json::from_value(unsaved_wire.clone()).unwrap();
+        assert!(!unsaved.saved);
+        assert_eq!(unsaved.reason.as_deref(), Some("recording-off"));
+        assert_eq!(serde_json::to_value(unsaved).unwrap(), unsaved_wire);
+
+        let params_wire = shared_high_risk_contract_fixture_value("/clip/listParams");
+        let params: ClipMarksListParams = serde_json::from_value(params_wire).unwrap();
+        assert_eq!(params.session_id, "session-fixture");
+
+        let marks_wire = shared_high_risk_contract_fixture_value("/clip/marks");
+        let marks: Vec<ClipMark> = serde_json::from_value(marks_wire.clone()).unwrap();
+        assert_eq!(marks[0].source, ClipMarkSource::Voice);
+        assert_eq!(marks[0].phrase.as_deref(), Some("clip that"));
+        assert_eq!(marks[1].phrase, None);
+        assert_eq!(serde_json::to_value(marks).unwrap(), marks_wire);
     }
 
     #[test]

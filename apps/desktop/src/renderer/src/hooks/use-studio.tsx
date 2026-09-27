@@ -3,6 +3,7 @@ import { LazyLiveSourceSelectionController } from '@/lib/live-source-selection-l
 import { confirmedSourceSelection } from '@/lib/source-selection-confirmed'
 import type { LiveSourceSelectionState } from '@/lib/live-source-selection'
 import { globalShortcutLayout, nextEligibleLayout } from '../../../shared/global-shortcuts'
+import { clipMarkedToast } from '../../../shared/clip-marks'
 import { BUILTIN_LAYOUTS } from '@/lib/layout-framing-memory'
 import { useScenePresets } from '@/hooks/use-scene-presets'
 import {
@@ -226,6 +227,8 @@ import type {
   CompositorStatus,
   DiagnosticStats,
   ClipExportResult,
+  ClipMarkCommand,
+  ClipMarkedEvent,
   ClipSuggestResult,
   Device,
   DeviceList,
@@ -1284,6 +1287,9 @@ export type StudioContextValue = {
   suggestClips: (sessionId: string) => Promise<ClipSuggestResult | null>
   /** Trim a clip out of the recording locally (ffmpeg, next to the file). */
   exportClip: (sessionId: string, startMs: number, endMs: number) => Promise<void>
+  /** Mark the current moment for a clip (plan 068 D6). The `clip.marked`
+   * event, not the reply, carries the toast so every source reads the same. */
+  markClip: () => Promise<ClipMarkedEvent | null>
   assessRecording: (path: string) => Promise<FileAssessment>
   repairRecording: (path: string) => Promise<GateStatus>
   restoreRecording: (path: string) => Promise<boolean>
@@ -2437,10 +2443,36 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           })
         })
     })
+    // Mark clip from the Stream Manager (plan 068 D6): the same relay shape
+    // as clear, resolved with where the mark landed.
+    const offClipMark = window.videorc?.onClipMarkRequest?.((command: ClipMarkCommand) => {
+      void (async () => {
+        if (!client) throw new Error('Backend socket is not connected.')
+        if (!isActiveRecordingState(recordingRef.current.state)) {
+          throw new Error('No session is running, so there is nothing to mark.')
+        }
+        return client.request<ClipMarkedEvent>('clip.mark')
+      })()
+        .then(async (event) => {
+          await window.videorc?.pushClipMarkResult?.({
+            requestId: command.requestId,
+            ok: true,
+            value: event
+          })
+        })
+        .catch(async (error) => {
+          await window.videorc?.pushClipMarkResult?.({
+            requestId: command.requestId,
+            ok: false,
+            error: error instanceof Error ? error.message : 'Could not mark the clip.'
+          })
+        })
+    })
     return () => {
       cancelled = true
       offState?.()
       offClear?.()
+      offClipMark?.()
     }
   }, [client])
   // Backend-authoritative comment highlight. The renderer owns only the
@@ -6323,6 +6355,15 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       }),
       nextClient.on('cohost.state', (payload) => {
         commitCohostState(payload as CohostState)
+      }),
+      // Clip that (plan 068 D6): one toast per mark, whether it came from a
+      // spoken phrase, a shortcut, a deck key, or the Stream Manager.
+      nextClient.on('clip.marked', (payload) => {
+        const copy = clipMarkedToast(payload as ClipMarkedEvent)
+        ;(copy.kind === 'success' ? toast.success : toast.warning)(copy.title, {
+          id: 'clip-marked',
+          description: copy.description
+        })
       }),
       nextClient.on('comments.highlight.status', (payload) => {
         commentHighlightRevision += 1
@@ -13050,6 +13091,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     [client, reportError]
   )
 
+  const markClip = useCallback(async (): Promise<ClipMarkedEvent | null> => {
+    if (!client) {
+      toast.error('Mark clip', { description: 'Backend is not connected. Try again in a moment.' })
+      return null
+    }
+    if (!isActiveRecordingState(recordingRef.current.state)) {
+      toast.info('Nothing to mark yet.', {
+        id: 'clip-marked',
+        description: 'Start recording or go live, then mark the moments you want clipped.'
+      })
+      return null
+    }
+    try {
+      return await client.request<ClipMarkedEvent>('clip.mark')
+    } catch (error) {
+      reportError(error)
+      return null
+    }
+  }, [client, reportError])
+
   const assessRecording = useCallback(
     async (sessionId: string): Promise<FileAssessment> => {
       if (!client) {
@@ -13762,6 +13823,17 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             message: error instanceof Error ? error.message : 'Could not clear the comment.'
           }
         }
+      },
+      markClip: async () => {
+        try {
+          const event = await client.request<ClipMarkedEvent>('clip.mark')
+          return event.saved ? { ok: true } : { ok: false, message: clipMarkedToast(event).title }
+        } catch (error) {
+          return {
+            ok: false,
+            message: error instanceof Error ? error.message : 'Could not mark the clip.'
+          }
+        }
       }
     }
     const intentKind = (payload as { kind?: unknown } | null)?.kind
@@ -13977,6 +14049,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             microphoneMuted: !current.audio.microphoneMuted
           }
         }))
+      },
+      markClip: () => {
+        void markClip()
       }
     }
     if (action.startsWith('layout')) return context.switchLayout?.(action)
@@ -14339,6 +14414,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       exportPublishPack,
       suggestClips,
       exportClip,
+      markClip,
       assessRecording,
       repairRecording,
       restoreRecording,
@@ -14565,6 +14641,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       exportPublishPack,
       suggestClips,
       exportClip,
+      markClip,
       assessRecording,
       repairRecording,
       restoreRecording,

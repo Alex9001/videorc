@@ -3,7 +3,7 @@ import type { ReactElement } from 'react'
 import { CHAT_PLATFORM_LABELS, ChatPlatformIcon } from '@/components/chat-platform-icon'
 import { HIGHLIGHT_ANCHOR_LABELS, HighlightAnchorOptions } from '@/components/comments-header'
 import { providerBadgeTitle } from '@/components/comments-destination-status'
-import { FrameIcon, MoreIcon, PinIcon, PreviewIcon } from '@/components/icons'
+import { ClipIcon, FrameIcon, MoreIcon, PinIcon, PreviewIcon } from '@/components/icons'
 import { StatusBar } from '@/components/status-bar'
 import { StatusDot, type StatusDotTone } from '@/components/status-dot'
 import { Button } from '@/components/ui/button'
@@ -110,6 +110,7 @@ export function StreamManagerStatusBar({
   onToggleAlwaysOnTop,
   onHighlightAnchorChange,
   onClear,
+  onMarkClip,
   onOpenPreview
 }: {
   providers: readonly LiveChatProviderState[]
@@ -119,6 +120,9 @@ export function StreamManagerStatusBar({
   onToggleAlwaysOnTop?: () => void
   onHighlightAnchorChange?: (anchor: CommentHighlightAnchor) => void
   onClear?: () => void
+  /** Plan 068 D6: present only while on air. Word and icon: mid-stream there
+   * is no time to hover. */
+  onMarkClip?: () => void
   onOpenPreview?: () => void
 }): ReactElement {
   const anchorControl =
@@ -196,6 +200,18 @@ export function StreamManagerStatusBar({
             </DropdownMenuContent>
           </DropdownMenu>
         ) : null}
+        {onMarkClip ? (
+          <button
+            aria-label="Mark clip"
+            className={ACTION_CLASS}
+            title="Mark this moment for a clip (or say “clip that”)"
+            type="button"
+            onClick={onMarkClip}
+          >
+            <ClipIcon aria-hidden />
+            Mark clip
+          </button>
+        ) : null}
         {onClear ? (
           <button
             aria-label="Clear view"
@@ -252,6 +268,12 @@ export function StreamManagerStatusBar({
               >
                 Keep on top
               </DropdownMenuCheckboxItem>
+            ) : null}
+            {onMarkClip ? (
+              <DropdownMenuItem onSelect={onMarkClip}>
+                <ClipIcon />
+                Mark clip
+              </DropdownMenuItem>
             ) : null}
             {onOpenPreview ? (
               <DropdownMenuItem onSelect={onOpenPreview}>

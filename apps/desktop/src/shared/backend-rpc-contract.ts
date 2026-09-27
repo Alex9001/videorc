@@ -18,6 +18,8 @@ import type {
   CohostSettingsPatch,
   CohostStartParams,
   CohostState,
+  ClipMark,
+  ClipMarkedEvent,
   CompositorFrameReady,
   CompositorStatus,
   SceneEditorDraftAck,
@@ -251,6 +253,8 @@ export interface BackendRpcMethodMap {
   'cohost.author.greeted': BackendRpcDefinition<CohostAuthorParams, CohostState>
   'cohost.settings.get': BackendRpcDefinition<undefined, CohostSettings>
   'cohost.settings.set': BackendRpcDefinition<CohostSettingsPatch, CohostSettings>
+  'clip.mark': BackendRpcDefinition<undefined, ClipMarkedEvent>
+  'clip.marks.list': BackendRpcDefinition<{ sessionId: string }, ClipMark[]>
 }
 
 export type BackendRpcMethod = keyof BackendRpcMethodMap
@@ -277,6 +281,7 @@ export interface BackendEventMap {
   'capture.recovery.status': CaptureRecoveryStatus
   'diagnostics.stats': DiagnosticStats
   'cohost.state': CohostState
+  'clip.marked': ClipMarkedEvent
   'performance.check.progress': PerformanceCheckProgress
   'performance.check.completed': PerformanceCheckState
 }
@@ -2001,6 +2006,31 @@ const cohostErrorDetailSchema = objectSchema(
   },
   { allowUnknown: false }
 )
+// Plan 068 D6: clip marks. Optional fields are omitted by the backend when
+// absent (never null).
+const clipMarkSourceSchema = enumSchema(['voice', 'manual'])
+const clipMarkSchema = objectSchema(
+  {
+    id: boundedString,
+    sessionId: boundedString,
+    atSeconds: numberSchema({ min: 0, max: 1_000_000_000 }),
+    source: clipMarkSourceSchema,
+    phrase: optionalSchema(stringSchema({ minLength: 1, maxLength: 128 })),
+    createdAt: timestamp
+  },
+  { allowUnknown: false }
+) as RuntimeSchema<ClipMark>
+const clipMarkedEventSchema = objectSchema(
+  {
+    sessionId: boundedString,
+    atSeconds: numberSchema({ min: 0, max: 1_000_000_000 }),
+    source: clipMarkSourceSchema,
+    saved: booleanSchema,
+    reason: optionalSchema(stringSchema({ minLength: 1, maxLength: 128 }))
+  },
+  { allowUnknown: false }
+) as RuntimeSchema<ClipMarkedEvent>
+
 // Plan 068: whether Orcle hears the streamer. Every optional field is omitted
 // by the backend when absent (never null).
 const cohostListeningSchema = objectSchema(
@@ -2533,7 +2563,12 @@ const runtimeContracts = {
   'cohost.recap.draft': { params: cohostRecapParamsSchema, result: cohostStateSchema },
   'cohost.author.greeted': { params: cohostAuthorParamsSchema, result: cohostStateSchema },
   'cohost.settings.get': { params: undefinedSchema, result: cohostSettingsSchema },
-  'cohost.settings.set': { params: cohostSettingsPatchSchema, result: cohostSettingsSchema }
+  'cohost.settings.set': { params: cohostSettingsPatchSchema, result: cohostSettingsSchema },
+  'clip.mark': { params: undefinedSchema, result: clipMarkedEventSchema },
+  'clip.marks.list': {
+    params: objectSchema({ sessionId: boundedString }, { allowUnknown: false }),
+    result: arraySchema(clipMarkSchema, { maxLength: 10_000 })
+  }
 } satisfies Record<BackendRpcMethod, RuntimeBackendRpcContract>
 
 export function isTypedBackendRpcMethod(method: string): method is BackendRpcMethod {
@@ -2577,6 +2612,7 @@ const runtimeEventSchemas = {
   'capture.recovery.status': captureRecoveryStatusSchema,
   'diagnostics.stats': diagnosticStatsSchema,
   'cohost.state': cohostStateSchema,
+  'clip.marked': clipMarkedEventSchema,
   'performance.check.progress': performanceCheckProgressSchema,
   'performance.check.completed': performanceCheckStateSchema
 } satisfies Record<BackendEvent, RuntimeSchema<unknown>>

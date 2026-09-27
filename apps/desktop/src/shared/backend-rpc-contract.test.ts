@@ -1601,6 +1601,55 @@ describe('backend RPC contract', () => {
     expect(() => parseBackendWireMessage('null')).toThrow('invalid websocket envelope')
   })
 
+  it('validates clip marks: the mark reply, the marked event, and the list (plan 068 D6)', () => {
+    const saved = { sessionId: 'session-1', atSeconds: 754.2, source: 'manual', saved: true }
+    expect(validateBackendRpcResult('clip.mark', saved)).toEqual(saved)
+    expect(validateBackendEventPayload('clip.marked', saved)).toEqual(saved)
+    const unsaved = {
+      sessionId: 'session-1',
+      atSeconds: 61.5,
+      source: 'voice',
+      saved: false,
+      reason: 'recording-off'
+    }
+    expect(validateBackendEventPayload('clip.marked', unsaved)).toEqual(unsaved)
+    // The serde-null trap: an absent reason is omitted, never null.
+    expect(() => validateBackendEventPayload('clip.marked', { ...saved, reason: null })).toThrow(
+      'clip.marked'
+    )
+    expect(() => validateBackendEventPayload('clip.marked', { ...saved, source: 'chat' })).toThrow(
+      'clip.marked'
+    )
+    expect(() => validateBackendEventPayload('clip.marked', { ...saved, extra: 1 })).toThrow(
+      'clip.marked'
+    )
+
+    expect(validateBackendRpcParams('clip.marks.list', { sessionId: 'session-1' })).toEqual({
+      sessionId: 'session-1'
+    })
+    const marks = [
+      {
+        id: 'mark-1',
+        sessionId: 'session-1',
+        atSeconds: 61.5,
+        source: 'voice',
+        phrase: 'clip that',
+        createdAt: '2026-09-27T10:01:01Z'
+      },
+      {
+        id: 'mark-2',
+        sessionId: 'session-1',
+        atSeconds: 754.2,
+        source: 'manual',
+        createdAt: '2026-09-27T10:12:34Z'
+      }
+    ]
+    expect(validateBackendRpcResult('clip.marks.list', marks)).toEqual(marks)
+    expect(() =>
+      validateBackendRpcResult('clip.marks.list', [{ ...marks[1], phrase: null }])
+    ).toThrow('clip.marks.list')
+  })
+
   it('validates the Live Co-host RPCs and state event against the wire contract', () => {
     const state = {
       sessionId: 'session-1',

@@ -968,8 +968,11 @@ function msToClock(ms: number): string {
   return `${Math.floor(totalSeconds / 60)}:${String(totalSeconds % 60).padStart(2, '0')}`
 }
 
-// Clip-worthy moments: ranked locally from chat spikes + captions, plus any
-// cloud highlights that carry timestamps. Every row exports a real file.
+const CLIP_SOURCE_LABELS = { voice: 'Voice', manual: 'Marked', chat: 'Chat' } as const
+
+// Clip-worthy moments: the marks you placed (a spoken "clip that" or Mark
+// clip) first, then chat spikes + captions, plus any cloud highlights that
+// carry timestamps. Every row exports a real file.
 function ClipsSection({
   session,
   highlightItems
@@ -994,18 +997,20 @@ function ClipsSection({
   )
   const rows = [
     ...(suggestion?.moments ?? []).map((moment) => ({
-      key: `chat-${moment.startMs}`,
+      key: `${moment.source ?? 'chat'}-${moment.startMs}`,
       startMs: moment.startMs,
       endMs: moment.endMs,
       label: moment.reason,
-      detail: moment.excerpt
+      detail: moment.excerpt,
+      source: moment.source ?? 'chat'
     })),
     ...timedHighlights.map((item) => ({
       key: `highlight-${item.startMs}`,
       startMs: item.startMs,
       endMs: item.endMs,
       label: typeof item.title === 'string' ? item.title : 'Highlight',
-      detail: typeof item.reason === 'string' ? item.reason : ''
+      detail: typeof item.reason === 'string' ? item.reason : '',
+      source: null
     }))
   ]
 
@@ -1025,20 +1030,20 @@ function ClipsSection({
               .finally(() => setLoading(false))
           }}
         >
-          {loading ? 'Ranking…' : 'Suggest clips from chat'}
+          {loading ? 'Ranking…' : 'Suggest clips'}
         </Button>
       </div>
       {suggestion && suggestion.moments.length === 0 && timedHighlights.length === 0 ? (
         <p className="text-xs text-muted-foreground">
           {suggestion.chatMessageCount === 0
-            ? 'No chat history for this session. Clips are ranked from audience reaction. Generate Highlights instead.'
-            : 'Chat stayed steady, with no stand-out spike to clip. Generate Highlights for content-based moments.'}
+            ? 'No marks and no chat history for this session. Say “clip that” or press Mark clip while recording, or Generate Highlights instead.'
+            : 'No marks, and chat stayed steady with no stand-out spike to clip. Generate Highlights for content-based moments.'}
         </p>
       ) : null}
       {!suggestion && rows.length === 0 ? (
         <p className="text-xs text-muted-foreground">
-          The strongest moments as exportable files, ranked from chat activity spikes, snapped to
-          what you were saying.
+          The moments you marked while recording (say “clip that” or press Mark clip) come first,
+          then chat activity spikes, snapped to what you were saying. Every row exports a file.
         </p>
       ) : null}
       {rows.map((row) => (
@@ -1047,7 +1052,14 @@ function ClipsSection({
             {msToClock(row.startMs)}–{msToClock(row.endMs)}
           </time>
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm">{row.label}</span>
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="truncate text-sm">{row.label}</span>
+              {row.source ? (
+                <Badge className="shrink-0" variant="outline">
+                  {CLIP_SOURCE_LABELS[row.source]}
+                </Badge>
+              ) : null}
+            </span>
             {row.detail ? (
               <span className="block truncate text-xs text-muted-foreground">{row.detail}</span>
             ) : null}

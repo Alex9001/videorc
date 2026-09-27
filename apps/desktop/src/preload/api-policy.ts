@@ -21,6 +21,8 @@ export const AUXILIARY_API_KEYS = {
     'onCommentHighlightState',
     'sendChatFromCommentsWindow',
     'clearComments',
+    // Mark clip from the Stream Manager (plan 068 D6): relayed, like clear.
+    'markClipFromCommentsWindow',
     'getCommentsWindowState',
     'setCommentsWindowAlwaysOnTop',
     'setCommentsWindowHighlightAnchor',

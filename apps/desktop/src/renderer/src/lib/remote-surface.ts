@@ -84,6 +84,9 @@ export interface RemoteIntentContext {
    * must not flash the card off. Resolves the user-facing refusal reason. */
   showCommentHighlight: (messageId: string) => Promise<RemoteIntentOutcome>
   clearCommentHighlight: () => Promise<RemoteIntentOutcome>
+  /** Plan 068 D6: mark the current moment for a clip. The backend stamps the
+   * capture clock; `ok: false` carries why nothing was kept. */
+  markClip: () => Promise<RemoteIntentOutcome>
 }
 
 export interface RemoteIntentOutcome {
@@ -309,6 +312,11 @@ export async function executeRemoteIntent(
       }
       case 'commentHighlightClear': {
         const outcome = await context.clearCommentHighlight()
+        return void (await ack(outcome.ok, outcome.message))
+      }
+      case 'clipMark': {
+        if (!context.sessionActive) return void (await ack(false, 'No active session.'))
+        const outcome = await context.markClip()
         return void (await ack(outcome.ok, outcome.message))
       }
       default:

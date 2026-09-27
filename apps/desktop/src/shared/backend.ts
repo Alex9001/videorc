@@ -2891,12 +2891,47 @@ export interface AiWorkflowResult {
   artifacts: AiArtifact[]
 }
 
-/** A clip-worthy time range, ranked locally from chat activity + captions. */
+/** Where a clip suggestion came from (plan 068 D6). */
+export type ClipMomentSource = 'voice' | 'manual' | 'chat'
+
+/** A clip-worthy time range: a mark the streamer placed, or a chat spike,
+ * snapped to captions. */
 export interface ClipMoment {
   startMs: number
   endMs: number
   reason: string
   excerpt: string
+  /** Omitted by an older backend, so a missing source reads as chat. */
+  source?: ClipMomentSource
+}
+
+/** Who placed a clip mark: a spoken "clip that" or the Mark clip control. */
+export type ClipMarkSource = 'voice' | 'manual'
+
+/** One persisted clip mark at a recording-file time (plan 068 D6). */
+export interface ClipMark {
+  id: string
+  sessionId: string
+  atSeconds: number
+  source: ClipMarkSource
+  /** The spoken phrase for a voice mark. Omitted, never null. */
+  phrase?: string
+  createdAt: string
+}
+
+/** `clip.marked` event and the `clip.mark` reply. `saved: false` carries a
+ * reason code (`recording-off`): the moment was heard but nothing was kept. */
+export interface ClipMarkedEvent {
+  sessionId: string
+  atSeconds: number
+  source: ClipMarkSource
+  saved: boolean
+  reason?: string
+}
+
+/** Stream Manager → main renderer: mark a clip now (plan 068 D6). */
+export interface ClipMarkCommand {
+  requestId: string
 }
 
 export interface ClipSuggestResult {
@@ -3687,6 +3722,8 @@ export interface GlobalShortcutsConfig {
   recordToggle?: string
   streamToggle?: string
   micToggle?: string
+  /** Mark a clip at the current moment (plan 068 D6). Unbound by default. */
+  clipMark?: string
 }
 
 export interface GlobalShortcutsResult {
@@ -3756,6 +3793,12 @@ export interface VideorcApi {
   pushCommentsClearResult: (
     resolution: CommentsCommandResolution<LiveChatSnapshot>
   ) => Promise<boolean>
+  /** Mark clip from the Stream Manager (plan 068 D6): the MAIN renderer owns
+   * the backend socket and makes the `clip.mark` RPC; the reply says where the
+   * mark landed and whether it was saved. */
+  markClipFromCommentsWindow: (command: ClipMarkCommand) => Promise<ClipMarkedEvent>
+  onClipMarkRequest: (callback: (command: ClipMarkCommand) => void) => () => void
+  pushClipMarkResult: (resolution: CommentsCommandResolution<ClipMarkedEvent>) => Promise<boolean>
   /** Co-host relay: the main renderer pushes state, the window seeds + follows
    * it, and window actions come back through the same correlated broker. */
   pushCohostWindowState: (state: CohostWindowState) => Promise<void>
