@@ -123,11 +123,27 @@ pub fn list_native_cameras() -> NativeCameraDevices {
     windows_native::list_native_cameras()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+/// Linux (L3): V4L2 capture nodes from sysfs.
+#[cfg(target_os = "linux")]
+pub fn list_native_cameras() -> NativeCameraDevices {
+    use crate::linux_v4l2_camera::{V4l2Roots, list_v4l2_cameras, node_access};
+
+    let devices = list_v4l2_cameras(&V4l2Roots::default(), node_access);
+    let warnings = if devices.is_empty() {
+        vec!["No V4L2 camera found under /sys/class/video4linux.".to_string()]
+    } else {
+        Vec::new()
+    };
+    NativeCameraDevices { devices, warnings }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn list_native_cameras() -> NativeCameraDevices {
     NativeCameraDevices {
         devices: Vec::new(),
-        warnings: vec!["Native camera discovery is only available on macOS/Windows.".to_string()],
+        warnings: vec![
+            "Native camera discovery is only available on macOS, Windows and Linux.".to_string(),
+        ],
     }
 }
 

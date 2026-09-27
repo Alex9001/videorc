@@ -41,6 +41,8 @@ mod kick_chat;
 mod linux_pipewire_stream;
 mod linux_portal_capture;
 mod linux_portal_session;
+mod linux_pulse_audio;
+mod linux_v4l2_camera;
 #[cfg(any(test, target_os = "linux"))]
 mod linux_vaapi;
 mod live_chat;

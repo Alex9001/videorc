@@ -66,6 +66,11 @@ pub enum MicrophoneInput {
     WindowsDshow {
         device_name: String,
     },
+    /// Linux (L2): FFmpeg opens the PulseAudio/PipeWire source directly.
+    #[allow(dead_code)]
+    LinuxPulse {
+        source_name: String,
+    },
 }
 
 // DirectShow otherwise uses the device's default audio buffer, commonly around
@@ -281,6 +286,11 @@ pub fn append_microphone_input(
             *next_input_index += 1;
             true
         }
+        MicrophoneInput::LinuxPulse { source_name } => {
+            args.extend(crate::linux_pulse_audio::pulse_input_args(source_name));
+            *next_input_index += 1;
+            true
+        }
     }
 }
 
@@ -290,9 +300,13 @@ pub fn append_microphone_input(
 /// The Windows dshow mic is captured raw by ffmpeg and has no in-process
 /// stage — without a volume leg the mute toggle records live audio. (The
 /// macOS avfoundation fallback shares that gap today; it keeps its shipped
-/// behavior until it gets its own slice.)
+/// behavior until it gets its own slice.) The Linux Pulse mic is raw FFmpeg
+/// capture too, so it takes the same volume leg.
 pub fn microphone_needs_graph_gain(microphone: Option<&MicrophoneInput>) -> bool {
-    matches!(microphone, Some(MicrophoneInput::WindowsDshow { .. }))
+    matches!(
+        microphone,
+        Some(MicrophoneInput::WindowsDshow { .. } | MicrophoneInput::LinuxPulse { .. })
+    )
 }
 
 pub fn microphone_channels(microphone: Option<&MicrophoneInput>) -> u16 {
@@ -301,7 +315,9 @@ pub fn microphone_channels(microphone: Option<&MicrophoneInput>) -> u16 {
             NATIVE_AUDIO_CHANNELS
         }
         Some(MicrophoneInput::AvFoundation { .. } | MicrophoneInput::AvFoundationUid { .. }) => 1,
-        Some(MicrophoneInput::WindowsDshow { .. }) => NATIVE_AUDIO_CHANNELS,
+        Some(MicrophoneInput::WindowsDshow { .. } | MicrophoneInput::LinuxPulse { .. }) => {
+            NATIVE_AUDIO_CHANNELS
+        }
         None => 0,
     }
 }
@@ -600,6 +616,42 @@ mod tests {
                 "-i".to_string(),
                 "audio=Microphone Array".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn linux_pulse_microphone_is_a_direct_ffmpeg_input_with_graph_gain() {
+        let microphone = MicrophoneInput::LinuxPulse {
+            source_name: "alsa_input.pci-0000_02_00.3.HiFi__Mic__source".to_string(),
+        };
+        let mut args = Vec::new();
+        let mut next_input_index = 1;
+
+        let appended = append_microphone_input(&mut args, Some(&microphone), &mut next_input_index);
+
+        assert!(appended);
+        assert_eq!(next_input_index, 2);
+        assert_eq!(
+            args,
+            strings(&[
+                "-f",
+                "pulse",
+                "-sample_rate",
+                "48000",
+                "-channels",
+                "2",
+                "-fragment_size",
+                "3840",
+                "-thread_queue_size",
+                "512",
+                "-i",
+                "alsa_input.pci-0000_02_00.3.HiFi__Mic__source",
+            ])
+        );
+        assert!(microphone_needs_graph_gain(Some(&microphone)));
+        assert_eq!(
+            microphone_channels(Some(&microphone)),
+            NATIVE_AUDIO_CHANNELS
         );
     }
 
