@@ -297,9 +297,16 @@ mod tests {
         assert_eq!(devices[0].name, "FaceTime HD Camera (Built-in)");
         assert_eq!(devices[0].kind, DeviceKind::Camera);
         assert_eq!(devices[0].status, DeviceStatus::Available);
-        let path = parse_linux_v4l2_camera_id(&devices[0].id).unwrap();
+        // The fake tree lives under the temp dir, so compare whole ids (the
+        // parser only accepts real `/dev/` paths).
         #[cfg(unix)]
-        assert!(path.ends_with("usb-Apple_FaceTime-video-index0"), "{path}");
+        let stable = roots.by_id.join("usb-Apple_FaceTime-video-index0");
+        #[cfg(not(unix))]
+        let stable = roots.dev.join("video0");
+        assert_eq!(
+            devices[0].id,
+            linux_v4l2_camera_id(&stable.to_string_lossy())
+        );
         assert_eq!(devices[1].name, "USB Cam");
         assert_eq!(devices[1].status, DeviceStatus::PermissionRequired);
         assert!(
@@ -309,10 +316,9 @@ mod tests {
                 .unwrap()
                 .contains("`video` group")
         );
-        assert!(
-            parse_linux_v4l2_camera_id(&devices[1].id)
-                .unwrap()
-                .ends_with("video2")
+        assert_eq!(
+            devices[1].id,
+            linux_v4l2_camera_id(&roots.dev.join("video2").to_string_lossy())
         );
     }
 
