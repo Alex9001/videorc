@@ -17,6 +17,9 @@ import { connectBackend, request } from './smoke-recording-session.mjs'
 //   assistant-response event -> immediate transcription-only chunk fallback
 //   realtime-unavailable -> chunk upload fallback -> final caption
 //   first audio, then producer silence -> truthful blocked/stalled status
+//   Orcle listen-only (plan 068): captions off, cohost.start with listen on ->
+//     chunk uploads say purpose=listen, the transcript record is kept, Orcle
+//     reports listening on, and no captions.* event ever reaches the renderer
 //
 // No production bearer, provider credential, microphone permission, or external network is
 // involved. Release builds do not compile the audio-injection/snapshot RPCs.
@@ -73,17 +76,21 @@ try {
   await proveRealtimeContract({ backend, observed, fake })
   await proveAssistantResponseFallback({ backend, observed, fake })
   await proveChunkFallback({ backend, observed, fake })
+  const listenChunks = await proveListenOnlySession({ backend, observed, fake })
 
   console.log(
     `Caption contract smoke PASS — realtime partial/final, repeated-completion upsert, ` +
       `assistant-response safety fallback, provider-ready truth, deterministic audio, ` +
-      `and chunk fallback passed ` +
-      `with post-frame stall detection ` +
-      `(realtime appends=${fake.state.audioAppends}, chunk requests=${fake.state.chunkRequests}).`
+      `chunk fallback with post-frame stall detection, ` +
+      `and listen-only Orcle transcription without caption emits passed ` +
+      `(realtime appends=${fake.state.audioAppends}, chunk requests=${fake.state.chunkRequests}, ` +
+      `listen chunks=${listenChunks}).`
   )
 } finally {
   try {
     if (backend) {
+      await request(backend, 5_000, 'cohost.stop', {}).catch(() => {})
+      await request(backend, 5_000, 'liveChat.stop', {}).catch(() => {})
       await request(backend, 5_000, 'captions.stop', {}).catch(() => {})
       backend.close()
     }
@@ -301,8 +308,129 @@ async function proveChunkFallback({ backend, observed, fake }) {
   )
 }
 
+// Plan 068 D1/D5: Orcle's listen intent runs the same transcription task with
+// presentation off. Captions stay off the whole time, so the renderer must
+// never see a caption event or an active caption status, while the upload
+// says purpose=listen (metered apart on the web) and the transcript record
+// is still kept for the recording's SRT.
+async function proveListenOnlySession({ backend, observed, fake }) {
+  // The previous scenario leaves a blocked caption session; end it first.
+  await request(backend, timeoutMs, 'captions.stop', {})
+  fake.state.realtimeAvailable = false
+  const chatSessionId = `captions-contract-listen-${Date.now()}`
+  await request(backend, timeoutMs, 'liveChat.start', {
+    sessionId: chatSessionId,
+    destinations: [
+      { platform: 'twitch', targetId: 'listen-contract', read: 'ready', write: 'ready' }
+    ],
+    // No chat arrives during the scenario, so Orcle never ticks.
+    fakes: [{ platform: 'twitch', targetId: 'listen-contract', count: 0, send: 'sent' }]
+  })
+  const settings = await request(backend, timeoutMs, 'cohost.settings.set', {
+    enabled: true,
+    listen: true
+  })
+  if (settings.enabled !== true || settings.listen !== true) {
+    throw new Error(`cohost.settings.set did not turn listening on: ${JSON.stringify(settings)}`)
+  }
+
+  const presentationBefore = observed.presentation.length
+  if (presentationBefore === 0) {
+    // The caption scenarios above emit captions.* events; seeing none means
+    // the collector is blind and the no-leak check below would be vacuous.
+    throw new Error('The caption event collector saw no captions.* events before listen-only.')
+  }
+  const chunkRequestsBefore = fake.state.chunkRequests
+  // Records survive caption stops until a capture boundary, so the listen
+  // record is proved by growth, not by its (shared) text alone.
+  const recordsBefore = (await request(backend, timeoutMs, 'captions.test.snapshot', {})).chunkCount
+  const started = await request(backend, timeoutMs, 'cohost.start', {
+    sessionId: chatSessionId,
+    consentToProcessChat: true
+  })
+  if (!['starting', 'on'].includes(started.listening?.state)) {
+    throw new Error(`cohost.start did not start the listen intent: ${JSON.stringify(started)}`)
+  }
+
+  const injected = await request(backend, timeoutMs, 'captions.test.inject-audio', {
+    durationMs: 5_000
+  })
+  if ((injected.framesAccepted ?? 0) < 1) {
+    throw new Error(
+      `Listen-only session received no deterministic PCM: ${JSON.stringify(injected)}`
+    )
+  }
+  await waitFor(
+    () => fake.state.chunkRequests > chunkRequestsBefore,
+    timeoutMs,
+    'listen-only chunk upload'
+  )
+  const snapshot = await waitForSnapshot(
+    backend,
+    (candidate) =>
+      candidate.chunkCount > recordsBefore &&
+      candidate.canonicalCues?.at(-1)?.text === 'Chunk fallback recovered.'
+  )
+  const listening = await waitForCohost(backend, (candidate) => candidate.listening?.state === 'on')
+
+  const purposes = fake.state.chunkPurposes.slice(chunkRequestsBefore)
+  if (purposes.length < 1 || purposes.some((purpose) => purpose !== 'listen')) {
+    throw new Error(`Listen-only uploads must say purpose=listen: ${JSON.stringify(purposes)}`)
+  }
+  if (snapshot.status?.state !== 'idle' || snapshot.status?.desiredEnabled !== false) {
+    throw new Error(
+      `A listen-only session must keep the caption status idle: ${JSON.stringify(snapshot.status)}`
+    )
+  }
+  const captionStatus = await request(backend, timeoutMs, 'captions.status.get', {})
+  if (captionStatus.state !== 'idle' || captionStatus.desiredEnabled !== false) {
+    throw new Error(
+      `captions.status.get looked active during listen-only: ${JSON.stringify(captionStatus)}`
+    )
+  }
+  if (listening.listening.remainingSeconds !== 3_597) {
+    throw new Error(
+      `Orcle listening did not carry the service allowance: ${JSON.stringify(listening.listening)}`
+    )
+  }
+
+  await request(backend, timeoutMs, 'cohost.stop', {})
+  // The listen-only task ends with Orcle: the tap is gone, nothing is queued.
+  const afterStop = await request(backend, timeoutMs, 'captions.test.inject-audio', {
+    durationMs: 100
+  }).then(
+    (value) => ({ ok: true, value }),
+    (error) => ({ ok: false, error })
+  )
+  if (afterStop.ok) {
+    throw new Error(
+      `The caption tap outlived Orcle's listen intent: ${JSON.stringify(afterStop.value)}`
+    )
+  }
+  await request(backend, timeoutMs, 'liveChat.stop', {})
+
+  const leaked = observed.presentation.slice(presentationBefore)
+  if (leaked.length > 0) {
+    throw new Error(`Listen-only reached the renderer as captions: ${JSON.stringify(leaked)}`)
+  }
+  return purposes.length
+}
+
+async function waitForCohost(backend, predicate) {
+  const startedAt = Date.now()
+  let latest
+  while (Date.now() - startedAt <= timeoutMs) {
+    latest = await request(backend, timeoutMs, 'cohost.status', {})
+    if (predicate(latest)) return latest
+    await sleep(50)
+  }
+  throw new Error(`Timed out waiting for Orcle state: ${JSON.stringify(latest)}`)
+}
+
 function collectCaptionEvents(ws) {
-  const result = { statuses: [], updates: [] }
+  // `presentation` counts every renderer-facing caption side effect: any
+  // captions.* event, plus caption health events.
+  const result = { statuses: [], updates: [], presentation: [] }
   ws.addEventListener('message', (event) => {
     let message
     try {
@@ -312,6 +440,12 @@ function collectCaptionEvents(ws) {
     }
     if (message.event === 'captions.status') result.statuses.push(message.payload)
     if (message.event === 'captions.update') result.updates.push(message.payload)
+    if (
+      String(message.event ?? '').startsWith('captions.') ||
+      (message.event === 'health.event' && /caption/i.test(String(message.payload?.code ?? '')))
+    ) {
+      result.presentation.push(message.event)
+    }
   })
   return result
 }
