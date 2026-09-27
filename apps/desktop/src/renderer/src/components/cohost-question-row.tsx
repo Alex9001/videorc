@@ -69,6 +69,16 @@ export function CohostQuestionRow({
         </Badge>
       ) : null}
       <span className="min-w-0 flex-1 truncate text-foreground">{question.text}</span>
+      {question.onTopic === true ? (
+        <Badge
+          className="shrink-0 text-muted-foreground"
+          data-slot="cohost-on-topic"
+          title="About what you are talking about right now"
+          variant="outline"
+        >
+          On topic
+        </Badge>
+      ) : null}
       {question.fromNotes ? (
         <NoteIcon
           aria-label="Answered from your Orcle notes"

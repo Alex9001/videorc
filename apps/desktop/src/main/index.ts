@@ -456,7 +456,11 @@ import type {
   VideorcAccountSnapshot,
   ViewerSample
 } from '../shared/backend'
-import { normalizeCommentHighlightAnchor, offCohostWindowState } from '../shared/backend'
+import {
+  COHOST_ACTION_KINDS,
+  normalizeCommentHighlightAnchor,
+  offCohostWindowState
+} from '../shared/backend'
 
 publishLaunchServicesSmokeOwnership()
 
@@ -13390,10 +13394,7 @@ app.whenReady().then(async () => {
       }
       const command = value as CohostActionCommand
       if (
-        (command.kind !== 'answered' &&
-          command.kind !== 'dismiss-question' &&
-          command.kind !== 'dismiss-flag' &&
-          command.kind !== 'restore') ||
+        !COHOST_ACTION_KINDS.includes(command.kind) ||
         typeof command.targetId !== 'string' ||
         !command.targetId.trim()
       ) {

@@ -6,7 +6,9 @@ import { AppErrorBoundary } from '@/components/error-boundary'
 import { StreamManager } from '@/components/stream-manager/stream-manager'
 import { WindowFrame } from '@/components/window-frame'
 import type {
+  CohostActionKind,
   CohostQuestion,
+  CohostState,
   CohostWindowState,
   CommentHighlightAnchor,
   CommentHighlightState,
@@ -244,20 +246,26 @@ function CommentsWindowApp(): ReactElement {
   // Co-host actions are correlated commands: the MAIN renderer owns the
   // backend socket and makes the real `cohost.*` RPC, exactly like send and
   // highlight.
+  // Resolves with the relayed state (null when nothing was sent or the
+  // action failed); the recap draft reads its text from it.
   const sendCohostAction =
-    (kind: 'answered' | 'dismiss-question' | 'dismiss-flag' | 'restore') =>
-    (targetId: string): void => {
-      if (!snapshot.sessionId) return
+    (kind: CohostActionKind) =>
+    (targetId: string): Promise<CohostState | null> => {
+      if (!snapshot.sessionId) return Promise.resolve(null)
+      const send = window.videorc?.sendCohostAction
+      if (!send) return Promise.resolve(null)
       setCohostActionPending(true)
-      void window.videorc
-        ?.sendCohostAction?.({
-          requestId: crypto.randomUUID(),
-          sessionId: snapshot.sessionId,
-          kind,
-          targetId
+      return send({
+        requestId: crypto.randomUUID(),
+        sessionId: snapshot.sessionId,
+        kind,
+        targetId
+      })
+        .then((state) => {
+          setCohost((current) => ({ ...current, state }))
+          return state
         })
-        .then((state) => setCohost((current) => ({ ...current, state })))
-        .catch((error) =>
+        .catch((error) => {
           setSendFailures([
             {
               destinationId: 'cohost-command',
@@ -265,7 +273,8 @@ function CommentsWindowApp(): ReactElement {
               reason: error instanceof Error ? error.message : 'Orcle action failed.'
             }
           ])
-        )
+          return null
+        })
         .finally(() => setCohostActionPending(false))
     }
 
@@ -343,8 +352,14 @@ function CommentsWindowApp(): ReactElement {
         cohostNudgeDismissedForever={cohostNudgeDismissed}
         cohostStarting={cohostStarting}
         cohostState={cohost.state}
-        onCohostAnswered={(question) => sendCohostAction('answered')(question.id)}
-        onCohostRestoreQuestion={(question) => sendCohostAction('restore')(question.id)}
+        onCohostAnswered={(question) => void sendCohostAction('answered')(question.id)}
+        onCohostRestoreQuestion={(question) => void sendCohostAction('restore')(question.id)}
+        onCohostPromiseDone={(promise) => void sendCohostAction('promise-done')(promise.id)}
+        onCohostPromiseDismiss={(promise) => void sendCohostAction('promise-dismiss')(promise.id)}
+        onCohostRecapDismiss={() =>
+          void sendCohostAction('recap-dismiss')(snapshot.sessionId ?? '')
+        }
+        onCohostRecapDraft={() => sendCohostAction('recap-draft')(snapshot.sessionId ?? '')}
         onCohostEnable={(enabled) => setCohostEnabled(enabled)}
         onCohostEnableConsent={() => setCohostEnabled(true, true)}
         onCohostListenOn={() => setCohostEnabled(true, false, true)}
@@ -352,8 +367,10 @@ function CommentsWindowApp(): ReactElement {
           setCohostNudgeDismissed(true)
           localStorage.setItem(COHOST_NUDGE_STORAGE_KEY, '1')
         }}
-        onCohostDismissFlag={(flag) => sendCohostAction('dismiss-flag')(flag.messageId)}
-        onCohostDismissQuestion={(question) => sendCohostAction('dismiss-question')(question.id)}
+        onCohostDismissFlag={(flag) => void sendCohostAction('dismiss-flag')(flag.messageId)}
+        onCohostDismissQuestion={(question) =>
+          void sendCohostAction('dismiss-question')(question.id)
+        }
         onCohostShowOnStream={live ? showQuestionOnStream : undefined}
         onBackToLive={
           view.mode.kind === 'history'

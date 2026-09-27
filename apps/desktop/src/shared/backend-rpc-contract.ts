@@ -10,6 +10,8 @@ import type {
   ScheduledStreamCandidate,
   CaptureRecoveryStatus,
   CohostFlagParams,
+  CohostPromiseParams,
+  CohostRecapParams,
   CohostQuestionParams,
   CohostSettings,
   CohostSettingsPatch,
@@ -241,6 +243,10 @@ export interface BackendRpcMethodMap {
   'cohost.question.dismiss': BackendRpcDefinition<CohostQuestionParams, CohostState>
   'cohost.question.restore': BackendRpcDefinition<CohostQuestionParams, CohostState>
   'cohost.flag.dismiss': BackendRpcDefinition<CohostFlagParams, CohostState>
+  'cohost.promise.done': BackendRpcDefinition<CohostPromiseParams, CohostState>
+  'cohost.promise.dismiss': BackendRpcDefinition<CohostPromiseParams, CohostState>
+  'cohost.recap.dismiss': BackendRpcDefinition<CohostRecapParams, CohostState>
+  'cohost.recap.draft': BackendRpcDefinition<CohostRecapParams, CohostState>
   'cohost.settings.get': BackendRpcDefinition<undefined, CohostSettings>
   'cohost.settings.set': BackendRpcDefinition<CohostSettingsPatch, CohostSettings>
 }
@@ -1851,8 +1857,36 @@ const cohostQuestionSchema = objectSchema(
     suggestedReply: stringSchema({ maxLength: 2000 }),
     fromNotes: booleanSchema,
     firstSeenAt: timestamp,
-    updatedAt: timestamp
+    updatedAt: timestamp,
+    // Tick v3 (plan 068): omitted by the backend while false.
+    onTopic: optionalSchema(booleanSchema)
   },
+  { allowUnknown: false }
+)
+// Plan 068 D8: promises, the reminder and the recap. The trigger kind
+// vocabulary may grow; an unknown one still validates (the engine already
+// read it as `none`).
+const cohostPromiseSchema = objectSchema(
+  {
+    id: boundedString,
+    text: stringSchema({ maxLength: 160 }),
+    trigger: objectSchema(
+      {
+        kind: stringSchema({ minLength: 1, maxLength: 32 }),
+        value: optionalSchema(nonNegativeInteger)
+      },
+      { allowUnknown: false }
+    ),
+    firstSeenAt: timestamp
+  },
+  { allowUnknown: false }
+)
+const cohostPromiseReminderSchema = objectSchema(
+  { promiseId: boundedString, text: stringSchema({ maxLength: 160 }), at: timestamp },
+  { allowUnknown: false }
+)
+const cohostRecapSchema = objectSchema(
+  { text: stringSchema({ maxLength: 140 }), at: timestamp, expiresAt: timestamp },
   { allowUnknown: false }
 )
 // `unknown` is the backend's serde catch-all for a kind newer than this build;
@@ -2003,7 +2037,12 @@ const cohostStateSchema = objectSchema(
     spotlight: optionalSchema(cohostSpotlightSchema),
     recentlyResolved: optionalSchema(arraySchema(cohostRecentlyResolvedSchema, { maxLength: 3 })),
     // Plan 068: absent without a session or from a backend before the field.
-    listening: optionalSchema(cohostListeningSchema)
+    listening: optionalSchema(cohostListeningSchema),
+    // Tick v3 (plan 068 D7/D8): all absent until the engine has them.
+    topic: optionalSchema(stringSchema({ maxLength: 60 })),
+    promises: optionalSchema(arraySchema(cohostPromiseSchema, { maxLength: 20 })),
+    promiseReminder: optionalSchema(cohostPromiseReminderSchema),
+    recap: optionalSchema(cohostRecapSchema)
   },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostState>
@@ -2023,6 +2062,14 @@ const cohostFlagParamsSchema = objectSchema(
   { sessionId: boundedString, messageId: boundedString },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostFlagParams>
+const cohostPromiseParamsSchema = objectSchema(
+  { sessionId: boundedString, promiseId: boundedString },
+  { allowUnknown: false }
+) as RuntimeSchema<CohostPromiseParams>
+const cohostRecapParamsSchema = objectSchema(
+  { sessionId: boundedString },
+  { allowUnknown: false }
+) as RuntimeSchema<CohostRecapParams>
 
 const scheduledMutationSchema = objectSchema(
   {
@@ -2458,6 +2505,10 @@ const runtimeContracts = {
   'cohost.question.dismiss': { params: cohostQuestionParamsSchema, result: cohostStateSchema },
   'cohost.question.restore': { params: cohostQuestionParamsSchema, result: cohostStateSchema },
   'cohost.flag.dismiss': { params: cohostFlagParamsSchema, result: cohostStateSchema },
+  'cohost.promise.done': { params: cohostPromiseParamsSchema, result: cohostStateSchema },
+  'cohost.promise.dismiss': { params: cohostPromiseParamsSchema, result: cohostStateSchema },
+  'cohost.recap.dismiss': { params: cohostRecapParamsSchema, result: cohostStateSchema },
+  'cohost.recap.draft': { params: cohostRecapParamsSchema, result: cohostStateSchema },
   'cohost.settings.get': { params: undefinedSchema, result: cohostSettingsSchema },
   'cohost.settings.set': { params: cohostSettingsPatchSchema, result: cohostSettingsSchema }
 } satisfies Record<BackendRpcMethod, RuntimeBackendRpcContract>

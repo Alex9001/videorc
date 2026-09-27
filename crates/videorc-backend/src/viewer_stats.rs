@@ -204,6 +204,28 @@ pub struct ViewerAggregator {
 }
 
 impl ViewerAggregator {
+    /// The fresh total right now (every platform polled within
+    /// `VIEWER_FRESHNESS`), `None` when no sampler has reported. Orcle's
+    /// promise triggers read it (plan 068 D8).
+    pub fn current_total(&self, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+        let freshness =
+            chrono::Duration::from_std(VIEWER_FRESHNESS).unwrap_or(chrono::Duration::seconds(75));
+        let fresh: Vec<u64> = self
+            .latest
+            .iter()
+            .filter(|(_, _, at)| now.signed_duration_since(*at) <= freshness)
+            .map(|(_, count, _)| *count)
+            .collect();
+        if fresh.is_empty() {
+            return None;
+        }
+        Some(
+            fresh
+                .iter()
+                .fold(0u64, |total, count| total.saturating_add(*count)),
+        )
+    }
+
     /// Records one sampler's poll. Returns `None` when that poll reported no
     /// platform: the sampler has nothing new to say, and a total built only
     /// from other samplers' older counts would repeat their own emission.

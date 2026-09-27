@@ -4085,6 +4085,21 @@ pub struct CohostFlagParams {
     pub message_id: String,
 }
 
+/// `cohost.promise.done` / `cohost.promise.dismiss` (plan 068 D8).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostPromiseParams {
+    pub session_id: String,
+    pub promise_id: String,
+}
+
+/// `cohost.recap.dismiss` / `cohost.recap.draft` (plan 068 D8).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostRecapParams {
+    pub session_id: String,
+}
+
 /// `cohost.settings.set`: every field optional; absent fields are unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -5611,6 +5626,44 @@ mod tests {
         // The restore RPC reuses the question params verbatim.
         let restore: CohostQuestionParams = serde_json::from_value(question_wire).unwrap();
         assert_eq!(restore.question_id, "q_fixture");
+        // Plan 068 S5 (tick v3): promise and recap params, and the topic,
+        // promises, reminder, recap and on-topic flag on the state; every one
+        // of them absent (never null) on the legacy payload.
+        let promise_wire = shared_high_risk_contract_fixture_value("/cohost/promiseParams");
+        let promise: CohostPromiseParams = serde_json::from_value(promise_wire.clone()).unwrap();
+        assert_eq!(promise.promise_id, "p_fixture");
+        assert_eq!(serde_json::to_value(promise).unwrap(), promise_wire);
+        let recap_wire = shared_high_risk_contract_fixture_value("/cohost/recapParams");
+        let recap: CohostRecapParams = serde_json::from_value(recap_wire.clone()).unwrap();
+        assert_eq!(recap.session_id, "session-fixture");
+        assert_eq!(serde_json::to_value(recap).unwrap(), recap_wire);
+        assert_eq!(v2.topic.as_deref(), Some("Mechanical keyboards"));
+        assert_eq!(v2.promises.len(), 2);
+        assert_eq!(
+            v2.promises[0].trigger,
+            crate::cohost::CohostPromiseTrigger {
+                kind: crate::cohost::CohostPromiseTriggerKind::Viewers,
+                value: Some(100),
+            }
+        );
+        assert_eq!(
+            v2.promises[1].trigger.kind,
+            crate::cohost::CohostPromiseTriggerKind::None
+        );
+        assert_eq!(v2.promises[1].trigger.value, None);
+        assert_eq!(
+            v2.promise_reminder.as_ref().map(|r| r.promise_id.as_str()),
+            Some("p_fixture")
+        );
+        assert_eq!(
+            v2.recap.as_ref().map(|r| r.expires_at.as_str()),
+            Some("2026-08-22T10:05:20Z")
+        );
+        assert!(v2.questions[0].on_topic);
+        assert_eq!(legacy.topic, None);
+        assert!(legacy.promises.is_empty());
+        assert_eq!(legacy.promise_reminder, None);
+        assert_eq!(legacy.recap, None);
     }
 
     #[test]

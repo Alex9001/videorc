@@ -5031,6 +5031,10 @@ fn websocket_method_execution_policy(method: &str) -> Option<WebSocketMethodExec
         | "cohost.question.dismiss"
         | "cohost.question.restore"
         | "cohost.flag.dismiss"
+        | "cohost.promise.done"
+        | "cohost.promise.dismiss"
+        | "cohost.recap.dismiss"
+        | "cohost.recap.draft"
         | "cohost.settings.set"
         | "captions.overlay.clear"
         | "captions.cues.submit"
@@ -8683,6 +8687,45 @@ async fn handle_text_message_with_role(
         "cohost.flag.dismiss" => {
             match serde_json::from_value::<protocol::CohostFlagParams>(command.params) {
                 Ok(params) => match cohost::dismiss_flag(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => {
+                        ServerResponse::error(command.id, error.code(), error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "cohost.promise.done" | "cohost.promise.dismiss" => {
+            match serde_json::from_value::<protocol::CohostPromiseParams>(command.params) {
+                Ok(params) => match cohost::close_promise(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => {
+                        ServerResponse::error(command.id, error.code(), error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "cohost.recap.dismiss" => {
+            match serde_json::from_value::<protocol::CohostRecapParams>(command.params) {
+                Ok(params) => match cohost::dismiss_recap(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => {
+                        ServerResponse::error(command.id, error.code(), error.to_string())
+                    }
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "cohost.recap.draft" => {
+            match serde_json::from_value::<protocol::CohostRecapParams>(command.params) {
+                Ok(params) => match cohost::draft_recap(state, params).await {
                     Ok(status) => ServerResponse::ok(command.id, status),
                     Err(error) => {
                         ServerResponse::error(command.id, error.code(), error.to_string())

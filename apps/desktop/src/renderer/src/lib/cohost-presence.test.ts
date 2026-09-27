@@ -80,8 +80,8 @@ describe('cohostPresenceView', () => {
     expect(view.openCount).toBe(3)
   })
 
-  it('says listening (not "0 q") when the chat has asked nothing yet', () => {
-    expect(cohostPresenceView(listening(), NOW).label).toBe('Orcle listening')
+  it('says reading chat (not "0 q", never "listening") when the chat has asked nothing yet', () => {
+    expect(cohostPresenceView(listening(), NOW).label).toBe('Orcle is reading chat')
   })
 
   it('counts the queued messages it has seen but not sent', () => {
@@ -174,11 +174,11 @@ describe('cohostEmptyStateCopy', () => {
     expect(cohostEmptyStateCopy(cohostPresenceView(one, NOW), one)).toBe('Reading 1 new message…')
     const idle = listening()
     expect(cohostEmptyStateCopy(cohostPresenceView(idle, NOW), idle)).toBe(
-      'Listening. Questions from chat will appear here.'
+      'Reading chat. Questions will appear here.'
     )
     const off = offCohostState()
     expect(cohostEmptyStateCopy(cohostPresenceView(off, NOW), off)).toBe(
-      'Questions from chat will appear here once Orcle is listening again.'
+      'Questions from chat will appear here once Orcle is reading chat again.'
     )
   })
 })

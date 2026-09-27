@@ -10,8 +10,10 @@ import type {
   CohostListeningState,
   CohostMoodScores,
   CohostPriority,
+  CohostPromiseTrigger,
   CohostQuestion,
   CohostReason,
+  CohostRecap,
   CohostState,
   StreamPlatform
 } from './backend'
@@ -65,12 +67,15 @@ export const EMPTY_COHOST_STATE: CohostState = {
 
 const PRIORITY_RANK: Record<CohostPriority, number> = { high: 0, normal: 1, low: 2 }
 
-/** Highest priority first, then oldest first — the order a producer would read
- * them out. Stable on id so equal rows never swap between ticks. */
+/** Highest priority first, on-topic before off-topic within a priority (plan
+ * 068 D7), then oldest first — the order a producer would read them out.
+ * Stable on id so equal rows never swap between ticks. */
 export function sortedCohostQuestions(questions: readonly CohostQuestion[]): CohostQuestion[] {
   return [...questions].sort((left, right) => {
     const priority = PRIORITY_RANK[left.priority] - PRIORITY_RANK[right.priority]
     if (priority !== 0) return priority
+    const topic = Number(right.onTopic === true) - Number(left.onTopic === true)
+    if (topic !== 0) return topic
     const seen = Date.parse(left.firstSeenAt) - Date.parse(right.firstSeenAt)
     if (Number.isFinite(seen) && seen !== 0) return seen
     return left.id.localeCompare(right.id)
@@ -576,6 +581,60 @@ export function cohostQuestionToast({
   )
   if (!candidate) return null
   return { message: cohostQuestionToastMessage(candidate, shortcut), atMs: nowMs }
+}
+
+// --- Promises and recaps (plan 068 D8) --------------------------------------
+
+/** One keyed toast slot for promise reminders: the backend fires each promise
+ * once, so a newer reminder replaces the older one in place. */
+export const COHOST_PROMISE_TOAST_ID = 'cohost-promise'
+
+const COHOST_PROMISE_TOAST_TEXT_CAP = 80
+
+/** "at 100 viewers", "in 10 min"; null for a promise with no trigger (it
+ * reminds after 20 minutes on its own). */
+export function cohostPromiseTriggerLabel(trigger: CohostPromiseTrigger): string | null {
+  if (typeof trigger.value !== 'number' || !Number.isFinite(trigger.value)) return null
+  const value = Math.max(0, Math.round(trigger.value))
+  if (trigger.kind === 'viewers') return `at ${value.toLocaleString()} viewers`
+  if (trigger.kind === 'minutes') return `in ${value} min`
+  return null
+}
+
+/** "Orcle: you promised: a giveaway at 100 viewers". */
+export function cohostPromiseReminderMessage(text: string): string {
+  const trimmed = trimDraftToCap(text, COHOST_PROMISE_TOAST_TEXT_CAP)
+  return trimmed ? `You promised: ${trimmed}` : 'You made a promise on stream.'
+}
+
+/**
+ * A reminder is news exactly once: when the state carries a reminder the
+ * previous state (of the same session) did not. Dismissing or finishing the
+ * promise clears it on the backend, so the same id never toasts twice.
+ */
+export function cohostPromiseReminderToast({
+  previous,
+  next
+}: {
+  previous: CohostState | null
+  next: CohostState
+}): string | null {
+  const reminder = next.promiseReminder
+  if (!reminder) return null
+  const before =
+    previous && previous.sessionId === next.sessionId ? previous.promiseReminder : undefined
+  if (before && before.promiseId === reminder.promiseId && before.at === reminder.at) return null
+  return cohostPromiseReminderMessage(reminder.text)
+}
+
+/** The recap while it is current: the backend drops it after five minutes,
+ * and this keeps a quiet chat honest between state events. */
+export function activeCohostRecap(state: CohostState | null, nowMs: number): CohostRecap | null {
+  const recap = state?.recap
+  if (!recap) return null
+  const expires = Date.parse(recap.expiresAt)
+  if (Number.isFinite(expires) && expires <= nowMs) return null
+  return recap
 }
 
 // --- Off-but-useful nudge ---------------------------------------------------

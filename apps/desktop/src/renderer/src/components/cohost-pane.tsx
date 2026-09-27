@@ -19,11 +19,19 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 import { Command, CommandList } from '@/components/ui/command'
 import { Kbd } from '@/components/ui/kbd'
 import { Separator } from '@/components/ui/separator'
-import type { CohostFlag, CohostQuestion, CohostRecentlyResolved, CohostState } from '@/lib/backend'
+import type {
+  CohostFlag,
+  CohostPromise,
+  CohostQuestion,
+  CohostRecap,
+  CohostRecentlyResolved,
+  CohostState
+} from '@/lib/backend'
 import { cohostEmptyStateCopy, cohostPresenceView, cohostQuestionIds } from '@/lib/cohost-presence'
 import { activeCohostSpotlight } from '@/lib/cohost-marks'
 import {
   activeCohostAlerts,
+  activeCohostRecap,
   cohostAlertLabel,
   cohostErrorDetail,
   cohostErrorDetailText,
@@ -32,6 +40,7 @@ import {
   cohostListenPromptVisible,
   cohostMoodScoresLabel,
   cohostPaneMode,
+  cohostPromiseTriggerLabel,
   cohostQuestionRowKey,
   cohostRowAt,
   cohostRows,
@@ -75,6 +84,11 @@ export function CohostPane({
   onRestoreQuestion,
   onDismissQuestion,
   onDismissFlag,
+  onPromiseDone,
+  onPromiseDismiss,
+  onRecapPost,
+  onRecapDismiss,
+  onRecapDraft,
   onJumpToMessage,
   onEnableConsent,
   onOpenChange,
@@ -99,6 +113,13 @@ export function CohostPane({
   onRestoreQuestion?: (question: CohostQuestion) => void
   onDismissQuestion: (question: CohostQuestion) => void
   onDismissFlag: (flag: CohostFlag) => void
+  /** Promises and recaps (plan 068 D8). Nothing here sends: Post to chat
+   * pre-fills the composer, Draft a recap asks the backend for a draft. */
+  onPromiseDone?: (promise: CohostPromise) => void
+  onPromiseDismiss?: (promise: CohostPromise) => void
+  onRecapPost?: (recap: CohostRecap) => void
+  onRecapDismiss?: () => void
+  onRecapDraft?: () => void
   onJumpToMessage?: (messageId: string) => void
   onEnableConsent?: () => void
   /** Reports the segment's open/closed state so the owner can throttle the
@@ -134,6 +155,9 @@ export function CohostPane({
     [state?.recentlyResolved, nowMs]
   )
   const spotlightQuestionId = activeCohostSpotlight(state, nowMs)?.questionId ?? null
+  const promises = state?.promises ?? []
+  const recap = activeCohostRecap(state, nowMs)
+  const topic = state?.topic?.trim() || null
   // Viewers saying something is broken. A persistent chip, never a toast: it
   // stays while the backend still counts two corroborating viewers.
   const alerts = activeCohostAlerts(state, nowMs)
@@ -162,11 +186,12 @@ export function CohostPane({
   // Ages and alert expiry are the only time-dependent copy in the pane; one
   // slow tick keeps them honest without re-rendering the message list
   // underneath.
+  const recapPresent = state?.recap !== undefined
   useEffect(() => {
-    if (rows.length === 0 && alertCount === 0) return
+    if (rows.length === 0 && alertCount === 0 && !recapPresent) return
     const timer = setInterval(() => setNowMs(Date.now()), 30_000)
     return () => clearInterval(timer)
-  }, [alertCount, rows.length])
+  }, [alertCount, recapPresent, rows.length])
 
   useEffect(() => {
     onOpenChange?.(open)
@@ -377,6 +402,17 @@ export function CohostPane({
 
       <CollapsibleContent>
         <Separator />
+        {topic ? (
+          // What the streamer is talking about (tick v3): one quiet line, the
+          // same tier as the error detail, present only when the server said.
+          <p
+            className="truncate px-2.5 py-1 text-[11px] text-muted-foreground"
+            data-slot="cohost-topic"
+            title={`Talking about: ${topic}`}
+          >
+            <span className="text-subtle">Talking about:</span> {topic}
+          </p>
+        ) : null}
         {errorDetail ? (
           // The failed tick in the server's own words, so "AI error" is never
           // the whole story. Monochrome; the dot already carries the state.
@@ -440,6 +476,46 @@ export function CohostPane({
             items={answeredOnAir}
             onRestore={(question) => onRestoreQuestion?.(question)}
           />
+        ) : null}
+        {promises.length > 0 ? (
+          <CohostPromises
+            disabled={actionPending}
+            items={promises}
+            onDismiss={onPromiseDismiss}
+            onDone={onPromiseDone}
+          />
+        ) : null}
+        {recap ? (
+          <CohostRecapCard
+            disabled={actionPending}
+            recap={recap}
+            onDismiss={onRecapDismiss}
+            onPost={onRecapPost}
+          />
+        ) : onRecapDraft ? (
+          <>
+            <Separator />
+            <div className="flex h-7 items-center gap-1 px-2" data-slot="cohost-recap-draft">
+              <span
+                className={cn(
+                  'min-w-0 flex-1 truncate text-[11px] text-subtle',
+                  PANE_NARROW_HIDDEN
+                )}
+              >
+                For viewers who just arrived.
+              </span>
+              <Button
+                className="shrink-0"
+                disabled={actionPending}
+                size="xs"
+                type="button"
+                variant="ghost"
+                onClick={onRecapDraft}
+              >
+                Draft a recap
+              </Button>
+            </div>
+          </>
         ) : null}
 
         {activeRow ? (
@@ -643,6 +719,123 @@ function AnsweredOnAir({
         <CollapsibleContent>{older.map((item) => line(item))}</CollapsibleContent>
       ) : null}
     </Collapsible>
+  )
+}
+
+/**
+ * What the streamer promised out loud (plan 068 D8): private rows with the
+ * trigger as a hint. Done and Dismiss both close the promise; the backend
+ * reminds once when the trigger is met, as a keyed toast.
+ */
+function CohostPromises({
+  items,
+  disabled,
+  onDone,
+  onDismiss
+}: {
+  items: readonly CohostPromise[]
+  disabled: boolean
+  onDone?: (promise: CohostPromise) => void
+  onDismiss?: (promise: CohostPromise) => void
+}): ReactElement {
+  return (
+    <div data-slot="cohost-promises">
+      <Separator />
+      <p className="px-2 pt-1.5 pb-0.5 text-[11px] font-semibold text-subtle">Promises</p>
+      {items.map((promise) => {
+        const hint = cohostPromiseTriggerLabel(promise.trigger)
+        return (
+          <div
+            key={promise.id}
+            className="flex h-7 min-w-0 items-center gap-1 px-2 text-xs"
+            data-slot="cohost-promise"
+          >
+            <span
+              className="min-w-0 flex-1 truncate text-foreground"
+              title={hint ? `${promise.text} (${hint})` : promise.text}
+            >
+              {promise.text}
+            </span>
+            {hint ? (
+              <span
+                className={cn('shrink-0 text-[11px] text-muted-foreground', PANE_NARROW_HIDDEN)}
+                data-slot="cohost-promise-hint"
+              >
+                {hint}
+              </span>
+            ) : null}
+            <Button
+              className="shrink-0"
+              disabled={disabled || !onDone}
+              size="xs"
+              type="button"
+              variant="ghost"
+              onClick={() => onDone?.(promise)}
+            >
+              Done
+            </Button>
+            <Button
+              className="shrink-0"
+              disabled={disabled || !onDismiss}
+              size="xs"
+              type="button"
+              variant="ghost"
+              onClick={() => onDismiss?.(promise)}
+            >
+              Dismiss
+            </Button>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * A recap for viewers who asked what they missed, or one the streamer
+ * drafted. Post to chat pre-fills the composer and nothing else: Orcle never
+ * sends.
+ */
+function CohostRecapCard({
+  recap,
+  disabled,
+  onPost,
+  onDismiss
+}: {
+  recap: CohostRecap
+  disabled: boolean
+  onPost?: (recap: CohostRecap) => void
+  onDismiss?: () => void
+}): ReactElement {
+  return (
+    <div className="shrink-0 p-2" data-slot="cohost-recap">
+      <Alert aria-label="Recap for viewers who just arrived" role="group">
+        <AlertTitle className="text-xs">Recap</AlertTitle>
+        <AlertDescription className="text-xs" data-slot="cohost-recap-text">
+          {recap.text}
+        </AlertDescription>
+        <div className="col-start-2 mt-1.5 flex flex-wrap gap-1">
+          <Button
+            disabled={disabled || !onPost}
+            size="xs"
+            type="button"
+            variant="secondary"
+            onClick={() => onPost?.(recap)}
+          >
+            Post to chat
+          </Button>
+          <Button
+            disabled={disabled || !onDismiss}
+            size="xs"
+            type="button"
+            variant="ghost"
+            onClick={onDismiss}
+          >
+            Dismiss
+          </Button>
+        </div>
+      </Alert>
+    </div>
   )
 }
 

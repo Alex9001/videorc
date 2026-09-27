@@ -400,6 +400,13 @@
       "sessionId": "session-fixture",
       "messageId": "session-fixture:twitch:default:message-fixture"
     },
+    "promiseParams": {
+      "sessionId": "session-fixture",
+      "promiseId": "p_fixture"
+    },
+    "recapParams": {
+      "sessionId": "session-fixture"
+    },
     "settingsPatch": {
       "enabled": true,
       "tone": "short",
@@ -520,7 +527,21 @@
       "status": "listening",
       "reason": null,
       "detail": null,
-      "questions": [],
+      "questions": [
+        {
+          "id": "q_topic",
+          "text": "Which switches?",
+          "messageIds": ["session-fixture:twitch:default:message-fixture"],
+          "askers": ["Viewer"],
+          "platforms": ["twitch"],
+          "priority": "normal",
+          "suggestedReply": "Gateron Reds.",
+          "fromNotes": false,
+          "firstSeenAt": "2026-08-22T10:00:00Z",
+          "updatedAt": "2026-08-22T10:00:20Z",
+          "onTopic": true
+        }
+      ],
       "flags": [
         {
           "messageId": "session-fixture:twitch:default:message-fixture",
@@ -610,6 +631,31 @@
         "reasonCode": "listen-monthly-quota-exhausted",
         "message": "Orcle's listening allowance for this month is used up.",
         "remainingSeconds": 0
+      },
+      "topic": "Mechanical keyboards",
+      "promises": [
+        {
+          "id": "p_fixture",
+          "text": "Giveaway at 100 viewers",
+          "trigger": { "kind": "viewers", "value": 100 },
+          "firstSeenAt": "2026-08-22T10:00:00Z"
+        },
+        {
+          "id": "p_fixture_2",
+          "text": "Show the build later",
+          "trigger": { "kind": "none" },
+          "firstSeenAt": "2026-08-22T10:00:10Z"
+        }
+      ],
+      "promiseReminder": {
+        "promiseId": "p_fixture",
+        "text": "Giveaway at 100 viewers",
+        "at": "2026-08-22T10:00:20Z"
+      },
+      "recap": {
+        "text": "So far: unboxed the Q1, compared switches.",
+        "at": "2026-08-22T10:00:20Z",
+        "expiresAt": "2026-08-22T10:05:20Z"
       }
     },
     "legacyState": {

@@ -4287,6 +4287,41 @@ export interface CohostQuestion {
   fromNotes: boolean
   firstSeenAt: string
   updatedAt: string
+  /** Tick v3 (plan 068): about what the streamer is talking about right now.
+   * Omitted by the backend while false. */
+  onTopic?: boolean
+}
+
+export type CohostPromiseTriggerKind = 'none' | 'viewers' | 'minutes'
+
+/** When a promise reminder fires: at `value` viewers, after `value` minutes,
+ * or (`none`) 20 minutes after Orcle first heard it. */
+export interface CohostPromiseTrigger {
+  kind: CohostPromiseTriggerKind | (string & Record<never, never>)
+  value?: number
+}
+
+/** A promise the streamer made out loud (plan 068 D8); private until they act. */
+export interface CohostPromise {
+  id: string
+  text: string
+  trigger: CohostPromiseTrigger
+  firstSeenAt: string
+}
+
+/** The engine's latest met trigger, keyed on the promise: toast once per id. */
+export interface CohostPromiseReminder {
+  promiseId: string
+  text: string
+  at: string
+}
+
+/** A recap for viewers who asked what they missed, or one the streamer
+ * drafted; never posted by Orcle. Gone after `expiresAt`. */
+export interface CohostRecap {
+  text: string
+  at: string
+  expiresAt: string
 }
 
 export interface CohostFlag {
@@ -4454,6 +4489,15 @@ export interface CohostState {
    * from a backend before the field (never null).
    */
   listening?: CohostListening
+  /**
+   * Tick v3 (plan 068 D7/D8). All absent (never null) until the engine has
+   * them: what the streamer is talking about, the open promises (oldest
+   * first, at most 20), the latest met promise trigger, and the recap.
+   */
+  topic?: string
+  promises?: CohostPromise[]
+  promiseReminder?: CohostPromiseReminder
+  recap?: CohostRecap
 }
 
 /**
@@ -4504,6 +4548,17 @@ export interface CohostFlagParams {
   messageId: string
 }
 
+/** `cohost.promise.done` / `cohost.promise.dismiss` (plan 068 D8). */
+export interface CohostPromiseParams {
+  sessionId: string
+  promiseId: string
+}
+
+/** `cohost.recap.dismiss` / `cohost.recap.draft` (plan 068 D8). */
+export interface CohostRecapParams {
+  sessionId: string
+}
+
 /**
  * What the detached Comments window needs to render the Co-host segment. The
  * MAIN renderer owns the backend socket, the entitlement snapshot and the
@@ -4544,7 +4599,27 @@ export function offCohostWindowState(): CohostWindowState {
   }
 }
 
-export type CohostActionKind = 'answered' | 'dismiss-question' | 'dismiss-flag' | 'restore'
+export type CohostActionKind =
+  | 'answered'
+  | 'dismiss-question'
+  | 'dismiss-flag'
+  | 'restore'
+  | 'promise-done'
+  | 'promise-dismiss'
+  | 'recap-dismiss'
+  | 'recap-draft'
+
+/** Every action kind the relay accepts; main validates against it. */
+export const COHOST_ACTION_KINDS: readonly CohostActionKind[] = [
+  'answered',
+  'dismiss-question',
+  'dismiss-flag',
+  'restore',
+  'promise-done',
+  'promise-dismiss',
+  'recap-dismiss',
+  'recap-draft'
+]
 
 /** Correlated co-host action from the Comments window, brokered through main
  * to the main renderer (which makes the actual `cohost.*` RPC). */
@@ -4552,7 +4627,9 @@ export interface CohostActionCommand {
   requestId: string
   sessionId: string
   kind: CohostActionKind
-  /** Question id for question actions; the flagged message id for flags. */
+  /** Question id for question actions; the flagged message id for flags; the
+   * promise id for promise actions; the session id again for recap actions
+   * (they have no target of their own). */
   targetId: string
 }
 

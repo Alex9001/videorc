@@ -42,9 +42,12 @@ import {
   cohostPaneMode,
   persistCohostListenPromptDismissed,
   readCohostListenPromptDismissed,
+  cohostPromiseReminderToast,
+  cohostPromiseTriggerLabel,
   cohostQuestionRowKey,
   cohostQuestionToast,
   cohostQuestionToastMessage,
+  activeCohostRecap,
   cohostRowAt,
   cohostRows,
   draftForQuestion,
@@ -148,6 +151,21 @@ describe('ordering', () => {
       question({ id: 'd', priority: 'normal', firstSeenAt: '2026-08-22T12:02:00.000Z' })
     ])
     expect(rows.map((row) => row.id)).toEqual(['a', 'c', 'd', 'b'])
+  })
+
+  it('puts on-topic questions first within a priority, never across one (plan 068)', () => {
+    const rows = sortedCohostQuestions([
+      question({ id: 'off-high', priority: 'high', firstSeenAt: '2026-08-22T12:00:00.000Z' }),
+      question({
+        id: 'on-high',
+        priority: 'high',
+        firstSeenAt: '2026-08-22T12:05:00.000Z',
+        onTopic: true
+      }),
+      question({ id: 'on-normal', priority: 'normal', onTopic: true }),
+      question({ id: 'off-normal', priority: 'normal', firstSeenAt: '2026-08-22T11:00:00.000Z' })
+    ])
+    expect(rows.map((row) => row.id)).toEqual(['on-high', 'off-high', 'on-normal', 'off-normal'])
   })
 
   it('keeps equal questions in a stable id order', () => {
@@ -946,5 +964,53 @@ describe('listening (plan 068)', () => {
       kind: 'consent',
       reason: `${COHOST_CONSENT_SENTENCE} Turn on cloud AI to use it.`
     })
+  })
+})
+
+describe('promises and recaps (plan 068 D8)', () => {
+  it('names the trigger as a short hint, none for a promise without one', () => {
+    expect(cohostPromiseTriggerLabel({ kind: 'viewers', value: 100 })).toBe('at 100 viewers')
+    expect(cohostPromiseTriggerLabel({ kind: 'viewers', value: 1500 })).toBe('at 1,500 viewers')
+    expect(cohostPromiseTriggerLabel({ kind: 'minutes', value: 10 })).toBe('in 10 min')
+    expect(cohostPromiseTriggerLabel({ kind: 'none' })).toBeNull()
+    expect(cohostPromiseTriggerLabel({ kind: 'viewers' })).toBeNull()
+    expect(cohostPromiseTriggerLabel({ kind: 'followers', value: 5 })).toBeNull()
+  })
+
+  it('toasts a reminder once, when it is news for the same session', () => {
+    const reminder = {
+      promiseId: 'p_1',
+      text: 'a giveaway at 100 viewers',
+      at: '2026-08-22T12:00:00Z'
+    }
+    const next = state({ promiseReminder: reminder })
+    expect(cohostPromiseReminderToast({ previous: null, next })).toBe(
+      'You promised: a giveaway at 100 viewers'
+    )
+    expect(cohostPromiseReminderToast({ previous: state(), next })).toBe(
+      'You promised: a giveaway at 100 viewers'
+    )
+    // The same reminder again is not news; a later one for another promise is.
+    expect(cohostPromiseReminderToast({ previous: next, next })).toBeNull()
+    expect(
+      cohostPromiseReminderToast({
+        previous: next,
+        next: state({ promiseReminder: { ...reminder, promiseId: 'p_2', text: 'the build' } })
+      })
+    ).toBe('You promised: the build')
+    expect(cohostPromiseReminderToast({ previous: next, next: state() })).toBeNull()
+  })
+
+  it('keeps a recap only until it expires', () => {
+    const recap = {
+      text: 'So far: unboxed the parts.',
+      at: '2026-08-22T12:00:00Z',
+      expiresAt: '2026-08-22T12:05:00Z'
+    }
+    const current = state({ recap })
+    expect(activeCohostRecap(current, Date.parse('2026-08-22T12:04:59Z'))).toEqual(recap)
+    expect(activeCohostRecap(current, Date.parse('2026-08-22T12:05:00Z'))).toBeNull()
+    expect(activeCohostRecap(state(), Date.parse('2026-08-22T12:00:00Z'))).toBeNull()
+    expect(activeCohostRecap(null, 0)).toBeNull()
   })
 })

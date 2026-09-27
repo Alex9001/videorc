@@ -20,23 +20,30 @@ use crate::captions::{CaptionUpdateKind, CaptionsUpdate};
 use crate::comment_highlight::{CommentHighlightPhase, CommentHighlightState};
 use crate::live_chat::{LiveChatEventType, LiveChatMessage};
 use crate::protocol::{
-    CohostFlagParams, CohostQuestionParams, CohostSettingsPatch, CohostStartParams, FeatureId,
+    CohostFlagParams, CohostPromiseParams, CohostQuestionParams, CohostRecapParams,
+    CohostSettingsPatch, CohostStartParams, FeatureId,
 };
 use crate::state::AppState;
 use crate::storage::Database;
 use crate::streaming::StreamPlatform;
 use crate::videorc_api::{
     COHOST_SPOTLIGHT_MAX_BODY_BYTES, CohostApiError, CohostApiErrorKind, CohostSpotlightCandidate,
-    CohostSpotlightRequest, CohostSpotlightResponse, CohostTickMessage, CohostTickOpenQuestion,
-    CohostTickQuestion, CohostTickRequest, CohostTickResponse, VideorcApiClient,
+    CohostSpotlightRequest, CohostSpotlightResponse, CohostTickMessage, CohostTickOpenPromise,
+    CohostTickOpenQuestion, CohostTickPromise, CohostTickQuestion, CohostTickRequest,
+    CohostTickResponse, VideorcApiClient,
 };
 
 pub const COHOST_STATE_EVENT: &str = "cohost.state";
 /// Pinned by the desktop; the server rejects unknown versions with 400
-/// `prompt-version-unsupported`. A session that gets that answer to a v2 tick
-/// drops to `COHOST_PROMPT_VERSION_FALLBACK` until it ends (server rollback).
-pub const COHOST_PROMPT_VERSION: u32 = 2;
-pub const COHOST_PROMPT_VERSION_FALLBACK: u32 = 1;
+/// `prompt-version-unsupported`. A session that gets that answer drops one
+/// step down `COHOST_PROMPT_VERSION_LADDER` (3 → 2 → 1) until it ends
+/// (server rollback); a rejected v1 tick is a real failure.
+pub const COHOST_PROMPT_VERSION: u32 = 3;
+pub const COHOST_PROMPT_VERSION_LADDER: [u32; 3] = [3, 2, 1];
+/// `rules` ride every version from v2 on, whatever the pinned version.
+const COHOST_PROMPT_VERSION_RULES_MIN: u32 = 2;
+/// Transcript, summary, promises, recap, on-topic (plan 068 D7).
+const COHOST_PROMPT_VERSION_SPEECH_MIN: u32 = 3;
 pub const COHOST_SETTINGS_KEY: &str = "cohostSettings";
 pub const COHOST_NOTES_MAX_CHARS: usize = 4000;
 /// The server rejects more or longer rules as `invalid-request`, so settings
@@ -55,6 +62,25 @@ const TICK_IDLE_INTERVAL: Duration = Duration::from_secs(20);
 /// ticks never overlap, so a slow tick delays the next one rather than
 /// shortening the gap.
 pub(crate) const TICK_MIN_GAP: Duration = Duration::from_secs(8);
+/// v3 cadence (plan 068 D7): a tick goes out on speech alone once this many
+/// transcript chars arrived since the previous tick and the idle interval
+/// passed, even with an empty chat delta.
+pub(crate) const TICK_TRANSCRIPT_MIN_NEW_CHARS: usize = 200;
+/// Server caps on the v3 request (`cohost.ts`); the server truncates the
+/// transcript itself, the promise list it rejects.
+const TICK_TRANSCRIPT_MAX_CHARS: usize = 1500;
+const TICK_SUMMARY_MAX_CHARS: usize = 600;
+const TICK_OPEN_PROMISES_CAP: usize = 20;
+const PROMISE_TEXT_MAX_CHARS: usize = 160;
+const TOPIC_MAX_CHARS: usize = 60;
+pub(crate) const RECAP_MAX_CHARS: usize = 140;
+/// A recap (server or drafted) leaves the state after this long.
+pub(crate) const RECAP_TTL: Duration = Duration::from_secs(5 * 60);
+/// A promise with no trigger reminds the streamer after this long.
+pub(crate) const PROMISE_DEFAULT_REMINDER: Duration = Duration::from_secs(20 * 60);
+/// Pending transcript kept between ticks; only the newest
+/// `TICK_TRANSCRIPT_MAX_CHARS` go out, the rest is context lost anyway.
+const TRANSCRIPT_PENDING_CAP_CHARS: usize = 4 * TICK_TRANSCRIPT_MAX_CHARS;
 /// Hard cap on the detail message carried on the wire; server envelope
 /// messages are one sentence, and a proxy error page must not become a toast.
 const ERROR_DETAIL_MESSAGE_MAX_CHARS: usize = 400;
@@ -171,6 +197,19 @@ pub enum CohostPriority {
     Low,
     /// Forward tolerance: a priority this build does not know. Never reaches
     /// the renderer — `apply_response` reads it as `normal`.
+    #[serde(other)]
+    Unknown,
+}
+
+/// When a promise reminder fires (plan 068 D8). `Unknown` is forward
+/// tolerance on the wire and is read as `none` (20 minutes after first seen).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CohostPromiseTriggerKind {
+    #[default]
+    None,
+    Viewers,
+    Minutes,
     #[serde(other)]
     Unknown,
 }
@@ -513,6 +552,49 @@ pub struct CohostQuestion {
     pub from_notes: bool,
     pub first_seen_at: String,
     pub updated_at: String,
+    /// v3: about what the streamer is talking about right now. Omitted while
+    /// false (the renderer contract treats it as optional).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_topic: bool,
+}
+
+/// One promise the streamer made out loud (plan 068 D8): private until they
+/// act on it. `value` is the viewer count or the minutes for that kind.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostPromiseTrigger {
+    pub kind: CohostPromiseTriggerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostPromise {
+    pub id: String,
+    pub text: String,
+    pub trigger: CohostPromiseTrigger,
+    pub first_seen_at: String,
+}
+
+/// The engine's latest met trigger, keyed on the promise: the renderer toasts
+/// once per promise id. Replaced by the next one, cleared with its promise.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostPromiseReminder {
+    pub promise_id: String,
+    pub text: String,
+    pub at: String,
+}
+
+/// A recap for viewers who asked what they missed, or one the streamer
+/// drafted from the summary. Never posted by Orcle; gone after `RECAP_TTL`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostRecap {
+    pub text: String,
+    pub at: String,
+    pub expires_at: String,
 }
 
 /// The v2 extras are absent keys when the server did not send them — never
@@ -664,6 +746,19 @@ pub struct CohostState {
     /// or by a backend from before the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listening: Option<CohostListening>,
+    /// What the streamer is talking about (plan 068 D7, v3). Omitted until
+    /// the server said so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// Open promises, oldest first, at most 20. Omitted while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promises: Vec<CohostPromise>,
+    /// The latest met promise trigger; omitted until one fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promise_reminder: Option<CohostPromiseReminder>,
+    /// Omitted while there is no recap, or once it expired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recap: Option<CohostRecap>,
 }
 
 impl CohostState {
@@ -691,6 +786,10 @@ impl CohostState {
             spotlight: None,
             recently_resolved: Vec::new(),
             listening: None,
+            topic: None,
+            promises: Vec::new(),
+            promise_reminder: None,
+            recap: None,
         }
     }
 }
@@ -701,8 +800,10 @@ pub enum CohostError {
     Disabled,
     #[error("Orcle needs the active live chat session; sessionId did not match.")]
     SessionMismatch,
-    #[error("sessionId and the question or message id are required.")]
+    #[error("sessionId and the question, message or promise id are required.")]
     InvalidParams,
+    #[error("Orcle has nothing to recap yet: no summary has arrived this session.")]
+    NoSummary,
     #[error("Could not persist Orcle settings: {0}")]
     Storage(String),
 }
@@ -713,6 +814,7 @@ impl CohostError {
             Self::Disabled => "cohost-disabled",
             Self::SessionMismatch => "cohost-session-mismatch",
             Self::InvalidParams => "invalid-params",
+            Self::NoSummary => "cohost-no-summary",
             Self::Storage(_) => "cohost-settings-storage-failed",
         }
     }
@@ -867,10 +969,9 @@ pub struct RecentSpeech {
     version: u64,
 }
 
-/// What a reader gets when the buffer changed since the version it saw.
-/// Read by the later plan 068 slices (tick transcript, Clip that, greeting by
-/// voice); nothing in S3 consumes it yet.
-#[allow(dead_code)]
+/// What a reader gets when the buffer changed since the version it saw. The
+/// tick scheduler polls it for the v3 transcript (plan 068 S5); Clip that and
+/// greeting by voice read it too.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecentSpeechSnapshot {
     pub finals: Vec<RecentSpeechFinal>,
@@ -897,7 +998,6 @@ impl RecentSpeech {
 
     /// `None` when nothing changed since `seen_version`; otherwise every final
     /// still inside the window at `now`, oldest first, with the new version.
-    #[allow(dead_code)]
     pub(crate) fn since(
         &self,
         seen_version: Option<u64>,
@@ -976,8 +1076,7 @@ pub fn voice_activity(state: &AppState) -> VoiceActivity {
 }
 
 /// The recent-speech buffer if it changed since `seen_version` (`None` to
-/// read unconditionally). Later slices poll this from their own passes.
-#[allow(dead_code)]
+/// read unconditionally). The tick scheduler polls it every pass.
 pub fn recent_speech_since(
     state: &AppState,
     seen_version: Option<u64>,
@@ -1109,6 +1208,32 @@ struct CohostSession {
     spotlight: SpotlightLane,
     /// Voice-resolved questions the streamer can put back, oldest first.
     recently_resolved: Vec<ResolvedRecord>,
+    /// v3 (plan 068 D7/D8). The rolling summary the server returned last and
+    /// the desktop echoes; the current topic; the open promises with their
+    /// bookkeeping; the recap; and the transcript cursor into the
+    /// recent-speech buffer.
+    summary: String,
+    topic: Option<String>,
+    promises: Vec<CohostPromise>,
+    /// Monotonic first-seen per open promise id, for the minutes trigger.
+    promise_seen: HashMap<String, Instant>,
+    /// Done or dismissed ids: never return from a later tick.
+    closed_promises: HashSet<String>,
+    /// Ids whose trigger already fired: one reminder per promise.
+    reminded_promises: HashSet<String>,
+    promise_reminder: Option<CohostPromiseReminder>,
+    next_promise_seq: u64,
+    recap: Option<CohostRecap>,
+    recap_expires_at: Option<Instant>,
+    /// Recent-speech version the scheduler last read, and the arrival time of
+    /// the newest final already folded into `transcript_pending`.
+    speech_version: Option<u64>,
+    speech_cursor: Option<Instant>,
+    /// Finals since the previous tick, oldest first, capped to the newest
+    /// `TRANSCRIPT_PENDING_CAP_CHARS`.
+    transcript_pending: String,
+    /// What the outstanding tick sent, restored on a version fallback.
+    in_flight_transcript: String,
 }
 
 /// What the engine remembers about one chat row it noted.
@@ -1251,6 +1376,20 @@ impl CohostSession {
             spotlight: SpotlightLane::default(),
             recently_resolved: Vec::new(),
             listening: None,
+            summary: String::new(),
+            topic: None,
+            promises: Vec::new(),
+            promise_seen: HashMap::new(),
+            closed_promises: HashSet::new(),
+            reminded_promises: HashSet::new(),
+            promise_reminder: None,
+            next_promise_seq: 0,
+            recap: None,
+            recap_expires_at: None,
+            speech_version: None,
+            speech_cursor: None,
+            transcript_pending: String::new(),
+            in_flight_transcript: String::new(),
         }
     }
 
@@ -1290,7 +1429,58 @@ impl CohostSession {
             spotlight: self.spotlight_at(now),
             recently_resolved: self.recently_resolved_at(now),
             listening: self.listening.clone(),
+            topic: self.topic.clone(),
+            promises: self.promises.clone(),
+            promise_reminder: self.promise_reminder.clone(),
+            recap: self.recap_at(now),
         }
+    }
+
+    /// The recap as the wire sees it: `None` once it expired.
+    fn recap_at(&self, now: Instant) -> Option<CohostRecap> {
+        self.recap
+            .as_ref()
+            .filter(|_| self.recap_expires_at.is_some_and(|until| now < until))
+            .cloned()
+    }
+
+    fn speaks_v3(&self) -> bool {
+        self.prompt_version >= COHOST_PROMPT_VERSION_SPEECH_MIN
+    }
+
+    /// Transcript chars waiting for the next tick, as the cadence sees them:
+    /// nothing below v3, where the transcript never goes out.
+    fn transcript_pending_chars(&self) -> usize {
+        if self.speaks_v3() {
+            self.transcript_pending.chars().count()
+        } else {
+            0
+        }
+    }
+
+    /// Fold the finals that arrived since the cursor into the pending
+    /// transcript. Returns how many chars were added.
+    fn note_speech(&mut self, snapshot: &RecentSpeechSnapshot) -> usize {
+        self.speech_version = Some(snapshot.version);
+        let mut added = 0;
+        for final_ in &snapshot.finals {
+            if self.speech_cursor.is_some_and(|cursor| final_.at <= cursor) {
+                continue;
+            }
+            self.speech_cursor = Some(final_.at);
+            let text = final_.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if !self.transcript_pending.is_empty() {
+                self.transcript_pending.push(' ');
+            }
+            self.transcript_pending.push_str(text);
+            added += text.chars().count();
+        }
+        self.transcript_pending =
+            keep_newest_chars(&self.transcript_pending, TRANSCRIPT_PENDING_CAP_CHARS);
+        added
     }
 
     /// Pending count as the cadence rules see it. After a version fallback the
@@ -1432,6 +1622,7 @@ impl CohostSession {
         }
         tick_due(
             self.cadence_pending(),
+            self.transcript_pending_chars(),
             self.last_tick_at.unwrap_or(self.started_at),
             self.last_tick_at,
             now,
@@ -1443,14 +1634,42 @@ impl CohostSession {
         self.last_tick_at = Some(now);
         self.in_flight = true;
         self.version_retry = false;
-        let messages: Vec<CohostTickMessage> = self.pending.drain(..).collect();
+        let speaks_v3 = self.speaks_v3();
+        let mut messages: Vec<CohostTickMessage> = self.pending.drain(..).collect();
+        if !speaks_v3 {
+            // A v1/v2 body stays exactly what those desktops send.
+            for message in &mut messages {
+                message.first_message = None;
+            }
+        }
         let dropped_messages = std::mem::take(&mut self.dropped);
         // v1 fallback: no `rules` key at all, so the body stays byte-identical
-        // to what a v1 desktop sends.
-        let rules = (self.prompt_version >= COHOST_PROMPT_VERSION).then(|| settings.rules.clone());
+        // to what a v1 desktop sends. From v2 on the rules always ride.
+        let rules = (self.prompt_version >= COHOST_PROMPT_VERSION_RULES_MIN)
+            .then(|| settings.rules.clone());
         self.in_flight_messages = messages.clone();
         self.in_flight_dropped = dropped_messages;
         self.in_flight_rules = rules.clone().unwrap_or_default();
+        let transcript_pending = std::mem::take(&mut self.transcript_pending);
+        let transcript = if speaks_v3 && !transcript_pending.trim().is_empty() {
+            let newest = keep_newest_chars(transcript_pending.trim(), TICK_TRANSCRIPT_MAX_CHARS);
+            self.in_flight_transcript = newest.clone();
+            Some(newest)
+        } else {
+            self.in_flight_transcript.clear();
+            None
+        };
+        let summary = (speaks_v3 && !self.summary.is_empty()).then(|| self.summary.clone());
+        let open_promises = (speaks_v3 && !self.promises.is_empty()).then(|| {
+            self.promises
+                .iter()
+                .take(TICK_OPEN_PROMISES_CAP)
+                .map(|promise| CohostTickOpenPromise {
+                    id: promise.id.clone(),
+                    text: truncate_chars(&promise.text, PROMISE_TEXT_MAX_CHARS),
+                })
+                .collect()
+        });
         let open_questions = self
             .questions
             .iter()
@@ -1474,6 +1693,9 @@ impl CohostSession {
             open_questions,
             messages,
             dropped_messages,
+            transcript,
+            summary,
+            open_promises,
         }
     }
 
@@ -1490,8 +1712,10 @@ impl CohostSession {
         now_iso: &str,
     ) {
         self.in_flight = false;
+        let sent_messages = self.in_flight_messages.len();
         self.in_flight_messages.clear();
         self.in_flight_dropped = 0;
+        self.in_flight_transcript.clear();
         let sent_rules = std::mem::take(&mut self.in_flight_rules);
         self.backoff_index = 0;
         self.next_attempt_at = None;
@@ -1516,6 +1740,40 @@ impl CohostSession {
                 .retain(|question| !resolved.contains(&question.id));
         } else {
             self.replace_questions(response.questions, &resolved, now_iso);
+        }
+
+        // v3 (plan 068 D7/D8): the latest response's summary and topic win
+        // when present; a response without them (v2 fallback) keeps the last.
+        if let Some(summary) = response.summary {
+            self.summary = truncate_chars(summary.trim(), TICK_SUMMARY_MAX_CHARS);
+        }
+        if let Some(topic) = response.topic {
+            let topic = truncate_chars(topic.trim(), TOPIC_MAX_CHARS);
+            self.topic = (!topic.is_empty()).then_some(topic);
+        }
+        let fulfilled: HashSet<String> = response.fulfilled_promise_ids.into_iter().collect();
+        for id in &fulfilled {
+            self.closed_promises.insert(id.clone());
+        }
+        if let Some(promises) = response.promises {
+            self.replace_promises(promises, now, now_iso);
+        } else if !fulfilled.is_empty() {
+            self.promises
+                .retain(|promise| !fulfilled.contains(&promise.id));
+        }
+        if self
+            .promise_reminder
+            .as_ref()
+            .is_some_and(|reminder| !self.promises.iter().any(|p| p.id == reminder.promise_id))
+        {
+            self.promise_reminder = None;
+        }
+        if let Some(recap) = response
+            .recap
+            .map(|recap| truncate_chars(recap.trim(), RECAP_MAX_CHARS))
+            .filter(|recap| !recap.is_empty())
+        {
+            self.set_recap(recap, now, now_iso);
         }
 
         for flag in response.flags {
@@ -1577,9 +1835,23 @@ impl CohostSession {
         }
 
         // Latest set wins. A flagged (or flag-dismissed) or deleted message is
-        // never suggested, whatever the server ranked.
+        // never suggested, whatever the server ranked. A speech-only tick (v3,
+        // no chat in the batch) that ranked nothing had nothing to rank: the
+        // current suggestions stay, re-filtered.
+        let incoming = if sent_messages == 0 && response.highlights.is_empty() {
+            self.highlights
+                .iter()
+                .map(|kept| crate::videorc_api::CohostTickHighlight {
+                    message_id: kept.message_id.clone(),
+                    score: kept.score,
+                    highlight_type: kept.highlight_type,
+                })
+                .collect()
+        } else {
+            response.highlights
+        };
         let mut highlights: Vec<CohostHighlight> = Vec::new();
-        for highlight in response.highlights {
+        for highlight in incoming {
             let id = &highlight.message_id;
             if !self.known_set.contains(id)
                 || self.deleted_ids.contains(id)
@@ -1669,6 +1941,7 @@ impl CohostSession {
                     .map(|question| question.first_seen_at.clone())
                     .unwrap_or_else(|| now_iso.to_string()),
                 updated_at: now_iso.to_string(),
+                on_topic: incoming.on_topic,
             });
             if next_questions.len() >= TICK_OPEN_QUESTIONS_CAP {
                 break;
@@ -1677,19 +1950,163 @@ impl CohostSession {
         self.questions = next_questions;
     }
 
+    /// Merge the server's full open promise set, like questions: an echoed
+    /// id keeps `first_seen_at`, a new promise (no id) gets a desktop id,
+    /// closed ids (done, dismissed, fulfilled) never return. Text is capped
+    /// to what the server accepts back.
+    fn replace_promises(&mut self, incoming: Vec<CohostTickPromise>, now: Instant, now_iso: &str) {
+        let mut next: Vec<CohostPromise> = Vec::with_capacity(incoming.len());
+        for promise in incoming {
+            let text = truncate_chars(promise.text.trim(), PROMISE_TEXT_MAX_CHARS);
+            if text.is_empty() {
+                continue;
+            }
+            let id = promise
+                .id
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty());
+            let existing = match &id {
+                Some(id) => self.promises.iter().find(|p| &p.id == id),
+                // A new promise the server failed to echo: the same words are
+                // the same promise.
+                None => self.promises.iter().find(|p| p.text == text),
+            };
+            let id = match (existing, id) {
+                (Some(existing), _) => existing.id.clone(),
+                (None, Some(id)) => id,
+                (None, None) => {
+                    self.next_promise_seq = self.next_promise_seq.saturating_add(1);
+                    format!("p_{}", self.next_promise_seq)
+                }
+            };
+            if self.closed_promises.contains(&id) || next.iter().any(|p| p.id == id) {
+                continue;
+            }
+            let value = promise
+                .trigger
+                .value
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| value.round() as u64);
+            let kind = match (promise.trigger.kind, value) {
+                (CohostPromiseTriggerKind::Viewers, Some(_)) => CohostPromiseTriggerKind::Viewers,
+                (CohostPromiseTriggerKind::Minutes, Some(_)) => CohostPromiseTriggerKind::Minutes,
+                _ => CohostPromiseTriggerKind::None,
+            };
+            let trigger = CohostPromiseTrigger {
+                kind,
+                value: (kind != CohostPromiseTriggerKind::None)
+                    .then_some(value)
+                    .flatten(),
+            };
+            self.promise_seen.entry(id.clone()).or_insert(now);
+            next.push(CohostPromise {
+                id,
+                text,
+                trigger,
+                first_seen_at: existing
+                    .map(|p| p.first_seen_at.clone())
+                    .unwrap_or_else(|| now_iso.to_string()),
+            });
+            if next.len() >= TICK_OPEN_PROMISES_CAP {
+                break;
+            }
+        }
+        self.promise_seen
+            .retain(|id, _| next.iter().any(|p| &p.id == id));
+        self.promises = next;
+    }
+
+    /// One scheduler pass over the open promises: a met trigger sets the
+    /// reminder once per promise. `viewers` is the current fresh total, or
+    /// `None` when no sampler reported.
+    fn check_promises(&mut self, viewers: Option<u64>, now: Instant, now_iso: &str) -> bool {
+        let mut fired: Option<CohostPromiseReminder> = None;
+        for promise in &self.promises {
+            if self.reminded_promises.contains(&promise.id) {
+                continue;
+            }
+            let Some(seen) = self.promise_seen.get(&promise.id).copied() else {
+                continue;
+            };
+            let elapsed = now.saturating_duration_since(seen);
+            let met = promise_trigger_met(promise.trigger, viewers, elapsed);
+            if !met {
+                continue;
+            }
+            fired = Some(CohostPromiseReminder {
+                promise_id: promise.id.clone(),
+                text: promise.text.clone(),
+                at: now_iso.to_string(),
+            });
+            break;
+        }
+        let Some(reminder) = fired else {
+            return false;
+        };
+        self.reminded_promises.insert(reminder.promise_id.clone());
+        self.promise_reminder = Some(reminder);
+        true
+    }
+
+    /// Done and dismiss share one outcome: the promise leaves, its id never
+    /// returns, and a reminder about it leaves with it.
+    fn close_promise(&mut self, promise_id: &str) -> bool {
+        let before = self.promises.len();
+        self.promises.retain(|promise| promise.id != promise_id);
+        self.promise_seen.remove(promise_id);
+        self.closed_promises.insert(promise_id.to_string());
+        if self
+            .promise_reminder
+            .as_ref()
+            .is_some_and(|reminder| reminder.promise_id == promise_id)
+        {
+            self.promise_reminder = None;
+        }
+        before != self.promises.len()
+    }
+
+    fn set_recap(&mut self, text: String, now: Instant, now_iso: &str) {
+        self.recap = Some(CohostRecap {
+            text,
+            at: now_iso.to_string(),
+            expires_at: iso_after(now, now + RECAP_TTL),
+        });
+        self.recap_expires_at = Some(now + RECAP_TTL);
+    }
+
+    fn dismiss_recap(&mut self, now: Instant) -> bool {
+        let had = self.recap_at(now).is_some();
+        self.recap = None;
+        self.recap_expires_at = None;
+        had
+    }
+
+    /// A recap drafted from the latest summary, no network call.
+    fn draft_recap(&mut self, now: Instant, now_iso: &str) -> Result<(), CohostError> {
+        let draft = recap_draft(&self.summary, RECAP_MAX_CHARS);
+        if draft.is_empty() {
+            return Err(CohostError::NoSummary);
+        }
+        self.set_recap(draft, now, now_iso);
+        Ok(())
+    }
+
     fn apply_failure(&mut self, error: &CohostApiError, now: Instant) {
         self.in_flight = false;
         let batch = std::mem::take(&mut self.in_flight_messages);
         let batch_dropped = std::mem::take(&mut self.in_flight_dropped);
+        let batch_transcript = std::mem::take(&mut self.in_flight_transcript);
         self.in_flight_rules.clear();
-        if error.kind == CohostApiErrorKind::PromptVersionUnsupported
-            && self.prompt_version != COHOST_PROMPT_VERSION_FALLBACK
+        if let Some(lower) = (error.kind == CohostApiErrorKind::PromptVersionUnsupported)
+            .then(|| fallback_prompt_version(self.prompt_version))
+            .flatten()
         {
-            // The server rolled back to v1. Not a failure the streamer should
-            // see: no pause, no error status, no backoff. Speak v1 for the rest
-            // of the session and put the rejected batch back in front of
-            // whatever arrived meanwhile so nothing is lost.
-            self.prompt_version = COHOST_PROMPT_VERSION_FALLBACK;
+            // The server rolled back a version. Not a failure the streamer
+            // should see: no pause, no error status, no backoff. Speak the
+            // next version down for the rest of the session and put the
+            // rejected batch (and its transcript) back in front of whatever
+            // arrived meanwhile so nothing is lost.
+            self.prompt_version = lower;
             self.version_retry = true;
             self.dropped = self.dropped.saturating_add(batch_dropped);
             for message in batch.into_iter().rev() {
@@ -1698,6 +2115,15 @@ impl CohostSession {
             while self.pending.len() > TICK_DELTA_CAP {
                 self.pending.pop_front();
                 self.dropped = self.dropped.saturating_add(1);
+            }
+            if !batch_transcript.is_empty() {
+                let mut restored = batch_transcript;
+                if !self.transcript_pending.is_empty() {
+                    restored.push(' ');
+                    restored.push_str(&self.transcript_pending);
+                }
+                self.transcript_pending =
+                    keep_newest_chars(&restored, TRANSCRIPT_PENDING_CAP_CHARS);
             }
             return;
         }
@@ -2562,15 +2988,20 @@ pub(crate) fn auto_highlight_pick(input: &AutoHighlightInput) -> Option<AutoHigh
 
 /// Cadence rule, pure for the test matrix: tick when at least five new rows
 /// arrived, or at least one arrived and 20 s passed since the anchor (last
-/// tick, else engine start); never within 8 s of the previous tick; never on
-/// an empty delta.
+/// tick, else engine start), or (v3, plan 068 D7) at least
+/// `TICK_TRANSCRIPT_MIN_NEW_CHARS` of transcript arrived and 20 s passed since
+/// the anchor even with an empty delta; never within 8 s of the previous
+/// tick; never with nothing to send. Callers pass `transcript_chars` as 0
+/// below v3.
 pub(crate) fn tick_due(
     pending: usize,
+    transcript_chars: usize,
     anchor: Instant,
     last_tick: Option<Instant>,
     now: Instant,
 ) -> bool {
-    if pending == 0 {
+    let speech_ready = transcript_chars >= TICK_TRANSCRIPT_MIN_NEW_CHARS;
+    if pending == 0 && !speech_ready {
         return false;
     }
     if last_tick.is_some_and(|last| now.duration_since(last) < TICK_MIN_GAP) {
@@ -2580,6 +3011,63 @@ pub(crate) fn tick_due(
         return true;
     }
     now.duration_since(anchor) >= TICK_IDLE_INTERVAL
+}
+
+/// The next version down the ladder after `current`, `None` at the bottom.
+pub(crate) fn fallback_prompt_version(current: u32) -> Option<u32> {
+    let index = COHOST_PROMPT_VERSION_LADDER
+        .iter()
+        .position(|version| *version == current)?;
+    COHOST_PROMPT_VERSION_LADDER.get(index + 1).copied()
+}
+
+/// Whether a promise trigger is met (plan 068 D8): `viewers` at or above the
+/// fresh total, `minutes` elapsed since first seen, and `none` (or an
+/// unknown kind) `PROMISE_DEFAULT_REMINDER` after first seen.
+pub(crate) fn promise_trigger_met(
+    trigger: CohostPromiseTrigger,
+    viewers: Option<u64>,
+    elapsed: Duration,
+) -> bool {
+    match (trigger.kind, trigger.value) {
+        (CohostPromiseTriggerKind::Viewers, Some(value)) => viewers.is_some_and(|v| v >= value),
+        (CohostPromiseTriggerKind::Minutes, Some(value)) => {
+            elapsed >= Duration::from_secs(value.saturating_mul(60))
+        }
+        _ => elapsed >= PROMISE_DEFAULT_REMINDER,
+    }
+}
+
+/// The newest `max_chars` of `value` (whole chars, never a split code point).
+fn keep_newest_chars(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    value.chars().skip(count - max_chars).collect()
+}
+
+/// A recap draft from the summary: the first `max_chars`, cut at a word
+/// boundary (the last whitespace inside the cap), trimmed; empty when the
+/// summary is.
+pub(crate) fn recap_draft(summary: &str, max_chars: usize) -> String {
+    let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    if summary.chars().count() <= max_chars {
+        return summary;
+    }
+    let head: String = summary.chars().take(max_chars).collect();
+    // A word that ends exactly at the cap is whole: keep it.
+    if summary
+        .chars()
+        .nth(max_chars)
+        .is_some_and(char::is_whitespace)
+    {
+        return head.trim_end().to_string();
+    }
+    match head.rfind(char::is_whitespace) {
+        Some(cut) if cut > 0 => head[..cut].trim_end().to_string(),
+        _ => head.trim_end().to_string(),
+    }
 }
 
 /// Spotlight cadence, pure for the test matrix (D7): a call goes out when the
@@ -2713,6 +3201,7 @@ pub(crate) fn tick_message_from_chat(message: &LiveChatMessage) -> Option<Cohost
         roles: (!roles.is_empty()).then_some(roles),
         text,
         at: message.published_at.clone(),
+        first_message: Some(message.first_message),
     })
 }
 
@@ -3068,6 +3557,69 @@ impl CohostEngine {
             return Err(CohostError::SessionMismatch);
         }
         Ok(session.mark_answered(question_id))
+    }
+
+    /// The recent-speech version the running session (of `generation`) last
+    /// folded in; `None` when that session is gone.
+    pub(crate) fn seen_speech_version(&self, generation: u64) -> Option<Option<u64>> {
+        self.session
+            .as_ref()
+            .filter(|session| session.generation == generation)
+            .map(|session| session.speech_version)
+    }
+
+    /// Fold new transcript finals into the running session's pending
+    /// transcript. Returns the chars added (0 for a replaced session).
+    pub(crate) fn note_speech(
+        &mut self,
+        generation: u64,
+        snapshot: &RecentSpeechSnapshot,
+    ) -> usize {
+        match self.session.as_mut() {
+            Some(session) if session.generation == generation => session.note_speech(snapshot),
+            _ => 0,
+        }
+    }
+
+    /// One pass over the promise triggers (plan 068 D8). True when a reminder
+    /// fired and the state changed.
+    pub(crate) fn check_promises(
+        &mut self,
+        generation: u64,
+        viewers: Option<u64>,
+        now: Instant,
+        now_iso: &str,
+    ) -> bool {
+        match self.session.as_mut() {
+            Some(session) if session.generation == generation => {
+                session.check_promises(viewers, now, now_iso)
+            }
+            _ => false,
+        }
+    }
+
+    fn session_for_mut(&mut self, session_id: &str) -> Result<&mut CohostSession, CohostError> {
+        match self.session.as_mut() {
+            Some(session) if session.session_id == session_id => Ok(session),
+            _ => Err(CohostError::SessionMismatch),
+        }
+    }
+
+    fn close_promise(&mut self, session_id: &str, promise_id: &str) -> Result<bool, CohostError> {
+        Ok(self.session_for_mut(session_id)?.close_promise(promise_id))
+    }
+
+    fn dismiss_recap(&mut self, session_id: &str, now: Instant) -> Result<bool, CohostError> {
+        Ok(self.session_for_mut(session_id)?.dismiss_recap(now))
+    }
+
+    fn draft_recap(
+        &mut self,
+        session_id: &str,
+        now: Instant,
+        now_iso: &str,
+    ) -> Result<(), CohostError> {
+        self.session_for_mut(session_id)?.draft_recap(now, now_iso)
     }
 
     fn dismiss_flag(&mut self, session_id: &str, message_id: &str) -> Result<bool, CohostError> {
@@ -3522,6 +4074,77 @@ pub async fn dismiss_flag(
     Ok(snapshot)
 }
 
+/// `cohost.promise.done` / `cohost.promise.dismiss` (plan 068 D8): both close
+/// the promise; the id never returns from a later tick.
+pub async fn close_promise(
+    state: &AppState,
+    params: CohostPromiseParams,
+) -> Result<CohostState, CohostError> {
+    if params.session_id.trim().is_empty() || params.promise_id.trim().is_empty() {
+        return Err(CohostError::InvalidParams);
+    }
+    let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
+    let mut engine = state.cohost.lock().await;
+    let changed = engine.close_promise(&params.session_id, &params.promise_id)?;
+    let snapshot = engine.snapshot();
+    drop(engine);
+    if changed {
+        emit_state(state, &snapshot, &lifecycle_delivery);
+    }
+    Ok(snapshot)
+}
+
+/// `cohost.recap.dismiss`: the recap card leaves; nothing was posted.
+pub async fn dismiss_recap(
+    state: &AppState,
+    params: CohostRecapParams,
+) -> Result<CohostState, CohostError> {
+    if params.session_id.trim().is_empty() {
+        return Err(CohostError::InvalidParams);
+    }
+    let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
+    let mut engine = state.cohost.lock().await;
+    let changed = engine.dismiss_recap(&params.session_id, Instant::now())?;
+    let snapshot = engine.snapshot();
+    drop(engine);
+    if changed {
+        emit_state(state, &snapshot, &lifecycle_delivery);
+    }
+    Ok(snapshot)
+}
+
+/// `cohost.recap.draft`: a recap from the latest summary, no network call.
+/// The draft rides the state as `recap` (the renderer pre-fills the composer
+/// from it); `cohost-no-summary` when nothing has been summarised yet.
+pub async fn draft_recap(
+    state: &AppState,
+    params: CohostRecapParams,
+) -> Result<CohostState, CohostError> {
+    if params.session_id.trim().is_empty() {
+        return Err(CohostError::InvalidParams);
+    }
+    let lifecycle_delivery = state.live_chat_persistence.begin_delivery().await;
+    let mut engine = state.cohost.lock().await;
+    engine.draft_recap(
+        &params.session_id,
+        Instant::now(),
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+    let snapshot = engine.snapshot();
+    drop(engine);
+    emit_state(state, &snapshot, &lifecycle_delivery);
+    Ok(snapshot)
+}
+
+/// The fresh viewer total across every sampler, `None` when none reported.
+fn current_viewer_total(state: &AppState) -> Option<u64> {
+    state
+        .viewer_aggregator
+        .lock()
+        .ok()
+        .and_then(|aggregator| aggregator.current_total(chrono::Utc::now()))
+}
+
 fn premium_entitled() -> bool {
     crate::entitlements::require_feature(
         &crate::entitlements::current_entitlements(),
@@ -3566,6 +4189,39 @@ async fn run_scheduler_pass(state: &AppState, generation: u64) -> bool {
                 if command.refresh { ", refresh" } else { "" }
             ),
         );
+        emit_state(state, &snapshot, &lifecycle_delivery);
+    }
+    // v3 (plan 068): fold what the streamer said since the last pass into the
+    // pending transcript (the buffer's own lock, never nested with the
+    // engine's), then check the promise triggers against the fresh viewer
+    // total.
+    let seen_speech = state.cohost.lock().await.seen_speech_version(generation);
+    let Some(seen_speech) = seen_speech else {
+        return false;
+    };
+    let speech = recent_speech_since(state, seen_speech);
+    let viewers = current_viewer_total(state);
+    let reminder = {
+        let mut engine = state.cohost.lock().await;
+        if let Some(snapshot) = &speech {
+            engine.note_speech(generation, snapshot);
+        }
+        engine
+            .check_promises(
+                generation,
+                viewers,
+                Instant::now(),
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .then(|| engine.snapshot())
+    };
+    if let Some(snapshot) = reminder {
+        if let Some(reminder) = &snapshot.promise_reminder {
+            state.emit_log(
+                "info",
+                format!("Orcle reminds you of a promise: {}", reminder.text),
+            );
+        }
         emit_state(state, &snapshot, &lifecycle_delivery);
     }
     let prepared = {
@@ -3620,7 +4276,7 @@ async fn run_scheduler_pass(state: &AppState, generation: u64) -> bool {
         )),
         Err(error)
             if error.kind == CohostApiErrorKind::PromptVersionUnsupported
-                && prepared.request.prompt_version != COHOST_PROMPT_VERSION_FALLBACK =>
+                && fallback_prompt_version(prepared.request.prompt_version).is_some() =>
         {
             Some((
                 "info",
@@ -3628,7 +4284,7 @@ async fn run_scheduler_pass(state: &AppState, generation: u64) -> bool {
                     "Orcle tick {}: the server does not speak tick contract v{}; using v{} for the rest of this session.",
                     prepared.request.tick_seq,
                     prepared.request.prompt_version,
-                    COHOST_PROMPT_VERSION_FALLBACK
+                    fallback_prompt_version(prepared.request.prompt_version).unwrap_or(1)
                 ),
             ))
         }
@@ -3915,6 +4571,7 @@ mod tests {
             priority: CohostPriority::High,
             suggested_reply: "Keychron Q1!".to_string(),
             from_notes: true,
+            on_topic: false,
         }
     }
 
@@ -3926,21 +4583,33 @@ mod tests {
     fn cadence_matrix_matches_the_contract() {
         let start = Instant::now();
         // 0 new → never.
-        assert!(!tick_due(0, start, None, start + secs(60)));
+        assert!(!tick_due(0, 0, start, None, start + secs(60)));
         // ≥5 new → immediately (no previous tick).
-        assert!(tick_due(5, start, None, start + secs(1)));
+        assert!(tick_due(5, 0, start, None, start + secs(1)));
         // 1 new → only after 20 s since the anchor.
-        assert!(!tick_due(1, start, None, start + secs(19)));
-        assert!(tick_due(1, start, None, start + secs(20)));
+        assert!(!tick_due(1, 0, start, None, start + secs(19)));
+        assert!(tick_due(1, 0, start, None, start + secs(20)));
         // Never < 8 s after the previous tick, even for a burst.
         let last = start + secs(30);
-        assert!(!tick_due(50, last, Some(last), last + secs(7)));
-        assert!(tick_due(50, last, Some(last), last + secs(8)));
+        assert!(!tick_due(50, 0, last, Some(last), last + secs(7)));
+        assert!(tick_due(50, 0, last, Some(last), last + secs(8)));
         // 1 new after a tick: waits for the 20 s idle window.
-        assert!(!tick_due(1, last, Some(last), last + secs(19)));
-        assert!(tick_due(1, last, Some(last), last + secs(20)));
+        assert!(!tick_due(1, 0, last, Some(last), last + secs(19)));
+        assert!(tick_due(1, 0, last, Some(last), last + secs(20)));
         // 4 new after a tick: still below the burst threshold.
-        assert!(!tick_due(4, last, Some(last), last + secs(12)));
+        assert!(!tick_due(4, 0, last, Some(last), last + secs(12)));
+        // v3 (plan 068 D7): 200 transcript chars tick on their own once the
+        // idle interval passed, never before, never under the 8 s floor,
+        // never at 199 chars.
+        assert!(!tick_due(0, 199, start, None, start + secs(60)));
+        assert!(!tick_due(0, 200, start, None, start + secs(19)));
+        assert!(tick_due(0, 200, start, None, start + secs(20)));
+        assert!(!tick_due(0, 5000, last, Some(last), last + secs(7)));
+        assert!(!tick_due(0, 5000, last, Some(last), last + secs(19)));
+        assert!(tick_due(0, 5000, last, Some(last), last + secs(20)));
+        // Speech never turns a trickle into a burst.
+        assert!(!tick_due(1, 5000, last, Some(last), last + secs(19)));
+        assert!(tick_due(1, 5000, last, Some(last), last + secs(20)));
     }
 
     // --- Automatic on-stream cards (plan 060 S1) -----------------------------
@@ -5644,6 +6313,7 @@ mod tests {
                 from_notes: false,
                 first_seen_at: "t0".to_string(),
                 updated_at: "t0".to_string(),
+                on_topic: false,
             });
         }
         let prepared = engine
@@ -5674,7 +6344,9 @@ mod tests {
                 "tone",
             ]
         );
-        assert_eq!(json["promptVersion"], 2);
+        assert_eq!(json["promptVersion"], 3);
+        // v3 keys ride only with content: nothing said, nothing summarised, no
+        // promise → no transcript/summary/openPromises key at all.
         assert_eq!(json["rules"], serde_json::json!([]));
         assert_eq!(json["tickSeq"], 1);
         assert_eq!(json["consentToProcessChat"], true);
@@ -5694,8 +6366,17 @@ mod tests {
         message_keys.sort_unstable();
         assert_eq!(
             message_keys,
-            vec!["at", "author", "id", "platform", "roles", "text"]
+            vec![
+                "at",
+                "author",
+                "firstMessage",
+                "id",
+                "platform",
+                "roles",
+                "text"
+            ]
         );
+        assert_eq!(message["firstMessage"], false);
         assert_eq!(message["platform"], "twitch");
         assert_eq!(message["author"], "Viewer 1");
         assert_eq!(message["roles"], serde_json::json!(["mod"]));
@@ -5814,7 +6495,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_version_unsupported_falls_back_to_v1_without_pausing() {
+    fn prompt_version_unsupported_walks_the_ladder_3_2_1_without_pausing() {
         let start = Instant::now();
         let mut engine = CohostEngine::new(CohostSettings {
             rules: vec!["No spoilers".to_string()],
@@ -5828,20 +6509,24 @@ mod tests {
         );
         let rows = messages("session-1", 0..2);
         engine.note_messages(&rows);
-        let v2 = engine
+        engine.note_speech(generation, &speech(&[(start, "we are talking")]));
+        let v3 = engine
             .prepare_tick(generation, true, true, start + secs(20))
             .unwrap();
-        assert_eq!(v2.request.prompt_version, 2);
-        assert_eq!(v2.request.rules, Some(vec!["No spoilers".to_string()]));
+        assert_eq!(v3.request.prompt_version, 3);
+        assert_eq!(v3.request.rules, Some(vec!["No spoilers".to_string()]));
+        assert_eq!(v3.request.transcript.as_deref(), Some("we are talking"));
+        assert_eq!(v3.request.messages[0].first_message, Some(false));
 
-        // Server rolled back: not an error the streamer sees, no backoff.
+        // Server rolled back to v2: not an error the streamer sees, no
+        // backoff. The batch AND the transcript are back in the delta.
         assert!(engine.apply_tick_result(
             generation,
             0,
             Err(server_error(
                 400,
                 "prompt-version-unsupported",
-                "promptVersion 2 is not supported."
+                "promptVersion 3 is not supported."
             )),
             start + secs(21),
             "t1",
@@ -5851,8 +6536,11 @@ mod tests {
         assert_eq!(snapshot.reason, None);
         assert_eq!(snapshot.detail, None);
         assert!(!snapshot.tick_in_flight);
-        // The rejected batch is back in the delta.
         assert_eq!(snapshot.pending_messages, 2);
+        assert_eq!(
+            engine.session.as_ref().unwrap().transcript_pending,
+            "we are talking"
+        );
 
         // Retried as soon as the contract's 8 s floor allows — not after the
         // 20 s trickle wait two pending rows would normally get.
@@ -5860,13 +6548,43 @@ mod tests {
             engine.prepare_tick(generation, true, true, start + secs(27)),
             Err(TickGate::Idle)
         );
-        let v1 = engine
+        let v2 = engine
             .prepare_tick(generation, true, true, start + secs(28))
+            .unwrap();
+        assert_eq!(v2.request.prompt_version, 2);
+        // v2 keeps the rules (the gate is `>= 2`, not `== pinned`) and drops
+        // every v3 key: byte-identical to what a v2 desktop sends.
+        assert_eq!(v2.request.rules, Some(vec!["No spoilers".to_string()]));
+        assert_eq!(v2.request.messages.len(), 2);
+        assert_eq!(v2.request.messages[0].first_message, None);
+        let json = serde_json::to_value(&v2.request).unwrap();
+        for key in ["transcript", "summary", "openPromises"] {
+            assert!(json.get(key).is_none(), "{key} must not ride a v2 body");
+        }
+        assert!(json["messages"][0].get("firstMessage").is_none());
+        assert_eq!(json.as_object().unwrap().len(), 12);
+        // The transcript waits for a server that can take it; below v3 it
+        // never drives the cadence.
+        assert_eq!(
+            engine.session.as_ref().unwrap().transcript_pending_chars(),
+            0
+        );
+
+        // v2 rejected too: down to v1, no `rules` key at all.
+        assert!(engine.apply_tick_result(
+            generation,
+            0,
+            Err(server_error(400, "prompt-version-unsupported", "no v2")),
+            start + secs(29),
+            "t2",
+        ));
+        assert_eq!(engine.snapshot().status, CohostStatus::Listening);
+        let v1 = engine
+            .prepare_tick(generation, true, true, start + secs(37))
             .unwrap();
         assert_eq!(v1.request.prompt_version, 1);
         assert_eq!(v1.request.rules, None);
         assert_eq!(v1.request.messages, v2.request.messages);
-        // Byte-identical to a v1 desktop's body: no `rules` key at all.
         let json = serde_json::to_value(&v1.request).unwrap();
         assert!(json.get("rules").is_none());
         assert_eq!(json["promptVersion"], 1);
@@ -5877,16 +6595,16 @@ mod tests {
             generation,
             0,
             Ok(response(Vec::new())),
-            start + secs(29),
-            "t2"
+            start + secs(38),
+            "t3"
         ));
         engine.note_messages(&messages("session-1", 2..4));
         assert_eq!(
-            engine.prepare_tick(generation, true, true, start + secs(40)),
+            engine.prepare_tick(generation, true, true, start + secs(50)),
             Err(TickGate::Idle)
         );
         let next = engine
-            .prepare_tick(generation, true, true, start + secs(48))
+            .prepare_tick(generation, true, true, start + secs(58))
             .unwrap();
         assert_eq!(next.request.prompt_version, 1);
 
@@ -5895,20 +6613,579 @@ mod tests {
             generation,
             0,
             Err(server_error(400, "prompt-version-unsupported", "no")),
-            start + secs(49),
-            "t3",
+            start + secs(59),
+            "t4",
         ));
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.status, CohostStatus::Error);
         assert_eq!(snapshot.reason, Some(CohostReason::ServerUnconfigured));
+        assert_eq!(fallback_prompt_version(3), Some(2));
+        assert_eq!(fallback_prompt_version(2), Some(1));
+        assert_eq!(fallback_prompt_version(1), None);
+        assert_eq!(fallback_prompt_version(9), None);
 
-        // A new session starts on v2 again.
+        // A new session starts on v3 again.
         let generation = engine.start_session("session-2".to_string(), true, None, start);
         engine.note_messages(&messages("session-2", 0..5));
         let fresh = engine
             .prepare_tick(generation, true, true, start + secs(1))
             .unwrap();
-        assert_eq!(fresh.request.prompt_version, 2);
+        assert_eq!(fresh.request.prompt_version, 3);
+    }
+
+    fn speech(finals: &[(Instant, &str)]) -> RecentSpeechSnapshot {
+        RecentSpeechSnapshot {
+            finals: finals
+                .iter()
+                .map(|(at, text)| RecentSpeechFinal {
+                    at: *at,
+                    offset_seconds: 0.0,
+                    duration_seconds: 1.0,
+                    text: text.to_string(),
+                    segments: Vec::new(),
+                    presented: false,
+                })
+                .collect(),
+            version: finals.len() as u64,
+        }
+    }
+
+    fn tick_promise(
+        id: Option<&str>,
+        text: &str,
+        kind: CohostPromiseTriggerKind,
+        value: Option<f64>,
+    ) -> CohostTickPromise {
+        CohostTickPromise {
+            id: id.map(str::to_string),
+            text: text.to_string(),
+            trigger: crate::videorc_api::CohostTickPromiseTrigger { kind, value },
+        }
+    }
+
+    #[test]
+    fn v3_request_carries_speech_and_the_response_feeds_topic_summary_and_on_topic() {
+        let start = Instant::now();
+        let (mut engine, generation) = running_engine(start);
+        let mut row = chat_message("session-1", 1, "2026-08-22T10:01:01Z");
+        row.first_message = true;
+        engine.note_messages(&[row.clone()]);
+        // Finals fold in once: the cursor skips what an earlier pass read.
+        let snapshot = speech(&[
+            (start + secs(1), " hello chat "),
+            (start + secs(2), "today"),
+        ]);
+        assert_eq!(engine.note_speech(generation, &snapshot), 15);
+        assert_eq!(engine.note_speech(generation, &snapshot), 0);
+        assert_eq!(engine.seen_speech_version(generation), Some(Some(2)));
+        assert_eq!(engine.seen_speech_version(generation + 1), None);
+
+        let prepared = engine
+            .prepare_tick(generation, true, true, start + secs(20))
+            .unwrap();
+        let json = serde_json::to_value(&prepared.request).unwrap();
+        assert_eq!(json["promptVersion"], 3);
+        assert_eq!(json["transcript"], "hello chat today");
+        // Nothing to echo yet: absent keys, never empty ones.
+        assert!(json.get("summary").is_none());
+        assert!(json.get("openPromises").is_none());
+        assert_eq!(json["messages"][0]["firstMessage"], true);
+        assert_eq!(json.as_object().unwrap().len(), 13);
+
+        let mut answer = response(vec![question("q_1", &[row.id.as_str()])]);
+        answer.questions[0].on_topic = true;
+        answer.summary = Some(format!("  {}  ", "s".repeat(700)));
+        answer.topic = Some(format!("{} tail", "t".repeat(70)));
+        answer.promises = Some(vec![tick_promise(
+            None,
+            "Giveaway",
+            CohostPromiseTriggerKind::Viewers,
+            Some(100.0),
+        )]);
+        answer.recap = Some(format!("{}", "r".repeat(200)));
+        assert!(engine.apply_tick_result(generation, 0, Ok(answer), start + secs(21), "t1"));
+        let state = engine.snapshot();
+        assert!(state.questions[0].on_topic);
+        assert_eq!(state.topic.as_deref().map(|t| t.chars().count()), Some(60));
+        assert_eq!(state.promises.len(), 1);
+        assert_eq!(state.promises[0].id, "p_1");
+        assert_eq!(state.promises[0].first_seen_at, "t1");
+        assert_eq!(
+            state.recap.as_ref().map(|r| r.text.chars().count()),
+            Some(RECAP_MAX_CHARS)
+        );
+        assert_eq!(
+            engine.session.as_ref().unwrap().summary.chars().count(),
+            600
+        );
+        // The state serialises the on-topic flag only when set.
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["questions"][0]["onTopic"], true);
+        assert_eq!(wire["promises"][0]["trigger"]["kind"], "viewers");
+        assert_eq!(wire["promises"][0]["trigger"]["value"], 100);
+
+        // The next tick echoes the summary and the open promises (capped).
+        engine.note_messages(&messages("session-1", 2..7));
+        let next = engine
+            .prepare_tick(generation, true, true, start + secs(30))
+            .unwrap();
+        assert_eq!(
+            next.request.summary.as_deref().map(|s| s.chars().count()),
+            Some(600)
+        );
+        assert_eq!(
+            next.request.open_promises,
+            Some(vec![CohostTickOpenPromise {
+                id: "p_1".to_string(),
+                text: "Giveaway".to_string(),
+            }])
+        );
+        // Nothing new was said: no transcript key.
+        assert!(next.request.transcript.is_none());
+
+        // A response without the v3 keys (v2 fallback shape) keeps what the
+        // session has; an on-topic flag that is absent reads false.
+        let mut plain = response(vec![question("q_1", &[row.id.as_str()])]);
+        plain.summary = None;
+        plain.topic = None;
+        plain.promises = None;
+        assert!(engine.apply_tick_result(generation, 0, Ok(plain), start + secs(31), "t2"));
+        let state = engine.snapshot();
+        assert!(!state.questions[0].on_topic);
+        assert!(
+            serde_json::to_value(&state).unwrap()["questions"][0]
+                .get("onTopic")
+                .is_none()
+        );
+        assert_eq!(state.topic.as_deref().map(|t| t.chars().count()), Some(60));
+        assert_eq!(state.promises.len(), 1);
+        assert_eq!(
+            engine.session.as_ref().unwrap().summary.chars().count(),
+            600
+        );
+        // An empty topic clears it.
+        let mut cleared = response(Vec::new());
+        cleared.topic = Some("   ".to_string());
+        engine.note_messages(&messages("session-1", 7..12));
+        engine
+            .prepare_tick(generation, true, true, start + secs(40))
+            .unwrap();
+        assert!(engine.apply_tick_result(generation, 0, Ok(cleared), start + secs(41), "t3"));
+        assert_eq!(engine.snapshot().topic, None);
+    }
+
+    #[test]
+    fn speech_alone_ticks_on_v3_after_200_chars_and_20_seconds_but_never_below_v3() {
+        let start = Instant::now();
+        let (mut engine, generation) = running_engine(start);
+        let long = "w".repeat(199);
+        engine.note_speech(generation, &speech(&[(start + secs(1), &long)]));
+        // 199 chars: not enough, even after the idle interval.
+        assert_eq!(
+            engine.prepare_tick(generation, true, true, start + secs(30)),
+            Err(TickGate::Idle)
+        );
+        let more = speech(&[(start + secs(1), &long), (start + secs(2), "x")]);
+        assert_eq!(engine.note_speech(generation, &more), 1);
+        // 200 chars but only 19 s since the anchor.
+        assert_eq!(
+            engine.prepare_tick(generation, true, true, start + secs(19)),
+            Err(TickGate::Idle)
+        );
+        let prepared = engine
+            .prepare_tick(generation, true, true, start + secs(20))
+            .unwrap();
+        assert!(prepared.request.messages.is_empty());
+        assert_eq!(
+            prepared
+                .request
+                .transcript
+                .as_deref()
+                .map(|t| t.chars().count()),
+            Some(201)
+        );
+        assert!(engine.apply_tick_result(
+            generation,
+            0,
+            Ok(response(Vec::new())),
+            start + secs(21),
+            "t1"
+        ));
+
+        // The pending transcript is capped to the newest 1500 chars on the
+        // wire, and never below the 8 s floor.
+        let huge = "h".repeat(2000);
+        let again = speech(&[
+            (start + secs(1), &long),
+            (start + secs(2), "x"),
+            (start + secs(22), &huge),
+        ]);
+        engine.note_speech(generation, &again);
+        assert_eq!(
+            engine.prepare_tick(generation, true, true, start + secs(27)),
+            Err(TickGate::Idle)
+        );
+        let prepared = engine
+            .prepare_tick(generation, true, true, start + secs(40))
+            .unwrap();
+        assert_eq!(
+            prepared
+                .request
+                .transcript
+                .as_deref()
+                .map(|t| t.chars().count()),
+            Some(TICK_TRANSCRIPT_MAX_CHARS)
+        );
+        assert!(engine.apply_tick_result(
+            generation,
+            0,
+            Ok(response(Vec::new())),
+            start + secs(41),
+            "t2"
+        ));
+
+        // A speech-only tick that ranked nothing keeps the suggestions a chat
+        // tick produced; one that ranks something replaces them.
+        engine.note_messages(&messages("session-1", 0..5));
+        let chat_tick = engine
+            .prepare_tick(generation, true, true, start + secs(60))
+            .unwrap();
+        let mut ranked = response(Vec::new());
+        ranked.highlights = vec![tick_highlight(
+            &chat_tick.request.messages[0].id,
+            0.9,
+            CohostHighlightType::Joke,
+        )];
+        assert!(engine.apply_tick_result(generation, 0, Ok(ranked), start + secs(61), "t3"));
+        assert_eq!(engine.highlights_len(), 1);
+        let speech_only = speech(&[
+            (start + secs(1), &long),
+            (start + secs(2), "x"),
+            (start + secs(22), &huge),
+            (start + secs(62), &huge),
+        ]);
+        engine.note_speech(generation, &speech_only);
+        let quiet = engine
+            .prepare_tick(generation, true, true, start + secs(90))
+            .unwrap();
+        assert!(quiet.request.messages.is_empty());
+        assert!(engine.apply_tick_result(
+            generation,
+            0,
+            Ok(response(Vec::new())),
+            start + secs(91),
+            "t4"
+        ));
+        assert_eq!(engine.highlights_len(), 1);
+
+        // Below v3 the same speech never makes a tick.
+        engine.session.as_mut().unwrap().prompt_version = 2;
+        let later = speech(&[
+            (start + secs(1), &long),
+            (start + secs(2), "x"),
+            (start + secs(22), &huge),
+            (start + secs(62), &huge),
+            (start + secs(100), &huge),
+        ]);
+        engine.note_speech(generation, &later);
+        assert_eq!(
+            engine.prepare_tick(generation, true, true, start + secs(120)),
+            Err(TickGate::Idle)
+        );
+        assert_eq!(engine.snapshot().pending_messages, 0);
+    }
+
+    #[test]
+    fn promises_merge_like_questions_and_triggers_remind_once() {
+        let start = Instant::now();
+        let (mut engine, generation) = running_engine(start);
+        let rows = messages("session-1", 0..5);
+        engine.note_messages(&rows);
+        engine
+            .prepare_tick(generation, true, true, start + secs(1))
+            .unwrap();
+        let mut first = response(Vec::new());
+        first.promises = Some(vec![
+            tick_promise(
+                None,
+                "Giveaway",
+                CohostPromiseTriggerKind::Viewers,
+                Some(100.0),
+            ),
+            tick_promise(None, "Build", CohostPromiseTriggerKind::Minutes, Some(10.0)),
+            tick_promise(None, "Later", CohostPromiseTriggerKind::None, None),
+            // Forward tolerance: an unknown kind reads as none; a value on
+            // `none` is dropped; a long text is capped; an empty one skipped.
+            tick_promise(
+                None,
+                "Someday",
+                CohostPromiseTriggerKind::Unknown,
+                Some(5.0),
+            ),
+            tick_promise(
+                None,
+                &"l".repeat(200),
+                CohostPromiseTriggerKind::None,
+                Some(3.0),
+            ),
+            tick_promise(None, "   ", CohostPromiseTriggerKind::None, None),
+        ]);
+        assert!(engine.apply_tick_result(generation, 0, Ok(first), start + secs(2), "t1"));
+        let state = engine.snapshot();
+        let ids: Vec<&str> = state.promises.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["p_1", "p_2", "p_3", "p_4", "p_5"]);
+        assert_eq!(
+            state.promises[3].trigger,
+            CohostPromiseTrigger {
+                kind: CohostPromiseTriggerKind::None,
+                value: None,
+            }
+        );
+        assert_eq!(
+            state.promises[4].text.chars().count(),
+            PROMISE_TEXT_MAX_CHARS
+        );
+        assert_eq!(state.promise_reminder, None);
+
+        // Triggers: viewers at or above, minutes since first seen, none after
+        // 20 minutes; each fires once, the first met promise per pass.
+        assert!(!engine.check_promises(generation, Some(99), start + secs(3), "t2"));
+        assert!(!engine.check_promises(generation, None, start + secs(3), "t2"));
+        assert!(engine.check_promises(generation, Some(100), start + secs(4), "t3"));
+        let reminder = engine.snapshot().promise_reminder.unwrap();
+        assert_eq!(
+            (
+                reminder.promise_id.as_str(),
+                reminder.text.as_str(),
+                reminder.at.as_str()
+            ),
+            ("p_1", "Giveaway", "t3")
+        );
+        assert!(!engine.check_promises(generation, Some(500), start + secs(5), "t4"));
+        assert_eq!(engine.snapshot().promise_reminder.unwrap().at, "t3");
+        assert!(engine.check_promises(generation, None, start + secs(2 + 600), "t5"));
+        assert_eq!(
+            engine.snapshot().promise_reminder.unwrap().promise_id,
+            "p_2"
+        );
+        assert!(engine.check_promises(generation, None, start + secs(2 + 1200), "t6"));
+        assert_eq!(
+            engine.snapshot().promise_reminder.unwrap().promise_id,
+            "p_3"
+        );
+        assert!(engine.check_promises(generation, None, start + secs(2 + 1200), "t7"));
+        assert_eq!(
+            engine.snapshot().promise_reminder.unwrap().promise_id,
+            "p_4"
+        );
+        assert!(engine.check_promises(generation, None, start + secs(2 + 1200), "t8"));
+        assert_eq!(
+            engine.snapshot().promise_reminder.unwrap().promise_id,
+            "p_5"
+        );
+        assert!(!engine.check_promises(generation, Some(1000), start + secs(9999), "t9"));
+        // A replaced generation changes nothing.
+        assert!(!engine.check_promises(generation + 1, Some(1000), start + secs(9999), "t9"));
+
+        // Done/dismiss close the promise, its id never returns, and a
+        // reminder about it leaves with it.
+        assert!(engine.close_promise("session-1", "p_5").unwrap());
+        assert!(!engine.close_promise("session-1", "p_5").unwrap());
+        assert_eq!(engine.snapshot().promise_reminder, None);
+        assert_eq!(
+            engine.close_promise("session-2", "p_1"),
+            Err(CohostError::SessionMismatch)
+        );
+        assert!(engine.close_promise("session-1", "p_1").unwrap());
+
+        // The next full set: echoed ids keep first_seen_at, a closed id is
+        // ignored, a new promise with an existing text keeps that id, an
+        // unknown echoed id is taken as is, and fulfilled ids close.
+        engine.note_messages(&messages("session-1", 5..10));
+        engine
+            .prepare_tick(generation, true, true, start + secs(20))
+            .unwrap();
+        let mut second = response(Vec::new());
+        second.promises = Some(vec![
+            tick_promise(
+                Some("p_1"),
+                "Giveaway",
+                CohostPromiseTriggerKind::Viewers,
+                Some(100.0),
+            ),
+            tick_promise(
+                Some("p_2"),
+                "Build (edited)",
+                CohostPromiseTriggerKind::Minutes,
+                Some(1.0),
+            ),
+            tick_promise(None, "Later", CohostPromiseTriggerKind::None, None),
+            tick_promise(
+                Some("srv_9"),
+                "Server-minted",
+                CohostPromiseTriggerKind::None,
+                None,
+            ),
+            tick_promise(
+                None,
+                "Brand new",
+                CohostPromiseTriggerKind::Viewers,
+                Some(1.0),
+            ),
+        ]);
+        second.fulfilled_promise_ids = vec!["p_4".to_string()];
+        assert!(engine.apply_tick_result(generation, 0, Ok(second), start + secs(21), "t10"));
+        let state = engine.snapshot();
+        let ids: Vec<(&str, &str, &str)> = state
+            .promises
+            .iter()
+            .map(|p| (p.id.as_str(), p.text.as_str(), p.first_seen_at.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("p_2", "Build (edited)", "t1"),
+                ("p_3", "Later", "t1"),
+                ("srv_9", "Server-minted", "t10"),
+                ("p_6", "Brand new", "t10"),
+            ]
+        );
+        // p_2 already reminded: a lower trigger never fires it again; the
+        // brand-new one fires on its own trigger.
+        assert!(engine.check_promises(generation, Some(1), start + secs(22), "t11"));
+        assert_eq!(
+            engine.snapshot().promise_reminder.unwrap().promise_id,
+            "p_6"
+        );
+
+        // A v2-shaped answer (no promises key) with fulfilled ids only removes.
+        engine.note_messages(&messages("session-1", 10..15));
+        engine
+            .prepare_tick(generation, true, true, start + secs(40))
+            .unwrap();
+        let mut third = response(Vec::new());
+        third.promises = None;
+        third.fulfilled_promise_ids = vec!["p_6".to_string()];
+        assert!(engine.apply_tick_result(generation, 0, Ok(third), start + secs(41), "t12"));
+        let state = engine.snapshot();
+        assert_eq!(state.promises.len(), 3);
+        assert_eq!(state.promise_reminder, None);
+        assert!(
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("promiseReminder")
+                .is_none()
+        );
+
+        // A new session forgets every promise and reminder.
+        let generation = engine.start_session("session-2".to_string(), true, None, start);
+        assert!(engine.snapshot().promises.is_empty());
+        assert!(!engine.check_promises(generation, Some(1000), start + secs(9999), "t13"));
+    }
+
+    #[test]
+    fn recap_rides_five_minutes_and_a_draft_cuts_the_summary_at_a_word() {
+        let start = Instant::now();
+        let (mut engine, generation) = running_engine(start);
+        assert_eq!(
+            engine.draft_recap("session-1", start, "t0"),
+            Err(CohostError::NoSummary)
+        );
+        engine.note_messages(&messages("session-1", 0..5));
+        engine
+            .prepare_tick(generation, true, true, start + secs(1))
+            .unwrap();
+        let mut answer = response(Vec::new());
+        answer.recap = Some("  So far: unboxed the parts.  ".to_string());
+        answer.summary = Some(
+            "We unboxed the keyboard, compared three switch types, and started the build with the plate and the stabilisers before chat asked about the case colour"
+                .to_string(),
+        );
+        assert!(engine.apply_tick_result(generation, 0, Ok(answer), start + secs(2), "t1"));
+        let recap = engine.snapshot().recap.unwrap();
+        assert_eq!(recap.text, "So far: unboxed the parts.");
+        assert_eq!(recap.at, "t1");
+        assert!(chrono::DateTime::parse_from_rfc3339(&recap.expires_at).is_ok());
+        assert!(
+            engine
+                .snapshot_at_for_test(start + secs(2 + 299))
+                .recap
+                .is_some()
+        );
+        assert!(
+            engine
+                .snapshot_at_for_test(start + secs(2 + 300))
+                .recap
+                .is_none()
+        );
+        assert!(engine.dismiss_recap("session-1", start + secs(3)).unwrap());
+        assert!(!engine.dismiss_recap("session-1", start + secs(3)).unwrap());
+        assert_eq!(
+            engine.dismiss_recap("session-2", start),
+            Err(CohostError::SessionMismatch)
+        );
+        assert!(
+            serde_json::to_value(engine.snapshot())
+                .unwrap()
+                .get("recap")
+                .is_none()
+        );
+
+        // The draft: from the summary, no network, at most 140 chars cut at
+        // a word boundary; it rides the state like a server recap.
+        engine
+            .draft_recap("session-1", start + secs(4), "t2")
+            .unwrap();
+        let draft = engine.snapshot().recap.unwrap();
+        assert_eq!(
+            draft.text,
+            "We unboxed the keyboard, compared three switch types, and started the build with the plate and the stabilisers before chat asked about the"
+        );
+        assert!(draft.text.chars().count() <= RECAP_MAX_CHARS);
+        assert_eq!(draft.at, "t2");
+        assert_eq!(recap_draft("short summary", 140), "short summary");
+        assert_eq!(recap_draft("   spaced   out  ", 140), "spaced out");
+        assert_eq!(recap_draft(&"x".repeat(150), 140).chars().count(), 140);
+        assert_eq!(recap_draft("", 140), "");
+        assert_eq!(recap_draft("one two three", 7), "one two");
+        assert_eq!(recap_draft("one two three", 8), "one two");
+    }
+
+    #[test]
+    fn promise_trigger_matrix_matches_the_contract() {
+        let viewers = CohostPromiseTrigger {
+            kind: CohostPromiseTriggerKind::Viewers,
+            value: Some(100),
+        };
+        assert!(!promise_trigger_met(viewers, None, secs(99_999)));
+        assert!(!promise_trigger_met(viewers, Some(99), secs(0)));
+        assert!(promise_trigger_met(viewers, Some(100), secs(0)));
+        let minutes = CohostPromiseTrigger {
+            kind: CohostPromiseTriggerKind::Minutes,
+            value: Some(10),
+        };
+        assert!(!promise_trigger_met(minutes, Some(1000), secs(599)));
+        assert!(promise_trigger_met(minutes, None, secs(600)));
+        for kind in [
+            CohostPromiseTriggerKind::None,
+            CohostPromiseTriggerKind::Unknown,
+        ] {
+            let none = CohostPromiseTrigger { kind, value: None };
+            assert!(!promise_trigger_met(none, Some(1000), secs(1199)));
+            assert!(promise_trigger_met(none, None, secs(1200)));
+        }
+        // Chat rows carry the first-message flag onto the v3 wire.
+        let mut row = chat_message("session-1", 1, "2026-08-22T10:01:01Z");
+        row.first_message = true;
+        assert_eq!(
+            tick_message_from_chat(&row).unwrap().first_message,
+            Some(true)
+        );
+        // Off-state wire: none of the v3 keys, never null.
+        let json = serde_json::to_value(CohostState::off()).unwrap();
+        for key in ["topic", "promises", "promiseReminder", "recap"] {
+            assert!(json.get(key).is_none(), "{key} must be absent while empty");
+        }
     }
 
     #[test]
@@ -6427,7 +7704,7 @@ mod tests {
             if error.kind == CohostApiErrorKind::PromptVersionUnsupported {
                 // Only a rejected v1 tick is a failure; a rejected v2 tick is
                 // the silent fallback (covered by its own test).
-                engine.session.as_mut().unwrap().prompt_version = COHOST_PROMPT_VERSION_FALLBACK;
+                engine.session.as_mut().unwrap().prompt_version = 1;
             }
             engine.note_messages(&messages("session-1", 0..5));
             engine
@@ -7097,6 +8374,7 @@ mod tests {
                 from_notes: false,
                 first_seen_at: "t".to_string(),
                 updated_at: "t".to_string(),
+                on_topic: false,
             });
         mark_question_answered_after_send(&state, "session-1", "q_1").await;
         assert!(cohost_status(&state).await.questions.is_empty());

@@ -196,8 +196,10 @@ import type {
   CohostActionCommand,
   CohostEnableCommand,
   CohostFlagParams,
+  CohostPromiseParams,
   CohostQuestion,
   CohostQuestionParams,
+  CohostRecapParams,
   CohostSettings,
   CohostSettingsPatch,
   CohostState,
@@ -3781,8 +3783,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         | 'cohost.question.answered'
         | 'cohost.question.dismiss'
         | 'cohost.question.restore'
-        | 'cohost.flag.dismiss',
-      params: CohostQuestionParams | CohostFlagParams
+        | 'cohost.flag.dismiss'
+        | 'cohost.promise.done'
+        | 'cohost.promise.dismiss'
+        | 'cohost.recap.dismiss'
+        | 'cohost.recap.draft',
+      params: CohostQuestionParams | CohostFlagParams | CohostPromiseParams | CohostRecapParams
     ): Promise<CohostState> => {
       if (!client) throw new Error('Backend socket is not connected.')
       setCohostActionPending(true)
@@ -3969,6 +3975,19 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             sessionId: command.sessionId,
             messageId: command.targetId
           })
+        }
+        // Plan 068 D8: promises and recaps, relayed like questions.
+        if (command.kind === 'promise-done' || command.kind === 'promise-dismiss') {
+          return runCohostAction(
+            command.kind === 'promise-done' ? 'cohost.promise.done' : 'cohost.promise.dismiss',
+            { sessionId: command.sessionId, promiseId: command.targetId }
+          )
+        }
+        if (command.kind === 'recap-dismiss' || command.kind === 'recap-draft') {
+          return runCohostAction(
+            command.kind === 'recap-draft' ? 'cohost.recap.draft' : 'cohost.recap.dismiss',
+            { sessionId: command.sessionId }
+          )
         }
         const method =
           command.kind === 'answered'

@@ -17,6 +17,7 @@ import {
   COHOST_TICK_MESSAGE_KEYS,
   COHOST_TICK_PATH,
   COHOST_TICK_REQUEST_KEYS,
+  COHOST_TICK_V3_REQUEST_KEYS,
   startFakeCohostService
 } from './lib/fake-cohost-service.mjs'
 import { connectBackend, request } from './smoke-recording-session.mjs'
@@ -633,17 +634,23 @@ function assertGap(earlier, later, minimumMs, label) {
 }
 
 function assertRequestShape(body) {
-  // Wire v2 adds `rules`; everything else is the v1 key set.
+  // Wire v2 adds `rules`; v3 adds the optional transcript, summary and
+  // openPromises (plan 068 D7); everything else is the v1 key set.
   const keys = Object.keys(body)
-    .filter((key) => key !== 'rules')
+    .filter((key) => key !== 'rules' && !COHOST_TICK_V3_REQUEST_KEYS.includes(key))
     .sort()
-  expect(Array.isArray(body.rules), 'A v2 tick request must carry the rules array.')
+  expect(Array.isArray(body.rules), 'A v2+ tick request must carry the rules array.')
   expect(
     JSON.stringify(keys) === JSON.stringify([...COHOST_TICK_REQUEST_KEYS]),
     `Tick request keys drifted from the contract: ${keys.join(',')}`
   )
   expect(
-    body.promptVersion === 2 &&
+    body.transcript === undefined ||
+      (typeof body.transcript === 'string' && body.transcript.length > 0),
+    'A v3 tick request omits transcript when nothing was said.'
+  )
+  expect(
+    body.promptVersion === 3 &&
       body.consentToProcessChat === true &&
       typeof body.clientVersion === 'string' &&
       body.clientVersion.startsWith('videorc-desktop/'),

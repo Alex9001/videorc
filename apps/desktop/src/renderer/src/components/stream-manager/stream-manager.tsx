@@ -27,6 +27,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTrafficLightGutter } from '@/components/window-frame'
 import type {
   CohostFlag,
+  CohostPromise,
   CohostQuestion,
   CohostState,
   CommentHighlightAnchor,
@@ -44,9 +45,11 @@ import { cohostGroupedDeltaFlash } from '@/lib/cohost-presence'
 import { activeCohostSpotlight, cohostCommentMarks } from '@/lib/cohost-marks'
 import {
   cohostNudgeVisible,
+  cohostPromiseReminderToast,
   cohostQuestionToast,
   cohostStateForSensitivity,
   draftForQuestion,
+  COHOST_PROMISE_TOAST_ID,
   COHOST_QUESTION_TOAST_ID
 } from '@/lib/cohost-view'
 import type { EntitlementUiGate } from '@/lib/entitlement-ui'
@@ -186,6 +189,12 @@ export interface StreamManagerProps {
   onCohostRestoreQuestion?: (question: CohostQuestion) => void
   onCohostDismissQuestion?: (question: CohostQuestion) => void
   onCohostDismissFlag?: (flag: CohostFlag) => void
+  /** Promises and recaps (plan 068 D8). The draft resolves with the relayed
+   * state; its `recap.text` pre-fills the composer. */
+  onCohostPromiseDone?: (promise: CohostPromise) => void
+  onCohostPromiseDismiss?: (promise: CohostPromise) => void
+  onCohostRecapDismiss?: () => void
+  onCohostRecapDraft?: () => Promise<CohostState | null>
   onCohostEnableConsent?: () => void
   onCohostUpgrade?: (url: string) => void
 }
@@ -231,6 +240,10 @@ export function StreamManager({
   onCohostRestoreQuestion,
   onCohostDismissQuestion,
   onCohostDismissFlag,
+  onCohostPromiseDone,
+  onCohostPromiseDismiss,
+  onCohostRecapDismiss,
+  onCohostRecapDraft,
   onCohostEnableConsent,
   onCohostUpgrade
 }: StreamManagerProps): ReactElement {
@@ -289,6 +302,9 @@ export function StreamManager({
       cohostToastAtRef.current = questionToast.atMs
       toast(questionToast.message, { id: COHOST_QUESTION_TOAST_ID })
     }
+    // A met promise trigger (plan 068 D8): private, keyed, once per promise.
+    const reminder = cohostPromiseReminderToast({ previous, next: cohostState })
+    if (reminder) toast(reminder, { id: COHOST_PROMISE_TOAST_ID })
     const delta = cohostGroupedDeltaFlash(previous, cohostState)
     if (delta) setCohostFlash(delta)
   }, [cohostState])
@@ -414,11 +430,15 @@ export function StreamManager({
   }, [cohostVisible, showOrcle])
 
   const sendTargets = sendablePlatforms(snapshot.providers)
+  // Pre-fill only: the composer is the one place a send starts (plan 068 D8).
+  const prefillComposer = (text: string): void => {
+    setPrefill((current) => ({ seq: (current?.seq ?? 0) + 1, text }))
+    setNarrowPane('chat')
+  }
   const thankInChat = (item: ActivityItem): void => {
     const text = thankYouDraft(item)
     if (!text) return
-    setPrefill((current) => ({ seq: (current?.seq ?? 0) + 1, text }))
-    setNarrowPane('chat')
+    prefillComposer(text)
   }
   const showActivityOnStream = (item: ActivityItem): void => {
     const message = messages.find((candidate) => candidate.id === item.messageId)
@@ -485,6 +505,20 @@ export function StreamManager({
               setNarrowPane('chat')
               setJumpTo((current) => ({ messageId, seq: (current?.seq ?? 0) + 1 }))
             }}
+            onPromiseDismiss={onCohostPromiseDismiss}
+            onPromiseDone={onCohostPromiseDone}
+            onRecapDismiss={onCohostRecapDismiss}
+            onRecapDraft={
+              onCohostRecapDraft
+                ? () => {
+                    void onCohostRecapDraft().then((state) => {
+                      const text = state?.recap?.text
+                      if (text) prefillComposer(text)
+                    })
+                  }
+                : undefined
+            }
+            onRecapPost={(recap) => prefillComposer(recap.text)}
             onReply={(question) => {
               setPrefill((current) => ({
                 seq: (current?.seq ?? 0) + 1,

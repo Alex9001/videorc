@@ -6,7 +6,9 @@ import { normalizeLayoutSettings } from '../renderer/src/lib/capture'
 import type {
   AccountCallbackEnvelope,
   CohostFlagParams,
+  CohostPromiseParams,
   CohostQuestionParams,
+  CohostRecapParams,
   CohostSettings,
   CohostSettingsPatch,
   CohostStartParams,
@@ -68,6 +70,8 @@ interface HighRiskContractFixtures {
     startParams: CohostStartParams
     questionParams: CohostQuestionParams
     flagParams: CohostFlagParams
+    promiseParams: CohostPromiseParams
+    recapParams: CohostRecapParams
     settingsPatch: CohostSettingsPatch
     settings: CohostSettings
     state: CohostState
@@ -168,6 +172,16 @@ describe('shared high-risk protocol fixture', () => {
     expect(
       validateBackendRpcParams('cohost.flag.dismiss', fixtures.cohost.flagParams)
     ).toStrictEqual(fixtures.cohost.flagParams)
+    for (const method of ['cohost.promise.done', 'cohost.promise.dismiss'] as const) {
+      expect(validateBackendRpcParams(method, fixtures.cohost.promiseParams)).toStrictEqual(
+        fixtures.cohost.promiseParams
+      )
+    }
+    for (const method of ['cohost.recap.dismiss', 'cohost.recap.draft'] as const) {
+      expect(validateBackendRpcParams(method, fixtures.cohost.recapParams)).toStrictEqual(
+        fixtures.cohost.recapParams
+      )
+    }
     expect(
       validateBackendRpcParams('cohost.settings.set', fixtures.cohost.settingsPatch)
     ).toStrictEqual(fixtures.cohost.settingsPatch)
@@ -181,7 +195,11 @@ describe('shared high-risk protocol fixture', () => {
       'cohost.question.answered',
       'cohost.question.dismiss',
       'cohost.question.restore',
-      'cohost.flag.dismiss'
+      'cohost.flag.dismiss',
+      'cohost.promise.done',
+      'cohost.promise.dismiss',
+      'cohost.recap.dismiss',
+      'cohost.recap.draft'
     ] as const) {
       expect(validateBackendRpcResult(method, fixtures.cohost.state)).toStrictEqual(
         fixtures.cohost.state
@@ -225,10 +243,39 @@ describe('shared high-risk protocol fixture', () => {
       fixtures.cohost.stateV2
     )
     expect(fixtures.cohost.stateV2.flags.map((flag) => flag.kind)).toContain('unknown')
-    for (const key of ['highlights', 'alerts', 'moodScores'] as const) {
+    for (const key of [
+      'highlights',
+      'alerts',
+      'moodScores',
+      'topic',
+      'promises',
+      'promiseReminder',
+      'recap'
+    ] as const) {
       expect(() =>
         validateBackendEventPayload('cohost.state', { ...fixtures.cohost.stateV2, [key]: null })
       ).toThrow('cohost.state')
+    }
+    // Tick v3 (plan 068 S5): topic, promises, reminder, recap and the
+    // on-topic flag ride the state; absent on the legacy payload; an unknown
+    // trigger kind still validates.
+    expect(fixtures.cohost.stateV2.topic).toBe('Mechanical keyboards')
+    expect(fixtures.cohost.stateV2.promises?.[0]).toStrictEqual({
+      id: 'p_fixture',
+      text: 'Giveaway at 100 viewers',
+      trigger: { kind: 'viewers', value: 100 },
+      firstSeenAt: '2026-08-22T10:00:00Z'
+    })
+    expect(fixtures.cohost.stateV2.questions[0]?.onTopic).toBe(true)
+    const futureTrigger = {
+      ...fixtures.cohost.stateV2,
+      promises: [
+        { ...fixtures.cohost.stateV2.promises![0], trigger: { kind: 'followers', value: 5 } }
+      ]
+    }
+    expect(validateBackendEventPayload('cohost.state', futureTrigger)).toStrictEqual(futureTrigger)
+    for (const key of ['topic', 'promises', 'promiseReminder', 'recap'] as const) {
+      expect(fixtures.cohost.legacyState).not.toHaveProperty(key)
     }
     expect(() =>
       validateBackendEventPayload('cohost.state', {
