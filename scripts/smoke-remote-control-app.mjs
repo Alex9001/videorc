@@ -185,6 +185,21 @@ try {
   await sceneStatePromise
   console.log('remote-control smoke: sceneApply ack + confirmed state OK')
 
+  // 4b. clipMark (plan 068 D6) is on the allowlist and relays through the
+  // renderer: with no session running the renderer refuses it with a reason,
+  // so the round trip proves admission + relay + ack without touching disk.
+  const clipAckPromise = waitForRemoteEvent(remote, 'remote.ack')
+  const clipTicket = await remoteRequest(remote, 'remote.intent', { kind: 'clipMark' })
+  if (!clipTicket.payload?.accepted) fail('clipMark intent was not accepted')
+  const clipAck = await clipAckPromise
+  if (clipAck?.intentId !== clipTicket.payload.intentId || clipAck?.ok !== false) {
+    fail(`clipMark without a session was not refused through the renderer: ${JSON.stringify(clipAck)}`)
+  }
+  if (clipAck?.message !== 'No active session.') {
+    fail(`clipMark refusal carried the wrong reason: ${JSON.stringify(clipAck)}`)
+  }
+  console.log('remote-control smoke: clipMark relay + refusal reason OK')
+
   // 5. Regenerate cuts the paired client.
   const closed = new Promise((resolveClose) => remote.once('close', resolveClose))
   await request(renderer, timeoutMs, 'remote.control.regenerate')

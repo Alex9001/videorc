@@ -413,6 +413,8 @@ import type {
   CohostWindowState,
   CommentHighlightCommand,
   CommentHighlightState,
+  ClipMarkCommand,
+  ClipMarkedEvent,
   CommentsClearCommand,
   CommentsCommandResolution,
   CommentsSendCommand,
@@ -456,7 +458,11 @@ import type {
   VideorcAccountSnapshot,
   ViewerSample
 } from '../shared/backend'
-import { normalizeCommentHighlightAnchor, offCohostWindowState } from '../shared/backend'
+import {
+  COHOST_ACTION_KINDS,
+  normalizeCommentHighlightAnchor,
+  offCohostWindowState
+} from '../shared/backend'
 
 publishLaunchServicesSmokeOwnership()
 
@@ -13390,10 +13396,7 @@ app.whenReady().then(async () => {
       }
       const command = value as CohostActionCommand
       if (
-        (command.kind !== 'answered' &&
-          command.kind !== 'dismiss-question' &&
-          command.kind !== 'dismiss-flag' &&
-          command.kind !== 'restore') ||
+        !COHOST_ACTION_KINDS.includes(command.kind) ||
         typeof command.targetId !== 'string' ||
         !command.targetId.trim()
       ) {
@@ -13434,12 +13437,16 @@ app.whenReady().then(async () => {
       if (command.grantConsent !== undefined && typeof command.grantConsent !== 'boolean') {
         return Promise.reject(new Error('Orcle consent grant must be a boolean.'))
       }
+      if (command.listen !== undefined && typeof command.listen !== 'boolean') {
+        return Promise.reject(new Error('Orcle listening must be a boolean.'))
+      }
       return commentsCommandBroker.request(requestId, () => {
         if (!mainWindow || mainWindow.webContents.isDestroyed()) return false
         sendElectronEvent(mainWindow.webContents, 'comments-window:cohost-enable-request', {
           requestId,
           enabled: command.enabled,
-          ...(command.grantConsent === true ? { grantConsent: true } : {})
+          ...(command.grantConsent === true ? { grantConsent: true } : {}),
+          ...(typeof command.listen === 'boolean' ? { listen: command.listen } : {})
         })
         return true
       })
@@ -13522,6 +13529,30 @@ app.whenReady().then(async () => {
         emitCommentsView()
       }
       return accepted
+    }
+  )
+  // Mark clip relay (plan 068 D6): the Stream Manager asks, the MAIN renderer
+  // owns the `clip.mark` RPC, and the marked event comes back as the reply.
+  secureIpcHandle(
+    'comments-window:clip-mark',
+    (event, value: unknown): Promise<ClipMarkedEvent> => {
+      if (!commentsWindow || event.sender.id !== commentsWindow.webContents.id) {
+        return Promise.reject(new Error('Only the Chat window can mark clips from here.'))
+      }
+      const requestId = commentsCommandRequestId(value)
+      const command: ClipMarkCommand = { requestId }
+      return commentsCommandBroker.request(requestId, () => {
+        if (!mainWindow || mainWindow.webContents.isDestroyed()) return false
+        sendElectronEvent(mainWindow.webContents, 'comments-window:clip-mark-request', command)
+        return true
+      })
+    }
+  )
+  secureIpcHandle(
+    'comments-window:clip-mark-result-push',
+    (event, resolution: CommentsCommandResolution<ClipMarkedEvent>) => {
+      if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false
+      return commentsCommandBroker.resolve(resolution)
     }
   )
   secureIpcHandle('captions-window:open', () => openCaptionsWindow())

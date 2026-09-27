@@ -64,6 +64,7 @@ Intent params (`kind` + fields):
 | `windowFront`                                 | `window`: `notes`\|`comments`\|`preview` | bring window forward                                                              |
 | `commentHighlight`                            | `messageId`                              | put that live-chat comment on stream (explicit show, idempotent — never a toggle) |
 | `commentHighlightClear`                       | —                                        | take the on-stream comment down                                                   |
+| `clipMark`                                    | —                                        | mark this moment for a clip (plan 068); needs an active session and recording on  |
 
 ## Events
 

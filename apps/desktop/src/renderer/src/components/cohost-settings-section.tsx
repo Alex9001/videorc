@@ -16,12 +16,14 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { setCohostSensitivity, useCohostSensitivity } from '@/hooks/use-cohost-sensitivity'
-import { useStudioCore } from '@/hooks/use-studio'
+import { useStudioChat, useStudioCore } from '@/hooks/use-studio'
 import type { CohostSettings, CohostSettingsPatch, CohostTone } from '@/lib/backend'
 import {
-  COHOST_CONSENT_SENTENCE,
+  COHOST_CHAT_CONSENT_SENTENCE,
+  COHOST_LISTEN_CONSENT_SENTENCE,
   COHOST_SENSITIVITIES,
   COHOST_SENSITIVITY_LABELS,
+  cohostListenAllowanceLabel,
   type CohostSensitivity
 } from '@/lib/cohost-view'
 import { cn } from '@/lib/utils'
@@ -151,8 +153,8 @@ export function CohostSettingsSection(): ReactElement | null {
             <div className="flex min-w-0 flex-col gap-0.5">
               <FieldLabel htmlFor="cohost-enabled">Enable Orcle</FieldLabel>
               <p className="text-xs text-muted-foreground">
-                Starts with your next livestream. {COHOST_CONSENT_SENTENCE} It needs the cloud-AI
-                consent you set in Publish.
+                Starts with your next livestream. {COHOST_CHAT_CONSENT_SENTENCE} It needs the
+                cloud-AI consent you set in Publish.
               </p>
             </div>
             <Switch
@@ -160,6 +162,24 @@ export function CohostSettingsSection(): ReactElement | null {
               disabled={locked}
               id="cohost-enabled"
               onCheckedChange={(enabled) => save({ enabled })}
+            />
+          </div>
+        </Field>
+
+        <Field>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex min-w-0 flex-col gap-0.5">
+              <FieldLabel htmlFor="cohost-listen">
+                Orcle hears you while you&apos;re live
+              </FieldLabel>
+              <p className="text-xs text-muted-foreground">{COHOST_LISTEN_CONSENT_SENTENCE}</p>
+              <CohostListenAllowance />
+            </div>
+            <Switch
+              checked={cohostSettings.listen === true}
+              disabled={locked}
+              id="cohost-listen"
+              onCheckedChange={(listen) => save({ listen })}
             />
           </div>
         </Field>
@@ -360,7 +380,7 @@ export function CohostSettingsSection(): ReactElement | null {
             ))}
           </ToggleGroup>
           <FieldDescription className="flex flex-col gap-0.5">
-            <span>What I talk about needs live captions.</span>
+            <span>What I talk about needs Orcle to hear you (or live captions).</span>
             <span>
               Orcle&apos;s picks: at most one card every 45 seconds; nothing Orcle flagged is ever
               shown.
@@ -369,6 +389,23 @@ export function CohostSettingsSection(): ReactElement | null {
         </Field>
       </FieldGroup>
     </PanelSection>
+  )
+}
+
+/**
+ * Listening time left this month, or that it is used up (plan 068). Its own
+ * component so only this line follows the live chat context; the server
+ * reports the allowance on a chunk it metered as listening, so the line is
+ * often absent.
+ */
+function CohostListenAllowance(): ReactElement | null {
+  const { cohostState } = useStudioChat()
+  const allowance = cohostListenAllowanceLabel(cohostState?.listening)
+  if (!allowance) return null
+  return (
+    <p className="text-xs tabular-nums text-subtle" data-slot="cohost-listen-allowance">
+      {allowance}
+    </p>
   )
 }
 

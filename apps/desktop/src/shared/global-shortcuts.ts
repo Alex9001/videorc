@@ -4,6 +4,7 @@ export const GLOBAL_SHORTCUT_ACTIONS = [
   'record-toggle',
   'stream-toggle',
   'mic-toggle',
+  'clip-mark',
   'layout-next',
   'layout-previous',
   ...LAYOUT_PRESET_VALUES.map((id) => `layout:${id}` as const)
@@ -19,6 +20,7 @@ export function globalShortcutEntries(
     ['record-toggle', config.recordToggle],
     ['stream-toggle', config.streamToggle],
     ['mic-toggle', config.micToggle],
+    ['clip-mark', config.clipMark],
     ['layout-next', config.layoutNext],
     ['layout-previous', config.layoutPrevious],
     ...LAYOUT_PRESET_VALUES.map((id): [GlobalShortcutAction, string | undefined] => [
@@ -52,6 +54,7 @@ const ACTION_CONFIG_KEYS = {
   'record-toggle': 'recordToggle',
   'stream-toggle': 'streamToggle',
   'mic-toggle': 'micToggle',
+  'clip-mark': 'clipMark',
   'layout-next': 'layoutNext',
   'layout-previous': 'layoutPrevious'
 } as const satisfies Partial<Record<GlobalShortcutAction, keyof GlobalShortcutsConfig>>

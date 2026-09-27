@@ -5345,6 +5345,12 @@ async fn start_session_with_timeline(
             state.clone(),
             session_id.clone(),
         ));
+        // Orcle's listen intent (plan 068): wanted before this capture, it
+        // resumes now. Off the recording path; it never fails or delays it.
+        let listen_state = state.clone();
+        tokio::spawn(async move {
+            crate::captions::resume_listen_for_capture(&listen_state).await;
+        });
     }
     if let Some(stdout) = stdout {
         tokio::spawn(publish_preview_stdout(state.clone(), None, stdout));
@@ -8682,7 +8688,7 @@ async fn monitor_session(
                     mark_stop_timeline(&state, RecordingStopPhase::Captions);
                     if should_begin_captioned_copy_render(
                         monitored_recording.captioned_copy_requested,
-                        caption_artifact.chunks.len(),
+                        caption_artifact.presented_chunk_count(),
                     ) {
                         crate::captions::begin_caption_cue_render(
                             &state,
@@ -9149,7 +9155,7 @@ async fn finalize_recording_media(
         mark_stop_timeline(state, RecordingStopPhase::Captions);
         if should_begin_captioned_copy_render(
             captioned_copy_requested,
-            caption_artifact.chunks.len(),
+            caption_artifact.presented_chunk_count(),
         ) {
             crate::captions::begin_caption_cue_render(
                 state,

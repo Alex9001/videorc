@@ -1,5 +1,10 @@
 import type { CohostQuestion, CohostState } from './backend'
-import { cohostErrorDetail, cohostErrorDetailText, cohostReasonLabel } from './cohost-view'
+import {
+  cohostErrorDetail,
+  cohostErrorDetailText,
+  cohostListeningView,
+  cohostReasonLabel
+} from './cohost-view'
 
 // Co-host presence (W2). One pure derivation of `cohost.state` that every
 // surface renders: the Comments window header, the pane's segment header and
@@ -110,7 +115,7 @@ function presenceLabel(
     case 'thinking':
       return 'Orcle · thinking…'
     case 'listening':
-      return openCount > 0 ? `Orcle · ${openCount} q` : 'Orcle listening'
+      return openCount > 0 ? `Orcle · ${openCount} q` : 'Orcle is reading chat'
     case 'paused': {
       const reason = cohostReasonLabel(state?.reason ?? null)
       return reason ? `Orcle paused · ${reason}` : 'Orcle paused'
@@ -152,6 +157,10 @@ function presenceTooltip(
 
   if (state?.partial === true) lines.push('Chat outran one AI pass; the newest messages were used.')
 
+  // Whether Orcle hears the streamer (plan 068): a sentence, never a second dot.
+  const listening = cohostListeningView(state?.listening)
+  if (listening) lines.push(listening.detail)
+
   // The failed tick in the server's own words — the one thing a streamer can
   // paste into a bug report. Only ever shown on a state that actually failed.
   if (kind === 'error' || kind === 'paused') {
@@ -192,16 +201,17 @@ export function cohostPresenceView(
   }
 }
 
-/** The pane's empty-state copy: static "Listening." upgrades to real work. */
+/** The pane's empty-state copy: static "Reading chat." upgrades to real work.
+ * Never "listening": that word is the microphone's (plan 068 S4). */
 export function cohostEmptyStateCopy(view: CohostPresenceView, state: CohostState | null): string {
   if (view.kind === 'reading') {
     const pending = nonNegative(state?.pendingMessages)
     return `Reading ${pending} new ${plural(pending, 'message')}…`
   }
   if (view.kind === 'thinking') return 'Thinking about the last batch…'
-  if (view.kind === 'listening') return 'Listening. Questions from chat will appear here.'
+  if (view.kind === 'listening') return 'Reading chat. Questions will appear here.'
   if (view.kind === 'starting') return 'Starting. Questions from chat will appear here.'
-  return 'Questions from chat will appear here once Orcle is listening again.'
+  return 'Questions from chat will appear here once Orcle is reading chat again.'
 }
 
 /**

@@ -148,6 +148,39 @@ describe('fake caption service', () => {
       await fake.close()
     }
   })
+
+  it('records the chunk purpose, defaults an absent one to captions, and refuses unknown ones', async () => {
+    const sessionToken = 'fake-caption-session'
+    const fake = await startFakeCaptionService({
+      smokeSessionToken: sessionToken,
+      smokeRealtimeToken: 'fake-caption-realtime'
+    })
+    const wav = pcm16Wav([0, 4_096, -8_192, 16_384])
+
+    try {
+      const listen = await postCaptionChunk(fake.httpOrigin, sessionToken, wav, {
+        purpose: 'listen'
+      })
+      await postCaptionChunk(fake.httpOrigin, sessionToken, wav, { purpose: 'captions' })
+      await postCaptionChunk(fake.httpOrigin, sessionToken, wav)
+      const refused = await postCaptionChunk(fake.httpOrigin, sessionToken, wav, {
+        purpose: 'recording',
+        expectedStatus: 400
+      })
+
+      assert.equal(listen.text, 'Chunk fallback recovered.')
+      assert.equal(refused.error.code, 'invalid-caption-purpose')
+      assert.equal(fake.state.chunkRequests, 3, 'a refused purpose is not an accepted chunk')
+      assert.deepEqual(fake.state.chunkPurposes, ['listen', 'captions', null])
+      assert.deepEqual(
+        fake.state.chunkAudio.map((audio) => audio.purpose),
+        ['listen', 'captions', 'captions']
+      )
+      assert.equal(fake.state.chunkAudio[0].peak, 0.5, 'the WAV part still parses beside the field')
+    } finally {
+      await fake.close()
+    }
+  })
 })
 
 function configureAndClose(socket) {
@@ -187,16 +220,18 @@ function configureAndClose(socket) {
   })
 }
 
-async function postCaptionChunk(origin, token, wav) {
+async function postCaptionChunk(origin, token, wav, { purpose, expectedStatus = 200 } = {}) {
   const form = new FormData()
   form.set('sessionClientId', 'fake-service-test')
+  // Field order matches the desktop client: text fields, then the audio part.
+  if (purpose !== undefined) form.set('purpose', purpose)
   form.set('audio', new Blob([wav], { type: 'audio/wav' }), 'caption.wav')
   const response = await fetch(`${origin}/api/ai/captions/chunks`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}` },
     body: form
   })
-  assert.equal(response.status, 200)
+  assert.equal(response.status, expectedStatus)
   return response.json()
 }
 

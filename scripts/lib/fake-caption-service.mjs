@@ -9,6 +9,13 @@ import { inspectMultipartPcm16Wav } from './audio-amplitude.mjs'
  * It mirrors the authenticated Videorc HTTP routes plus the legacy Gateway
  * realtime dialect without ever touching production or logging transcript,
  * bearer, or client-token material.
+ *
+ * Chunk uploads carry an optional multipart `purpose` (plan 068 D5):
+ * `captions` (the default when absent, like an older desktop) or `listen`
+ * (Orcle's listen intent, metered apart on the real service). Anything else
+ * is refused with 400 like the web route. `state.chunkPurposes` records what
+ * each accepted upload sent (`null` when the field was absent) and every
+ * `state.chunkAudio` entry carries the effective purpose.
  */
 export async function startFakeCaptionService({
   smokeSessionToken,
@@ -35,6 +42,7 @@ export async function startFakeCaptionService({
     assistantResponses: 0,
     chunkRequests: 0,
     chunkAudio: [],
+    chunkPurposes: [],
     usageReports: 0,
     emittedFinals: []
   }
@@ -75,16 +83,25 @@ export async function startFakeCaptionService({
       })
     }
     if (req.method === 'POST' && req.url === '/api/ai/captions/chunks') {
+      let body
       let audio
       try {
-        audio = inspectMultipartPcm16Wav(await readRequestBody(req))
+        body = await readRequestBody(req)
+        audio = inspectMultipartPcm16Wav(body)
       } catch (error) {
         return json(res, 400, {
           error: { code: 'invalid-caption-wav', message: error.message }
         })
       }
+      const purpose = readMultipartTextField(body, req.headers['content-type'], 'purpose')
+      if (purpose !== null && !CHUNK_PURPOSES.has(purpose)) {
+        return json(res, 400, {
+          error: { code: 'invalid-caption-purpose', message: 'Unknown caption chunk purpose.' }
+        })
+      }
       state.chunkRequests += 1
-      state.chunkAudio.push(audio)
+      state.chunkPurposes.push(purpose)
+      state.chunkAudio.push({ ...audio, purpose: purpose ?? 'captions' })
       const hasSpeech = !Number.isFinite(minSpeechPeak) || audio.peak >= Math.max(0, minSpeechPeak)
       const text = hasSpeech ? chunkText : ''
       return json(res, 200, {
@@ -253,6 +270,40 @@ export async function startFakeCaptionService({
       await new Promise((resolveClose) => server.close(resolveClose))
     }
   }
+}
+
+const CHUNK_PURPOSES = new Set(['captions', 'listen'])
+
+/**
+ * The value of one plain (non-file) multipart/form-data field, or null when
+ * the body has no such field. Binary-safe: parts are located on the raw
+ * bytes, so the WAV part never goes through a string conversion.
+ */
+function readMultipartTextField(body, contentType, fieldName) {
+  const match = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(String(contentType ?? ''))
+  if (!match) return null
+  const delimiter = Buffer.from(`--${match[1] ?? match[2]}`)
+  let cursor = body.indexOf(delimiter)
+  while (cursor >= 0) {
+    const partStart = cursor + delimiter.length
+    const next = body.indexOf(delimiter, partStart)
+    if (next < 0) return null
+    const part = body.subarray(partStart, next)
+    const headerEnd = part.indexOf('\r\n\r\n')
+    if (headerEnd >= 0) {
+      const headers = part.subarray(0, headerEnd).toString('latin1')
+      const disposition = /^content-disposition:(.*)$/im.exec(headers)?.[1] ?? ''
+      const name = /;\s*name="([^"]*)"/i.exec(disposition)?.[1]
+      if (name === fieldName && !/;\s*filename=/i.test(disposition)) {
+        const value = part.subarray(headerEnd + 4)
+        const trimmed =
+          value.subarray(-2).toString('latin1') === '\r\n' ? value.subarray(0, -2) : value
+        return trimmed.toString('utf8')
+      }
+    }
+    cursor = next
+  }
+  return null
 }
 
 function json(res, status, payload) {

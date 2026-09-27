@@ -344,6 +344,11 @@ pub struct CaptionChunkRecord {
     /// SRT and captioned-copy output contain one canonical cue.
     #[serde(skip_serializing)]
     pub provider_item_id: Option<String>,
+    /// Captions were presenting when this record landed (plan 068 D1). The
+    /// SRT and the Publish tab keep every record; the cue render and the
+    /// burned copy use presented records only.
+    #[serde(skip_serializing)]
+    pub presented: bool,
 }
 
 fn upsert_caption_record(chunks: &mut Vec<CaptionChunkRecord>, record: CaptionChunkRecord) -> bool {
@@ -690,6 +695,22 @@ pub struct FinalizedCaptionArtifact {
     pub chunks: Vec<CaptionChunkRecord>,
     style: CaptionStyleSnapshot,
     artifact_generation: u64,
+}
+
+impl FinalizedCaptionArtifact {
+    /// Records that landed while captions presented: the only ones the cue
+    /// render and burned copy may use (plan 068 D1).
+    pub fn presented_chunks(&self) -> Vec<CaptionChunkRecord> {
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.presented)
+            .cloned()
+            .collect()
+    }
+
+    pub fn presented_chunk_count(&self) -> usize {
+        self.chunks.iter().filter(|chunk| chunk.presented).count()
+    }
 }
 
 fn take_finalized_caption_artifact(
@@ -1092,7 +1113,8 @@ where
     Prepare: FnOnce(std::path::PathBuf, String) -> PrepareFuture,
     PrepareFuture: std::future::Future<Output = std::io::Result<()>>,
 {
-    let cues = caption_cues(&artifact.chunks);
+    // Listen-only records never reach the compositor's cue frames.
+    let cues = caption_cues(&artifact.presented_chunks());
     if cues.is_empty() {
         return Ok(None);
     }
@@ -2788,7 +2810,28 @@ pub struct CaptionsCoordinator {
     task: Option<tokio::task::JoinHandle<()>>,
     stop: Option<Arc<AtomicBool>>,
     status: Option<CaptionsStatus>,
+    /// The captions intent (plan 068 D1): the user wants live captions
+    /// presented. Owns `captions.status`, `captions.update`, overlays, cue
+    /// render and burn.
     desired_enabled: bool,
+    /// Orcle's listen intent (plan 068 D1): the provider task and tap run
+    /// while either intent is wanted. Listen owns nothing visible in the
+    /// captions UI.
+    listen_wanted: bool,
+    /// Presentation flag shared with the running task: every renderer-facing
+    /// caption side effect checks it. `None` without a task.
+    presentation: Option<Arc<AtomicBool>>,
+    /// The status the task would have presented. Adopted when captions turn
+    /// on over a running listen-only task so the renderer sees the true
+    /// transport state at once.
+    shadow_status: Option<CaptionsStatus>,
+    /// The running task proved it can listen: a successful upload, or a
+    /// silent chunk skipped after the tap delivered frames. A listen intent
+    /// joining the task reports `on` at once. Reset with every task.
+    listen_ready: bool,
+    /// Bumped whenever the listen intent ends (a stop, sign-out): a listening
+    /// state a task decided to publish before that never lands after it.
+    listen_epoch: u64,
     language: Option<String>,
     /// Orders delayed capture auto-start against explicit stop/start, capture
     /// stop, sign-out, and shutdown. A queued task may commit only the exact
@@ -3066,6 +3109,7 @@ pub async fn install_caption_sign_out_test_session(state: &AppState) -> CaptionS
         coordinator.task = Some(task);
         coordinator.stop = Some(stop);
         coordinator.desired_enabled = true;
+        coordinator.presentation = Some(Arc::new(AtomicBool::new(true)));
         coordinator.language = Some("en".to_string());
         let capture_epoch = coordinator.capture_epoch;
         coordinator.chunks.push(CaptionChunkRecord {
@@ -3076,6 +3120,7 @@ pub async fn install_caption_sign_out_test_session(state: &AppState) -> CaptionS
             segments: Vec::new(),
             capture_epoch,
             provider_item_id: Some("private-item".to_string()),
+            presented: true,
         });
         coordinator.finalized_style = Some(coordinator.style);
         coordinator.status = Some(CaptionsStatus::active(
@@ -3142,6 +3187,7 @@ pub async fn install_caption_queued_audio_test_session(
         coordinator.task = Some(task);
         coordinator.stop = Some(stop);
         coordinator.desired_enabled = true;
+        coordinator.presentation = Some(Arc::new(AtomicBool::new(true)));
         coordinator.status = Some(CaptionsStatus::active(
             CaptionsState::Listening,
             CaptionsTransport::Realtime,
@@ -3154,6 +3200,39 @@ pub async fn install_caption_queued_audio_test_session(
         task_started,
         release_consumer,
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn listen_wanted_for_test(state: &AppState) -> bool {
+    state.captions.lock().await.listen_wanted
+}
+
+/// A live listen-only provider task on the tap (captions off, Orcle's listen
+/// intent wanted), for the stop-path tests outside this module.
+#[cfg(test)]
+pub(crate) async fn install_listen_only_test_task(state: &AppState) {
+    let mut receiver = install_tap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let task_stop = stop.clone();
+    let task = tokio::spawn(async move {
+        while !task_stop.load(Ordering::Acquire) {
+            match tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv()).await
+            {
+                Ok(None) => break,
+                Ok(Some(_)) | Err(_) => {}
+            }
+        }
+    });
+    let mut coordinator = state.captions.lock().await;
+    coordinator.task = Some(task);
+    coordinator.stop = Some(stop);
+    coordinator.listen_wanted = true;
+    coordinator.presentation = Some(Arc::new(AtomicBool::new(false)));
+}
+
+#[cfg(test)]
+pub(crate) async fn caption_task_alive_for_test(state: &AppState) -> bool {
+    coordinator_task_alive(&*state.captions.lock().await)
 }
 
 #[cfg(test)]
@@ -3235,12 +3314,59 @@ fn set_status(state: &AppState, coordinator: &mut CaptionsCoordinator, status: C
 }
 
 /// Fire-and-forget status update from inside the session task (which cannot
-/// hold the coordinator lock while the RPC handler might).
-async fn publish_status(state: &AppState, status: CaptionsStatus) {
-    let mut coordinator = state.captions.lock().await;
+/// hold the coordinator lock while the RPC handler might). The status is
+/// always remembered as the task's shadow; it reaches the renderer only while
+/// captions present (plan 068 D1).
+async fn publish_status(session: &CaptionSession, status: CaptionsStatus) {
+    let mut coordinator = session.state.captions.lock().await;
+    coordinator.shadow_status = Some(status.clone());
+    if !session.presenting() {
+        return;
+    }
     coordinator.status = Some(status.clone());
     drop(coordinator);
-    state.emit_event("captions.status", status);
+    session.state.emit_event("captions.status", status);
+}
+
+/// The listen epoch now (see `CaptionsCoordinator::listen_epoch`).
+pub(crate) async fn current_listen_epoch(state: &AppState) -> u64 {
+    state.captions.lock().await.listen_epoch
+}
+
+fn spawn_listening_publish(
+    state: &AppState,
+    listen_epoch: u64,
+    listening: crate::cohost::CohostListening,
+) {
+    // Never await the chat lifecycle fence on the caption task: capture
+    // finalization joins this task while holding that fence. The publish
+    // re-checks the epoch under the fence, so a state the task queued before
+    // a sign-out never overwrites the sign-out's `blocked`.
+    let state = state.clone();
+    tokio::spawn(async move {
+        crate::cohost::publish_listening_for_epoch(&state, listen_epoch, listening).await;
+    });
+}
+
+fn coordinator_task_alive(coordinator: &CaptionsCoordinator) -> bool {
+    coordinator
+        .task
+        .as_ref()
+        .is_some_and(|task| !task.is_finished())
+}
+
+fn coordinator_presenting(coordinator: &CaptionsCoordinator) -> bool {
+    coordinator
+        .presentation
+        .as_ref()
+        .is_some_and(|present| present.load(Ordering::Acquire))
+}
+
+/// A live task that Orcle's listen intent owns and captions do not present.
+fn listen_only_task_alive(coordinator: &CaptionsCoordinator) -> bool {
+    coordinator.listen_wanted
+        && coordinator_task_alive(coordinator)
+        && !coordinator_presenting(coordinator)
 }
 
 pub async fn start_captions(state: &AppState, language: Option<String>) -> Result<CaptionsStatus> {
@@ -3376,31 +3502,39 @@ async fn start_captions_with_bearer_for_session(
     };
     let capture_active =
         capture_elapsed_seconds.is_some() || caption_contract_idle_session_enabled();
-    let real_input_eligible = if let Some(recording) = expected_recording.as_ref() {
-        recording
-            .as_ref()
-            .and_then(|active| active.native_audio.as_ref())
-            .is_some_and(|audio| audio.caption_start_eligible())
+    let (real_input_eligible, mark_target) = if let Some(recording) = expected_recording.as_ref() {
+        caption_capture_facts(recording.as_ref())
     } else {
-        state
-            .recording
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|active| active.native_audio.as_ref())
-            .is_some_and(|audio| audio.caption_start_eligible())
+        caption_capture_facts(state.recording.lock().await.as_ref())
     };
 
     let mut coordinator = state.captions.lock().await;
     coordinator.desired_enabled = true;
     coordinator.language = language.clone();
+    let listen_task_alive = coordinator.listen_wanted && coordinator_task_alive(&coordinator);
     if !capture_active {
-        if let Some(task) = coordinator.task.take() {
-            task.abort();
+        if !listen_task_alive {
+            if let Some(task) = coordinator.task.take() {
+                task.abort();
+            }
+            coordinator.stop = None;
+            remove_tap();
         }
-        coordinator.stop = None;
-        remove_tap();
         let status = CaptionsStatus::ready();
+        set_status(state, &mut coordinator, status.clone());
+        return Ok(Some(status));
+    }
+    // A listen-only task already owns the tap and the timeline (plan 068 D1):
+    // captions join it in place. Same task, same sequence, same offsets; the
+    // renderer sees the transport state the task reached.
+    if listen_only_task_alive(&coordinator) {
+        if let Some(present) = coordinator.presentation.as_ref() {
+            present.store(true, Ordering::Release);
+        }
+        let status = coordinator
+            .shadow_status
+            .clone()
+            .unwrap_or_else(CaptionsStatus::ready);
         set_status(state, &mut coordinator, status.clone());
         return Ok(Some(status));
     }
@@ -3424,6 +3558,55 @@ async fn start_captions_with_bearer_for_session(
         block_captions_after_control(state, "captions-microphone-required", message.into()).await;
         anyhow::bail!(message);
     }
+    let status = spawn_transcription_task(
+        state,
+        &mut coordinator,
+        TranscriptionTaskStart {
+            bearer,
+            client,
+            language,
+            capture_elapsed_seconds: capture_elapsed_seconds.unwrap_or(0.0),
+            present: true,
+            mark_target,
+        },
+    );
+    set_status(state, &mut coordinator, status.clone());
+
+    Ok(Some(status))
+}
+
+/// What the caption start seams read off the capture slot: whether its
+/// microphone can feed the tap, and where a voice clip mark for it lands.
+fn caption_capture_facts(
+    active: Option<&crate::recording::ActiveRecording>,
+) -> (bool, Option<crate::clip_marks::MarkTarget>) {
+    let eligible = active
+        .and_then(|active| active.native_audio.as_ref())
+        .is_some_and(|audio| audio.caption_start_eligible());
+    let mark_target = active.map(|active| crate::clip_marks::MarkTarget {
+        session_id: active.session_id.clone(),
+        records_to_file: active.output_path.is_some(),
+    });
+    (eligible, mark_target)
+}
+
+struct TranscriptionTaskStart {
+    bearer: String,
+    client: VideorcApiClient,
+    language: Option<String>,
+    capture_elapsed_seconds: f64,
+    present: bool,
+    mark_target: Option<crate::clip_marks::MarkTarget>,
+}
+
+/// Install the tap and spawn the one provider task both intents share
+/// (plan 068 D1). Returns the Starting status; the caller decides whether it
+/// is presented. Any finished/stale task is replaced.
+fn spawn_transcription_task(
+    state: &AppState,
+    coordinator: &mut CaptionsCoordinator,
+    start: TranscriptionTaskStart,
+) -> CaptionsStatus {
     if let Some(task) = coordinator.task.take() {
         task.abort();
     }
@@ -3432,6 +3615,7 @@ async fn start_captions_with_bearer_for_session(
     let session_client_id = format!("captions-{}", uuid::Uuid::new_v4().simple());
     let sequence = coordinator.sequence.clone();
     let stop = Arc::new(AtomicBool::new(false));
+    let present = Arc::new(AtomicBool::new(start.present));
     let receiver = install_tap();
     let mut status = CaptionsStatus::active(
         CaptionsState::Starting,
@@ -3439,41 +3623,221 @@ async fn start_captions_with_bearer_for_session(
         &session_client_id,
     );
     status.message = Some("Connecting live captions…".to_string());
-    set_status(state, &mut coordinator, status.clone());
+    coordinator.shadow_status = Some(status.clone());
+    coordinator.presentation = Some(present.clone());
+    coordinator.listen_ready = false;
 
     let task_state = state.clone();
     let task_stop = stop.clone();
     coordinator.task = Some(tokio::spawn(run_caption_session(CaptionSession {
-        bearer,
-        client,
-        language,
+        bearer: start.bearer,
+        client: start.client,
+        language: start.language,
         receiver,
-        capture_elapsed_seconds: capture_elapsed_seconds.unwrap_or(0.0),
+        capture_elapsed_seconds: start.capture_elapsed_seconds,
         session_client_id,
         sequence,
         state: task_state,
         stop: task_stop,
+        present,
+        mark_target: start.mark_target,
     })));
     coordinator.stop = Some(stop);
+    status
+}
 
-    Ok(Some(status))
+/// Start Orcle's listen intent for a running Orcle session (plan 068 D2).
+/// Reuses the caption start gates but never fails or blocks capture, never
+/// raises a caption block, and never publishes a caption status: with no
+/// eligible microphone, bearer or capture it reports a listen block and
+/// returns quietly. The intent stays wanted so a later capture start resumes
+/// it (`resume_listen_for_capture`).
+pub async fn start_listen_for_cohost(
+    state: &AppState,
+    cohost_session_id: &str,
+) -> crate::cohost::CohostListening {
+    start_listen_with_bearer(
+        state,
+        cohost_session_id,
+        crate::account::stored_session_token,
+    )
+    .await
+}
+
+async fn start_listen_with_bearer(
+    state: &AppState,
+    cohost_session_id: &str,
+    resolve_bearer: impl FnOnce() -> Option<String> + Send,
+) -> crate::cohost::CohostListening {
+    use crate::cohost::CohostListening;
+    if state.process_shutdown_requested() {
+        return CohostListening::blocked("shutting-down", "Videorc is shutting down.");
+    }
+    let _control = CAPTION_CONTROL.lock().await;
+    if state.process_shutdown_requested() {
+        return CohostListening::blocked("shutting-down", "Videorc is shutting down.");
+    }
+    {
+        let coordinator = state.captions.lock().await;
+        if coordinator.privacy_teardown_in_progress || coordinator.privacy_teardown_failed {
+            return CohostListening::blocked(
+                "signing-out",
+                "Orcle can't listen while account sign-out cleans up private caption data.",
+            );
+        }
+    }
+    let capture_elapsed_seconds = crate::recording::active_capture_elapsed_seconds(state).await;
+    let capture_active =
+        capture_elapsed_seconds.is_some() || caption_contract_idle_session_enabled();
+    let (real_input_eligible, mark_target) =
+        caption_capture_facts(state.recording.lock().await.as_ref());
+
+    let mut coordinator = state.captions.lock().await;
+    coordinator.listen_wanted = true;
+    if coordinator_task_alive(&coordinator) {
+        // Captions (or an earlier listen) already run the task: join it.
+        let ready = coordinator.listen_ready
+            || coordinator
+                .shadow_status
+                .as_ref()
+                .is_some_and(|status| status.provider_ready);
+        return if ready {
+            CohostListening::on(None)
+        } else {
+            CohostListening::starting()
+        };
+    }
+    if !capture_active {
+        return CohostListening::blocked("no-capture", "Orcle hears you once a session is live.");
+    }
+    if !real_input_eligible && !caption_contract_idle_session_enabled() {
+        return CohostListening::blocked(
+            "no-microphone",
+            "Select a microphone so Orcle can hear you.",
+        );
+    }
+    // Credentials are read only once a session could actually listen.
+    let Some(bearer) = resolve_bearer() else {
+        return CohostListening::blocked("signed-out", "Sign in so Orcle can hear you.");
+    };
+    let client = match VideorcApiClient::new() {
+        Ok(client) => client,
+        Err(error) => {
+            return CohostListening::blocked(
+                "service-unavailable",
+                format!("Orcle can't reach the transcription service: {error}"),
+            );
+        }
+    };
+    let language = coordinator.language.clone();
+    spawn_transcription_task(
+        state,
+        &mut coordinator,
+        TranscriptionTaskStart {
+            bearer,
+            client,
+            language,
+            capture_elapsed_seconds: capture_elapsed_seconds.unwrap_or(0.0),
+            present: false,
+            mark_target,
+        },
+    );
+    tracing::info!(cohost_session_id, "Orcle listen intent started.");
+    CohostListening::starting()
+}
+
+/// Capture start seam: a listen intent that was wanted before capture (or
+/// blocked by no capture) starts now. Runs off the recording path and never
+/// delays it.
+pub async fn resume_listen_for_capture(state: &AppState) {
+    let wanted = {
+        let coordinator = state.captions.lock().await;
+        coordinator.listen_wanted && !coordinator_task_alive(&coordinator)
+    };
+    if !wanted {
+        return;
+    }
+    let Some(session_id) = crate::cohost::cohost_status(state).await.session_id else {
+        return;
+    };
+    let listening = start_listen_for_cohost(state, &session_id).await;
+    crate::cohost::publish_listening(state, listening).await;
+}
+
+/// How Orcle's listen intent ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenStop {
+    /// The user stopped Orcle, listening or chat: a listen-only task ends at
+    /// once and queued audio is never transcribed (a privacy boundary).
+    Abort,
+    /// The capture is ending and `finish_captions_for_capture` follows (the
+    /// recording monitor): only the intent clears. A listen-only task keeps
+    /// running until that seam closes the tap and drains its last chunks
+    /// into the SRT, Clip that and the transcript.
+    DrainWithCapture,
+    /// `session.stop`: drain with the capture when one is running, else abort.
+    DrainIfCapturing,
+}
+
+/// End Orcle's listen intent (plan 068 D1). Captions that present keep the
+/// task; a listen-only task ends at once like an explicit caption opt-out
+/// (queued audio is not transcribed after it). Never publishes a caption
+/// status.
+pub async fn stop_listen(state: &AppState) {
+    stop_listen_with(state, ListenStop::Abort).await;
+}
+
+pub async fn stop_listen_with(state: &AppState, how: ListenStop) {
+    let drain_with_capture = match how {
+        ListenStop::Abort => false,
+        ListenStop::DrainWithCapture => true,
+        ListenStop::DrainIfCapturing => crate::recording::active_capture_elapsed_seconds(state)
+            .await
+            .is_some(),
+    };
+    let _control = CAPTION_CONTROL.lock().await;
+    let end_task = {
+        let mut coordinator = state.captions.lock().await;
+        coordinator.listen_wanted = false;
+        // A listening state the task decided to publish before the intent
+        // ended never lands after it.
+        coordinator.listen_epoch = coordinator.listen_epoch.saturating_add(1);
+        !drain_with_capture
+            && coordinator_task_alive(&coordinator)
+            && !coordinator_presenting(&coordinator)
+    };
+    if end_task {
+        finish_caption_task(state, true, false).await;
+    }
 }
 
 pub async fn stop_captions(state: &AppState) -> CaptionsStatus {
     let _control = CAPTION_CONTROL.lock().await;
-    {
+    let keep_listen_task = {
         let mut coordinator = state.captions.lock().await;
         advance_caption_start_intent(&mut coordinator);
+        coordinator.listen_wanted && coordinator_task_alive(&coordinator)
+    };
+    if !keep_listen_task {
+        // Explicit opt-out is a privacy boundary: do not transcribe audio
+        // already queued behind the user's click. Graceful draining is
+        // reserved for the capture-finalization path below so its last
+        // settled cue can reach SRT.
+        finish_caption_task(state, false, false).await;
     }
-    // Explicit opt-out is a privacy boundary: do not transcribe audio already
-    // queued behind the user's click. Graceful draining is reserved for the
-    // capture-finalization path below so its last settled cue can reach SRT.
-    finish_caption_task(state, false, false).await;
     let status = {
         let mut coordinator = state.captions.lock().await;
         coordinator.desired_enabled = false;
         coordinator.language = None;
-        remove_tap();
+        if keep_listen_task {
+            // Orcle still listens (plan 068 D1): presentation goes off, the
+            // task and tap stay. Nothing captions showed survives this click.
+            if let Some(present) = coordinator.presentation.as_ref() {
+                present.store(false, Ordering::Release);
+            }
+        } else {
+            remove_tap();
+        }
         let status = CaptionsStatus::idle();
         coordinator.status = Some(status.clone());
         status
@@ -3508,6 +3872,12 @@ pub async fn stop_captions_for_sign_out(
         coordinator.privacy_teardown_failed = false;
         coordinator.privacy_teardown_in_progress = true;
         coordinator.desired_enabled = false;
+        coordinator.listen_wanted = false;
+        coordinator.listen_ready = false;
+        // A listening publish queued before this line never lands after it.
+        coordinator.listen_epoch = coordinator.listen_epoch.saturating_add(1);
+        coordinator.presentation = None;
+        coordinator.shadow_status = None;
         coordinator.language = None;
         coordinator.chunks.clear();
         coordinator.capture_epoch = coordinator.capture_epoch.saturating_add(1);
@@ -3547,6 +3917,10 @@ pub async fn stop_captions_for_sign_out(
         coordinator.chunks.clear();
         coordinator.finalized_style = None;
     }
+    // Orcle's copy of what was said goes with the transcript, before the
+    // credentials do: nothing heard under this account can ride the next
+    // tick under another, and Orcle stops claiming it listens.
+    crate::cohost::purge_speech_for_sign_out(state).await;
     // Any SRT writer which crossed the old generation must finish publication
     // or remove its identity-bound staging/output before credentials can be
     // cleared. This wait owns no general caption-control/coordinator lock.
@@ -3725,6 +4099,9 @@ async fn finish_caption_task(
         if !preserve_desired {
             coordinator.desired_enabled = false;
         }
+        coordinator.presentation = None;
+        coordinator.shadow_status = None;
+        coordinator.listen_ready = false;
         (coordinator.task.take(), coordinator.stop.take())
     };
     finish_taken_caption_task(task, stop, drain_final_transcript).await
@@ -3785,8 +4162,20 @@ async fn block_captions_after_control(state: &AppState, reason_code: &str, messa
         advance_caption_start_intent(&mut coordinator);
     }
     // A block is terminal for this runtime. Discard pending PCM just like an
-    // explicit opt-out; only a normal capture end may drain final audio.
-    finish_caption_task(state, true, false).await;
+    // explicit opt-out; only a normal capture end may drain final audio. A
+    // task Orcle's listen intent still wants keeps running unpresented.
+    let keep_listen_task = {
+        let coordinator = state.captions.lock().await;
+        coordinator.listen_wanted && coordinator_task_alive(&coordinator)
+    };
+    if keep_listen_task {
+        let coordinator = state.captions.lock().await;
+        if let Some(present) = coordinator.presentation.as_ref() {
+            present.store(false, Ordering::Release);
+        }
+    } else {
+        finish_caption_task(state, true, false).await;
+    }
     let status = {
         let mut coordinator = state.captions.lock().await;
         coordinator.desired_enabled = true;
@@ -3830,6 +4219,49 @@ struct CaptionSession {
     sequence: CaptionSequence,
     state: AppState,
     stop: Arc<AtomicBool>,
+    /// Captions are presenting (plan 068 D1). Flipped by `captions.start` /
+    /// `captions.stop` while the task keeps running for the listen intent.
+    present: Arc<AtomicBool>,
+    /// The capture this task transcribes, read when the task started: a voice
+    /// clip mark lands on it even while the capture-end drain runs after the
+    /// recording slot was retired.
+    mark_target: Option<crate::clip_marks::MarkTarget>,
+}
+
+impl CaptionSession {
+    fn presenting(&self) -> bool {
+        self.present.load(Ordering::Acquire)
+    }
+
+    /// Mark the task ready to listen, and report `listening` (an `on`, with
+    /// the listen allowance when a listen-metered answer carried it) to Orcle
+    /// when the listen intent is wanted.
+    async fn note_listen_ready(&self, listening: crate::cohost::CohostListening) {
+        let (wanted, epoch) = {
+            let mut coordinator = self.state.captions.lock().await;
+            coordinator.listen_ready = true;
+            (coordinator.listen_wanted, coordinator.listen_epoch)
+        };
+        if wanted {
+            spawn_listening_publish(&self.state, epoch, listening);
+        }
+    }
+
+    /// Caption health events are presentation: listen-only stays silent.
+    fn emit_health(&self, level: crate::protocol::HealthLevel, code: &str, message: &str) {
+        if !self.presenting() {
+            return;
+        }
+        let _ = crate::recording::emit_health_event(&self.state, None, level, code, message);
+    }
+
+    fn chunk_purpose(&self) -> crate::videorc_api::CaptionChunkPurpose {
+        if self.presenting() {
+            crate::videorc_api::CaptionChunkPurpose::Captions
+        } else {
+            crate::videorc_api::CaptionChunkPurpose::Listen
+        }
+    }
 }
 
 /// Session-wide caption sequence shared by every provider transport.
@@ -4215,6 +4647,41 @@ fn classify_realtime_close(code: u16, reason: &str) -> RealtimeTransportFailure 
     }
 }
 
+/// One RMS window of the silence gate (plan 068 D4): 50 ms at 16 kHz.
+const SPEECH_WINDOW_SAMPLES: usize = CAPTION_SAMPLE_RATE as usize / 20;
+/// -45 dBFS as a linear full-scale ratio.
+const SPEECH_RMS_FLOOR: f64 = 0.005_623_413_251_903_491;
+
+fn window_rms(samples: &[i16]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mean_square = samples
+        .iter()
+        .map(|sample| {
+            let normalized = f64::from(*sample) / f64::from(i16::MAX);
+            normalized * normalized
+        })
+        .sum::<f64>()
+        / samples.len() as f64;
+    mean_square.sqrt()
+}
+
+/// Silence gate for one transcription chunk (plan 068 D4): `false` only when
+/// every 50 ms window's RMS sits below -45 dBFS. A trailing partial window
+/// counts. Empty input is silence.
+pub fn chunk_has_speech(samples: &[i16]) -> bool {
+    samples
+        .chunks(SPEECH_WINDOW_SAMPLES)
+        .any(|window| window_rms(window) >= SPEECH_RMS_FLOOR)
+}
+
+/// Voice activity for one received frame (plan 068 D9): the same gate as the
+/// chunk silence skip, on the frame the caption task already holds.
+pub(crate) fn pcm_has_voice(samples: &[i16]) -> bool {
+    chunk_has_speech(samples)
+}
+
 fn pcm_has_speech_energy(samples: &[i16]) -> bool {
     if samples.is_empty() {
         return false;
@@ -4237,15 +4704,38 @@ async fn run_caption_session(mut session: CaptionSession) {
     let sequence = session.sequence.clone();
     let mut timeline = CaptionTimeline::new(session.capture_elapsed_seconds);
     let mut audio_heartbeat = CaptionAudioHeartbeat::new(std::time::Instant::now());
-    let ended_normally = match run_realtime_caption_session(
-        &mut session,
-        &sequence,
-        &mut timeline,
-        &mut audio_heartbeat,
-    )
-    .await
-    {
+    // Orcle's listen intent never uses the realtime socket (plan 068 D5): its
+    // token route is caption-gated, so a caption quota or the captions switch
+    // would end listening. A listen-only task goes straight to the metered
+    // chunk path and stays there, even if captions join it later.
+    let realtime = if session.presenting() {
+        run_realtime_caption_session(&mut session, &sequence, &mut timeline, &mut audio_heartbeat)
+            .await
+    } else {
+        RealtimeOutcome::ListenOnly
+    };
+    let ended_normally = match realtime {
         RealtimeOutcome::Ended => true,
+        RealtimeOutcome::ListenOnly => {
+            tracing::info!("Orcle listens through chunked transcription.");
+            let mut status = CaptionsStatus::active(
+                CaptionsState::Degraded,
+                CaptionsTransport::Chunked,
+                &session.session_client_id,
+            );
+            status.reason_code = Some("realtime-fallback".to_string());
+            status.message = Some("Captions on with higher delay.".to_string());
+            // Presentation is off: this is the shadow a later captions start
+            // adopts, never a caption status the renderer sees now.
+            publish_status(&session, status).await;
+            run_chunked_caption_session(
+                &mut session,
+                &sequence,
+                &mut timeline,
+                &mut audio_heartbeat,
+            )
+            .await
+        }
         RealtimeOutcome::Fallback(reason) => {
             tracing::info!(
                 "Streaming captions unavailable ({reason}); using chunked transcription."
@@ -4257,7 +4747,7 @@ async fn run_caption_session(mut session: CaptionSession) {
             );
             status.reason_code = Some("realtime-fallback".to_string());
             status.message = Some(format!("Captions on with higher delay: {reason}"));
-            publish_status(&session.state, status).await;
+            publish_status(&session, status).await;
             run_chunked_caption_session(
                 &mut session,
                 &sequence,
@@ -4270,16 +4760,37 @@ async fn run_caption_session(mut session: CaptionSession) {
     };
     if ended_normally {
         remove_tap();
-        let desired_enabled = session.state.captions.lock().await.desired_enabled;
-        publish_status(
-            &session.state,
-            if desired_enabled {
+        let (desired_enabled, listen_wanted, listen_epoch) = {
+            let coordinator = session.state.captions.lock().await;
+            (
+                coordinator.desired_enabled,
+                coordinator.listen_wanted,
+                coordinator.listen_epoch,
+            )
+        };
+        if listen_wanted {
+            spawn_listening_publish(
+                &session.state,
+                listen_epoch,
+                crate::cohost::CohostListening::blocked(
+                    "no-capture",
+                    "Orcle hears you while a session is live.",
+                ),
+            );
+        }
+        // A listen-only end is silent: the renderer never saw a caption
+        // session, so it gets no caption boundary here.
+        if desired_enabled || session.presenting() {
+            let status = if desired_enabled {
                 CaptionsStatus::ready()
             } else {
                 CaptionsStatus::idle()
-            },
-        )
-        .await;
+            };
+            let mut coordinator = session.state.captions.lock().await;
+            coordinator.status = Some(status.clone());
+            drop(coordinator);
+            session.state.emit_event("captions.status", status);
+        }
     }
 }
 
@@ -4288,6 +4799,8 @@ enum RealtimeOutcome {
     Ended,
     /// Streaming can't run (no key, mint failed, socket rejected) — chunk instead.
     Fallback(String),
+    /// A listen-only task never tries streaming: chunk from the start.
+    ListenOnly,
     /// Auth/premium/quota failure already published; end the session.
     Terminal,
 }
@@ -4337,9 +4850,17 @@ async fn run_realtime_caption_session(
             Ok(token) => token,
             Err(CaptionChunkFailure::Terminal { code, message }) => {
                 tracing::warn!("Live captions stopped ({code}): {message}");
-                remove_tap();
-                publish_blocked_status(session, &code, &message, CaptionsTransport::Realtime).await;
-                return RealtimeOutcome::Terminal;
+                return realtime_terminal_outcome(
+                    handle_terminal_failure(
+                        session,
+                        &code,
+                        &message,
+                        CaptionsTransport::Realtime,
+                        TerminalOrigin::RealtimeMint,
+                    )
+                    .await,
+                    &message,
+                );
             }
             Err(CaptionChunkFailure::Transient { code, message }) => {
                 if let Some(code) = code.as_deref() {
@@ -4406,9 +4927,7 @@ async fn run_realtime_caption_session(
 
         if reconnecting {
             reconnecting = false;
-            let _ = crate::recording::emit_health_event(
-                &session.state,
-                None,
+            session.emit_health(
                 crate::protocol::HealthLevel::Info,
                 "captions-upload-recovered",
                 "Streaming captions reconnected.",
@@ -4524,6 +5043,12 @@ async fn run_realtime_caption_session(
                     if mono.is_empty() {
                         continue;
                     }
+                    crate::cohost::note_voice_frame(
+                        &session.state,
+                        &frame.samples,
+                        &mono,
+                        std::time::Instant::now(),
+                    );
                     if provider_ready
                         && speech_watchdog_since.is_none()
                         && pcm_has_speech_energy(&mono)
@@ -4582,15 +5107,16 @@ async fn run_realtime_caption_session(
                             .map(|frame| classify_realtime_close(u16::from(frame.code), &frame.reason))
                             .unwrap_or_else(|| classify_realtime_close(1006, "socket ended without a close frame"));
                         if failure.kind == RealtimeFailureKind::Terminal {
-                            publish_blocked_status(
+                            let outcome = handle_terminal_failure(
                                 session,
                                 &failure.code,
                                 &failure.message,
                                 CaptionsTransport::Realtime,
+                                TerminalOrigin::RealtimeSocket,
                             )
                             .await;
                             report_usage(session, &mut unreported_ms).await;
-                            return RealtimeOutcome::Terminal;
+                            return realtime_terminal_outcome(outcome, &failure.message);
                         }
                         if retry_budget.retry_delay().is_none() {
                             report_usage(session, &mut unreported_ms).await;
@@ -4626,24 +5152,23 @@ async fn run_realtime_caption_session(
                         }
                         RealtimeCaptionEvent::Error(failure) => {
                             if failure.kind == RealtimeFailureKind::Terminal {
-                                publish_blocked_status(
+                                let outcome = handle_terminal_failure(
                                     session,
                                     &failure.code,
                                     &failure.message,
                                     CaptionsTransport::Realtime,
+                                    TerminalOrigin::RealtimeSocket,
                                 )
                                 .await;
                                 report_usage(session, &mut unreported_ms).await;
-                                return RealtimeOutcome::Terminal;
+                                return realtime_terminal_outcome(outcome, &failure.message);
                             }
                             report_usage(session, &mut unreported_ms).await;
                             return RealtimeOutcome::Fallback(failure.message.clone());
                         }
                         RealtimeCaptionEvent::AssistantResponse => {
                             let message = "Realtime caption model generated an assistant response; switching to transcription-only fallback.";
-                            let _ = crate::recording::emit_health_event(
-                                &session.state,
-                                None,
+                            session.emit_health(
                                 crate::protocol::HealthLevel::Warn,
                                 "captions-assistant-response-generated",
                                 message,
@@ -4723,9 +5248,7 @@ async fn run_realtime_caption_session(
                         .is_some_and(|started| started.elapsed() >= TRANSCRIPT_WATCHDOG_TIMEOUT)
                     {
                         let message = "speech reached the realtime socket but no transcript arrived";
-                        let _ = crate::recording::emit_health_event(
-                            &session.state,
-                            None,
+                        session.emit_health(
                             crate::protocol::HealthLevel::Warn,
                             "captions-transcript-watchdog",
                             "Realtime captions detected speech without a transcript; switching to chunked fallback.",
@@ -4745,9 +5268,7 @@ async fn signal_reconnecting(session: &CaptionSession, reconnecting: &mut bool, 
     }
     *reconnecting = true;
     tracing::warn!("Streaming captions reconnecting: {message}");
-    let _ = crate::recording::emit_health_event(
-        &session.state,
-        None,
+    session.emit_health(
         crate::protocol::HealthLevel::Warn,
         "captions-upload-failed",
         &format!("Streaming captions interrupted; reconnecting. {message}"),
@@ -4759,15 +5280,18 @@ async fn signal_reconnecting(session: &CaptionSession, reconnecting: &mut bool, 
     );
     status.reason_code = Some("realtime-reconnecting".to_string());
     status.message = Some(format!("Captions reconnecting: {message}"));
-    publish_status(&session.state, status).await;
+    publish_status(session, status).await;
 }
 
 async fn caption_session_expects_audio(session: &CaptionSession) -> bool {
     if session.stop.load(Ordering::Acquire) {
         return false;
     }
-    let desired_enabled = session.state.captions.lock().await.desired_enabled;
-    if !desired_enabled {
+    let wanted = {
+        let coordinator = session.state.captions.lock().await;
+        coordinator.desired_enabled || coordinator.listen_wanted
+    };
+    if !wanted {
         return false;
     }
     if caption_contract_idle_session_enabled() {
@@ -4785,7 +5309,166 @@ async fn publish_caption_audio_failure(
     transport: CaptionsTransport,
     failure: CaptionAudioPathFailure,
 ) {
-    publish_blocked_status(session, failure.reason_code(), failure.message(), transport).await;
+    handle_terminal_failure(
+        session,
+        failure.reason_code(),
+        failure.message(),
+        transport,
+        TerminalOrigin::AudioPath,
+    )
+    .await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalOutcome {
+    /// The provider task ends now.
+    EndTask,
+    /// One intent ended and the other keeps this task: captions keep
+    /// presenting after a listen block, or Orcle keeps listening (metered as
+    /// listen from the next chunk) after a caption block.
+    Continue,
+}
+
+/// Where a terminal failure came from: it decides which intent it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalOrigin {
+    /// A chunk upload metered with this purpose.
+    Upload(crate::videorc_api::CaptionChunkPurpose),
+    /// The realtime token route, which checks caption access.
+    RealtimeMint,
+    /// The realtime socket or its provider: a transport only captions use.
+    RealtimeSocket,
+    /// The microphone path itself.
+    AudioPath,
+}
+
+/// Which intent a terminal failure ends (plan 068 D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalScope {
+    Listen,
+    Captions,
+    Both,
+}
+
+/// Pure: listen codes end listening only; a caption allowance or captions
+/// switch answer to a caption-metered request, and any realtime transport
+/// failure, end captions only; everything else (sign-in, Premium, the account
+/// blocklist, server configuration, a lost microphone, and any code a listen
+/// chunk got) ends both. The web answers `ai-disabled` for the global switch
+/// too: then the first listen chunk after it gets the same code and ends the
+/// task.
+fn terminal_failure_scope(code: &str, origin: TerminalOrigin) -> TerminalScope {
+    use crate::videorc_api::CaptionChunkPurpose;
+    if crate::videorc_api::is_listen_block_code(code) {
+        return TerminalScope::Listen;
+    }
+    match origin {
+        TerminalOrigin::Upload(CaptionChunkPurpose::Captions) | TerminalOrigin::RealtimeMint
+            if crate::videorc_api::is_caption_scoped_code(code) =>
+        {
+            TerminalScope::Captions
+        }
+        TerminalOrigin::RealtimeSocket => TerminalScope::Captions,
+        _ => TerminalScope::Both,
+    }
+}
+
+/// A realtime terminal failure: end the task, or keep listening on chunks.
+fn realtime_terminal_outcome(outcome: TerminalOutcome, message: &str) -> RealtimeOutcome {
+    match outcome {
+        TerminalOutcome::EndTask => RealtimeOutcome::Terminal,
+        TerminalOutcome::Continue => RealtimeOutcome::Fallback(message.to_string()),
+    }
+}
+
+/// A terminal provider failure (plan 068 D5). A listen-scoped code ends only
+/// Orcle's listen intent: presenting captions continue, a listen-only task
+/// ends quietly. A caption-scoped code while Orcle listens ends only
+/// presentation: the caption block is published as it always was and the
+/// task keeps transcribing for Orcle. Every other terminal failure ends the
+/// task, blocks the listen intent when it was wanted, and presents a caption
+/// block only while captions present.
+async fn handle_terminal_failure(
+    session: &CaptionSession,
+    code: &str,
+    message: &str,
+    transport: CaptionsTransport,
+    origin: TerminalOrigin,
+) -> TerminalOutcome {
+    let scope = terminal_failure_scope(code, origin);
+    let (listen_wanted, listen_epoch) = {
+        let mut coordinator = session.state.captions.lock().await;
+        let wanted = coordinator.listen_wanted;
+        if scope == TerminalScope::Listen {
+            coordinator.listen_wanted = false;
+        }
+        (wanted, coordinator.listen_epoch)
+    };
+    let block_listening = || {
+        spawn_listening_publish(
+            &session.state,
+            listen_epoch,
+            crate::cohost::CohostListening::blocked(code, message),
+        );
+    };
+    match scope {
+        TerminalScope::Listen => {
+            if listen_wanted {
+                block_listening();
+            }
+            if session.presenting() {
+                tracing::warn!(
+                    "Orcle stopped listening ({code}); live captions continue: {message}"
+                );
+                return TerminalOutcome::Continue;
+            }
+            remove_tap();
+            TerminalOutcome::EndTask
+        }
+        TerminalScope::Captions if listen_wanted => {
+            tracing::warn!("Live captions stopped ({code}); Orcle keeps listening: {message}");
+            publish_caption_block_keeping_task(session, code, message, transport).await;
+            TerminalOutcome::Continue
+        }
+        TerminalScope::Captions | TerminalScope::Both => {
+            if listen_wanted {
+                block_listening();
+            }
+            if session.presenting() {
+                publish_blocked_status(session, code, message, transport).await;
+            } else {
+                remove_tap();
+            }
+            TerminalOutcome::EndTask
+        }
+    }
+}
+
+/// Captions stop presenting with their block, while the task and tap stay
+/// for Orcle. The flip and the status share the coordinator lock, so a
+/// `captions.stop` racing it orders strictly before or after.
+async fn publish_caption_block_keeping_task(
+    session: &CaptionSession,
+    reason_code: &str,
+    message: &str,
+    transport: CaptionsTransport,
+) {
+    {
+        let mut coordinator = session.state.captions.lock().await;
+        if !session.present.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut status = CaptionsStatus::active(
+            CaptionsState::Blocked,
+            transport,
+            &session.session_client_id,
+        );
+        status.reason_code = Some(reason_code.to_string());
+        status.message = Some(message.to_string());
+        coordinator.status = Some(status.clone());
+        session.state.emit_event("captions.status", status);
+    }
+    clear_caption_presentation(&session.state, "blocked");
 }
 
 async fn publish_listening_if_ready(
@@ -4806,7 +5489,11 @@ async fn publish_listening_if_ready(
     );
     status.provider_ready = true;
     status.remaining_seconds = remaining_seconds;
-    publish_status(&session.state, status).await;
+    publish_status(session, status).await;
+    // The realtime allowance is the caption one: Orcle's stays unknown.
+    session
+        .note_listen_ready(crate::cohost::CohostListening::on(None))
+        .await;
 }
 
 async fn publish_blocked_status(
@@ -4889,6 +5576,9 @@ async fn handle_realtime_event(
             let Some(&(item_seq, _)) = items.get(&item_id) else {
                 return;
             };
+            if !session.presenting() {
+                return;
+            }
             session.state.emit_event(
                 "captions.update",
                 CaptionsUpdate {
@@ -4910,20 +5600,38 @@ async fn handle_realtime_event(
                 return;
             };
             let end = timeline.cue_end_seconds(offset);
-            let inserted = {
+            let duration_seconds = (end - offset).clamp(0.5, 30.0);
+            let update = CaptionsUpdate {
+                session_client_id: session.session_client_id.clone(),
+                seq: item_seq,
+                kind: CaptionUpdateKind::Final,
+                text: transcript.clone(),
+                chunk_seconds: (end - offset).ceil() as u64,
+                remaining_seconds: None,
+            };
+            let (inserted, presented) = {
                 let mut coordinator = session.state.captions.lock().await;
-                upsert_caption_record(
+                // Presentation is read under the coordinator lock that
+                // `captions.stop` flips it under: a final never lands after
+                // the caption boundary that cleared the bar.
+                let presented = session.presenting();
+                let inserted = upsert_caption_record(
                     &mut coordinator.chunks,
                     CaptionChunkRecord {
                         seq: item_seq,
                         offset_seconds: offset,
-                        duration_seconds: (end - offset).clamp(0.5, 30.0),
+                        duration_seconds,
                         text: transcript.clone(),
                         segments: Vec::new(),
                         capture_epoch: timeline.capture_epoch,
                         provider_item_id: Some(item_id.clone()),
+                        presented,
                     },
-                )
+                );
+                if presented {
+                    session.state.emit_event("captions.update", update.clone());
+                }
+                (inserted, presented)
             };
             if !inserted {
                 tracing::debug!(
@@ -4931,18 +5639,21 @@ async fn handle_realtime_event(
                     "Coalesced a repeated realtime caption completion."
                 );
             }
-            let update = CaptionsUpdate {
-                session_client_id: session.session_client_id.clone(),
-                seq: item_seq,
-                kind: CaptionUpdateKind::Final,
-                text: transcript,
-                chunk_seconds: (end - offset).ceil() as u64,
-                remaining_seconds: None,
-            };
-            session.state.emit_event("captions.update", update.clone());
-            // Orcle's spotlight lane reads finals only (plan 060 S3): a
+            // Orcle hears every final in both intents (plan 068 S3): a
             // lock-append-return on the coordinator's task, after the emit.
-            crate::cohost::note_caption_final(&session.state, &update);
+            crate::cohost::note_transcript_final(
+                &session.state,
+                &update,
+                crate::cohost::RecentSpeechFinal {
+                    at: std::time::Instant::now(),
+                    offset_seconds: offset,
+                    duration_seconds,
+                    text: transcript,
+                    segments: Vec::new(),
+                    presented,
+                    mark_target: session.mark_target.clone(),
+                },
+            );
         }
         RealtimeCaptionEvent::ConfigurationAcknowledged
         | RealtimeCaptionEvent::Error(_)
@@ -5121,12 +5832,65 @@ impl CaptionChunkBuffer {
     }
 }
 
+/// The chunk, the purpose it was metered with, and the service's answer.
 type CaptionChunkUploadResult = (
     BufferedCaptionChunk,
+    crate::videorc_api::CaptionChunkPurpose,
     std::result::Result<CaptionChunkResponse, CaptionChunkFailure>,
 );
 type CaptionChunkUploadFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = CaptionChunkUploadResult> + Send>>;
+
+/// Orcle's listening state as one chunked task reports it: `on` once the task
+/// is ready (a successful upload, or a silent chunk skipped after the tap
+/// delivered frames), then the listen allowance from listen-metered answers,
+/// published at most once per `LISTEN_REMAINING_REFRESH`. Pure.
+#[derive(Debug, Default)]
+struct ListenReadiness {
+    ready: bool,
+    last_remaining_at: Option<std::time::Instant>,
+}
+
+/// How often the listen allowance may change Orcle's published state.
+const LISTEN_REMAINING_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl ListenReadiness {
+    /// A silent chunk was skipped. Ready only once the tap has delivered
+    /// frames, so a dead microphone path never reads as listening. `Some` is
+    /// the state to report.
+    fn silent_chunk_skipped(
+        &mut self,
+        frames_seen: bool,
+    ) -> Option<crate::cohost::CohostListening> {
+        if self.ready || !frames_seen {
+            return None;
+        }
+        self.ready = true;
+        Some(crate::cohost::CohostListening::on(None))
+    }
+
+    /// An upload succeeded. `listen_remaining` is the allowance when the chunk
+    /// was metered as listen (a captions answer carries the caption one).
+    fn upload_succeeded(
+        &mut self,
+        listen_remaining: Option<u64>,
+        now: std::time::Instant,
+    ) -> Option<crate::cohost::CohostListening> {
+        let first = !self.ready;
+        self.ready = true;
+        let Some(remaining) = listen_remaining else {
+            return first.then(|| crate::cohost::CohostListening::on(None));
+        };
+        let due = self
+            .last_remaining_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= LISTEN_REMAINING_REFRESH);
+        if !first && !due {
+            return None;
+        }
+        self.last_remaining_at = Some(now);
+        Some(crate::cohost::CohostListening::on(Some(remaining)))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptionChunkTransientAction {
@@ -5188,13 +5952,86 @@ fn begin_caption_chunk_upload(
     let bearer = session.bearer.clone();
     let session_client_id = session.session_client_id.clone();
     let language = session.language.clone();
+    // Captions win while they present: one upload, one charge (plan 068 D5).
+    let purpose = session.chunk_purpose();
     let wav = encode_wav_16k_mono(&chunk.samples);
     Box::pin(async move {
         let result = client
-            .transcribe_caption_chunk(&bearer, &session_client_id, wav, language.as_deref())
+            .transcribe_caption_chunk(
+                &bearer,
+                &session_client_id,
+                wav,
+                language.as_deref(),
+                purpose,
+            )
             .await;
-        (chunk, result)
+        (chunk, purpose, result)
     })
+}
+
+/// Keep one chunk's transcript and hand it to captions (while they present)
+/// and to Orcle. Presentation is read under the coordinator lock, the lock
+/// `captions.stop` flips it under, and the update is emitted there: a caption
+/// turned off while its upload was in flight never shows after the clear.
+async fn commit_chunk_transcript(
+    session: &CaptionSession,
+    chunk: &BufferedCaptionChunk,
+    caption_metered: bool,
+    response: &CaptionChunkResponse,
+) {
+    let text = response.text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let update = CaptionsUpdate {
+        session_client_id: session.session_client_id.clone(),
+        seq: chunk.seq,
+        kind: CaptionUpdateKind::Final,
+        text: text.to_string(),
+        chunk_seconds: response.chunk_seconds,
+        remaining_seconds: caption_metered.then_some(response.remaining_seconds),
+    };
+    let (current_epoch, presented) = {
+        let mut coordinator = session.state.captions.lock().await;
+        let presented = session.presenting();
+        coordinator.chunks.push(CaptionChunkRecord {
+            seq: chunk.seq,
+            offset_seconds: chunk.offset_seconds,
+            duration_seconds: chunk.duration_seconds,
+            text: text.to_string(),
+            segments: response.segments.clone(),
+            capture_epoch: chunk.capture_epoch,
+            provider_item_id: None,
+            presented,
+        });
+        let current_epoch = coordinator.capture_epoch;
+        if presented && chunk.capture_epoch == current_epoch {
+            session.state.emit_event("captions.update", update.clone());
+        }
+        (current_epoch, presented)
+    };
+    if chunk.capture_epoch != current_epoch {
+        tracing::info!(
+            "Suppressed a caption update from a previous recording (epoch {} < {}).",
+            chunk.capture_epoch,
+            current_epoch,
+        );
+        return;
+    }
+    // Same tap as the realtime final (plan 068 S3).
+    crate::cohost::note_transcript_final(
+        &session.state,
+        &update,
+        crate::cohost::RecentSpeechFinal {
+            at: std::time::Instant::now(),
+            offset_seconds: chunk.offset_seconds,
+            duration_seconds: chunk.duration_seconds,
+            text: text.to_string(),
+            segments: response.segments.clone(),
+            presented,
+            mark_target: session.mark_target.clone(),
+        },
+    );
 }
 
 async fn await_caption_chunk_upload(
@@ -5225,6 +6062,7 @@ async fn run_chunked_caption_session(
     let mut next_upload_allowed_at = tokio::time::Instant::now();
     let mut degraded_reason: Option<String> = None;
     let mut provider_confirmed = false;
+    let mut listen_readiness = ListenReadiness::default();
     let mut last_reported_tap_drops = TAP_FRAMES_DROPPED.load(Ordering::Relaxed);
     let mut heartbeat_tick = tokio::time::interval(std::time::Duration::from_millis(250));
     heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -5238,10 +6076,23 @@ async fn run_chunked_caption_session(
             return false;
         }
 
-        if in_flight.is_none()
-            && tokio::time::Instant::now() >= next_upload_allowed_at
-            && let Some(chunk) = buffer.pop_front()
-        {
+        while in_flight.is_none() && tokio::time::Instant::now() >= next_upload_allowed_at {
+            let Some(chunk) = buffer.pop_front() else {
+                break;
+            };
+            // Silence is never uploaded or metered (plan 068 D4). The chunk
+            // was stamped before this point, so the timeline stays exact.
+            if !chunk_has_speech(&chunk.samples) {
+                tracing::trace!(seq = chunk.seq, "Skipped a silent transcription chunk.");
+                // Quiet is not "still starting": a skipped chunk after real
+                // frames proves the path, so Orcle reads as listening.
+                if let Some(listening) =
+                    listen_readiness.silent_chunk_skipped(audio_heartbeat.has_seen_frame())
+                {
+                    session.note_listen_ready(listening).await;
+                }
+                continue;
+            }
             in_flight = Some(begin_caption_chunk_upload(session, chunk));
         }
         if !receiver_open && in_flight.is_none() && buffer.is_empty() {
@@ -5296,12 +6147,19 @@ async fn run_chunked_caption_session(
                     capture_epoch = coordinator.capture_epoch;
                 }
                 last_frame_timestamp = Some(frame.timestamp_micros);
+                let mono = downmix_resample_to_16k_mono(
+                    &frame.samples,
+                    frame.channels,
+                    frame.sample_rate,
+                );
+                crate::cohost::note_voice_frame(
+                    &session.state,
+                    &frame.samples,
+                    &mono,
+                    std::time::Instant::now(),
+                );
                 let dropped_seconds = buffer.push_samples(
-                    downmix_resample_to_16k_mono(
-                        &frame.samples,
-                        frame.channels,
-                        frame.sample_rate,
-                    ),
+                    mono,
                     capture_epoch,
                     sequence,
                     timeline,
@@ -5316,15 +6174,14 @@ async fn run_chunked_caption_session(
                     .await;
                 }
             }
-            (chunk, result) = await_caption_chunk_upload(&mut in_flight) => {
+            (chunk, purpose, result) = await_caption_chunk_upload(&mut in_flight) => {
                 in_flight = None;
+                let caption_metered = purpose == crate::videorc_api::CaptionChunkPurpose::Captions;
                 match result {
                     Ok(response) => {
                         let recovered = degraded_reason.take().is_some();
                         if recovered {
-                            let _ = crate::recording::emit_health_event(
-                                &session.state,
-                                None,
+                            session.emit_health(
                                 crate::protocol::HealthLevel::Info,
                                 "captions-upload-recovered",
                                 "Caption uploads recovered; live captions resumed.",
@@ -5340,56 +6197,52 @@ async fn run_chunked_caption_session(
                             status.provider_ready = true;
                             status.reason_code = Some("realtime-fallback".to_string());
                             status.message = Some("Captions on with higher delay.".to_string());
-                            status.remaining_seconds = Some(response.remaining_seconds);
-                            publish_status(&session.state, status).await;
+                            // A listen-metered answer carries Orcle's allowance,
+                            // never the caption one.
+                            status.remaining_seconds =
+                                caption_metered.then_some(response.remaining_seconds);
+                            publish_status(session, status).await;
+                        }
+                        let listen_remaining =
+                            (!caption_metered).then_some(response.remaining_seconds);
+                        if let Some(listening) = listen_readiness
+                            .upload_succeeded(listen_remaining, std::time::Instant::now())
+                        {
+                            session.note_listen_ready(listening).await;
                         }
                         backoff = None;
                         next_upload_allowed_at = tokio::time::Instant::now();
-                        if !response.text.trim().is_empty() {
-                            let current_epoch = {
-                                let mut coordinator = session.state.captions.lock().await;
-                                coordinator.chunks.push(CaptionChunkRecord {
-                                    seq: chunk.seq,
-                                    offset_seconds: chunk.offset_seconds,
-                                    duration_seconds: chunk.duration_seconds,
-                                    text: response.text.trim().to_string(),
-                                    segments: response.segments.clone(),
-                                    capture_epoch: chunk.capture_epoch,
-                                    provider_item_id: None,
-                                });
-                                coordinator.capture_epoch
-                            };
-                            if chunk.capture_epoch == current_epoch {
-                                let update = CaptionsUpdate {
-                                    session_client_id: session.session_client_id.clone(),
-                                    seq: chunk.seq,
-                                    kind: CaptionUpdateKind::Final,
-                                    text: response.text.trim().to_string(),
-                                    chunk_seconds: response.chunk_seconds,
-                                    remaining_seconds: Some(response.remaining_seconds),
-                                };
-                                session.state.emit_event("captions.update", update.clone());
-                                // Same tap as the realtime final (plan 060 S3).
-                                crate::cohost::note_caption_final(&session.state, &update);
-                            } else {
-                                tracing::info!(
-                                    "Suppressed a caption update from a previous recording (epoch {} < {}).",
-                                    chunk.capture_epoch,
-                                    current_epoch,
-                                );
-                            }
-                        }
+                        commit_chunk_transcript(session, &chunk, caption_metered, &response).await;
                     }
                     Err(CaptionChunkFailure::Terminal { code, message }) => {
-                        tracing::warn!("Live captions stopped ({code}): {message}");
-                        publish_blocked_status(
+                        tracing::warn!("Live transcription stopped ({code}): {message}");
+                        match handle_terminal_failure(
                             session,
                             &code,
                             &message,
                             CaptionsTransport::Chunked,
+                            TerminalOrigin::Upload(purpose),
                         )
-                        .await;
-                        return false;
+                        .await
+                        {
+                            TerminalOutcome::EndTask => return false,
+                            TerminalOutcome::Continue => {
+                                // The intent that continues sends the chunk
+                                // again, metered as itself: nothing is lost.
+                                let dropped_seconds = buffer.requeue_front(chunk);
+                                if dropped_seconds > 0.0 {
+                                    surface_chunked_audio_drop(
+                                        session,
+                                        dropped_seconds,
+                                        0,
+                                        provider_confirmed,
+                                    )
+                                    .await;
+                                }
+                                backoff = None;
+                                next_upload_allowed_at = tokio::time::Instant::now();
+                            }
+                        }
                     }
                     Err(CaptionChunkFailure::Transient { message, .. }) => {
                         let transition = apply_caption_chunk_transient_failure(
@@ -5423,9 +6276,7 @@ async fn run_chunked_caption_session(
                             next_backoff.as_secs()
                         );
                         if degraded_reason.as_deref() != Some(message.as_str()) {
-                            let _ = crate::recording::emit_health_event(
-                                &session.state,
-                                None,
+                            session.emit_health(
                                 crate::protocol::HealthLevel::Warn,
                                 "captions-upload-failed",
                                 &format!("Caption upload failed; retrying with backoff. {message}"),
@@ -5438,7 +6289,7 @@ async fn run_chunked_caption_session(
                             status.provider_ready = provider_confirmed;
                             status.reason_code = Some("chunk-upload-retrying".to_string());
                             status.message = Some(format!("Captions retrying: {message}"));
-                            publish_status(&session.state, status).await;
+                            publish_status(session, status).await;
                             degraded_reason = Some(message);
                         }
                     }
@@ -5525,9 +6376,7 @@ async fn surface_chunked_audio_drop(
         }
         (false, false) => return,
     };
-    let _ = crate::recording::emit_health_event(
-        &session.state,
-        None,
+    session.emit_health(
         crate::protocol::HealthLevel::Warn,
         "captions-audio-dropped",
         &detail,
@@ -5540,7 +6389,7 @@ async fn surface_chunked_audio_drop(
     status.provider_ready = provider_confirmed;
     status.reason_code = Some("captions-audio-dropped".to_string());
     status.message = Some(detail);
-    publish_status(&session.state, status).await;
+    publish_status(session, status).await;
 }
 
 /// Exponential backoff for transient upload failures: 2s doubling to a 30s
@@ -6033,6 +6882,7 @@ mod tests {
             segments: Vec::new(),
             capture_epoch: 3,
             provider_item_id: Some("item-7".to_string()),
+            presented: true,
         };
         assert!(upsert_caption_record(&mut chunks, first.clone()));
         let mut revised = first;
@@ -6077,6 +6927,7 @@ mod tests {
                 segments: Vec::new(),
                 capture_epoch: 0,
                 provider_item_id: Some("item-1".to_string()),
+                presented: true,
             },
         ));
         assert!(!upsert_caption_record(
@@ -6089,6 +6940,7 @@ mod tests {
                 segments: Vec::new(),
                 capture_epoch: 0,
                 provider_item_id: Some("item-1".to_string()),
+                presented: true,
             },
         ));
 
@@ -6103,6 +6955,7 @@ mod tests {
             segments: Vec::new(),
             capture_epoch: 0,
             provider_item_id: None,
+            presented: true,
         });
 
         assert_eq!(fallback_chunk_seq, 2);
@@ -6873,6 +7726,7 @@ mod tests {
                 .collect(),
             capture_epoch: 0,
             provider_item_id: None,
+            presented: true,
         }
     }
 
@@ -8237,5 +9091,1059 @@ mod tests {
             channels: 2,
             samples: vec![0.0; 128],
         });
+    }
+
+    // --- Plan 068 S3: one transcription engine, two intents ------------------
+
+    fn drain_events(
+        events: &mut tokio::sync::broadcast::Receiver<crate::protocol::ServerEvent>,
+    ) -> Vec<crate::protocol::ServerEvent> {
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    fn caption_event_names(events: &[crate::protocol::ServerEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|event| event.event.starts_with("captions.") || event.event == "health")
+            .map(|event| event.event.clone())
+            .collect()
+    }
+
+    /// A live provider task standing in for the shared engine, with the
+    /// coordinator wired the way `spawn_transcription_task` wires it.
+    async fn install_intent_test_task(
+        state: &AppState,
+        captions: bool,
+        listen: bool,
+    ) -> Arc<AtomicBool> {
+        let mut receiver = install_tap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let task_stop = stop.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if task_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                match tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv())
+                    .await
+                {
+                    Ok(None) => break,
+                    Ok(Some(_)) | Err(_) => {}
+                }
+            }
+        });
+        let present = Arc::new(AtomicBool::new(captions));
+        let mut coordinator = state.captions.lock().await;
+        coordinator.task = Some(task);
+        coordinator.stop = Some(stop);
+        coordinator.desired_enabled = captions;
+        coordinator.listen_wanted = listen;
+        coordinator.presentation = Some(present.clone());
+        let mut shadow = CaptionsStatus::active(
+            CaptionsState::Degraded,
+            CaptionsTransport::Chunked,
+            "captions-intent-test",
+        );
+        shadow.provider_ready = true;
+        coordinator.shadow_status = Some(shadow.clone());
+        coordinator.status = Some(if captions {
+            shadow
+        } else {
+            CaptionsStatus::idle()
+        });
+        present
+    }
+
+    fn test_caption_session(state: &AppState, present: bool) -> CaptionSession {
+        let (_sender, receiver) = mpsc::channel(1);
+        CaptionSession {
+            bearer: "test-bearer".to_string(),
+            client: VideorcApiClient::new().expect("test api client"),
+            language: None,
+            receiver,
+            capture_elapsed_seconds: 0.0,
+            session_client_id: "captions-session-test".to_string(),
+            sequence: CaptionSequence::default(),
+            state: state.clone(),
+            stop: Arc::new(AtomicBool::new(false)),
+            present: Arc::new(AtomicBool::new(present)),
+            mark_target: None,
+        }
+    }
+
+    fn tone(samples: usize, amplitude: f64) -> Vec<i16> {
+        (0..samples)
+            .map(|index| {
+                let phase = index as f64 * 440.0 * std::f64::consts::TAU / 16_000.0;
+                (phase.sin() * amplitude * f64::from(i16::MAX)) as i16
+            })
+            .collect()
+    }
+
+    fn dbfs(db: f64) -> f64 {
+        10f64.powf(db / 20.0)
+    }
+
+    #[test]
+    fn silence_gate_skips_only_chunks_with_no_window_above_minus_45_dbfs() {
+        let chunk_samples = (f64::from(CAPTION_SAMPLE_RATE) * CAPTION_CHUNK_SECONDS) as usize;
+        // A sine's RMS is amplitude / sqrt(2): pick amplitudes around the
+        // floor so the RMS lands clearly on each side of -45 dBFS.
+        let quiet = dbfs(-48.0) * std::f64::consts::SQRT_2;
+        let loud = dbfs(-40.0) * std::f64::consts::SQRT_2;
+        let cases: Vec<(&str, Vec<i16>, bool)> = vec![
+            ("empty", Vec::new(), false),
+            ("digital silence", vec![0; chunk_samples], false),
+            ("-48 dBFS everywhere", tone(chunk_samples, quiet), false),
+            ("-40 dBFS everywhere", tone(chunk_samples, loud), true),
+            (
+                "one 50 ms window at -40 dBFS in silence",
+                {
+                    let mut samples = vec![0i16; chunk_samples];
+                    let start = SPEECH_WINDOW_SAMPLES * 20;
+                    samples[start..start + SPEECH_WINDOW_SAMPLES]
+                        .copy_from_slice(&tone(SPEECH_WINDOW_SAMPLES, loud));
+                    samples
+                },
+                true,
+            ),
+            (
+                "a loud trailing partial window still counts",
+                {
+                    // 60 full silent windows, then a 100-sample loud tail.
+                    let mut samples = vec![0i16; chunk_samples];
+                    samples.extend(tone(100, loud));
+                    samples
+                },
+                true,
+            ),
+            (
+                "-40 dBFS spread thinly across every window stays silent",
+                {
+                    // One sample per window at full scale would be loud; one
+                    // sample at -20 dBFS per 800-sample window is ~-49 dBFS RMS.
+                    let mut samples = vec![0i16; chunk_samples];
+                    for window in samples.chunks_mut(SPEECH_WINDOW_SAMPLES) {
+                        window[0] = (dbfs(-20.0) * f64::from(i16::MAX)) as i16;
+                    }
+                    samples
+                },
+                false,
+            ),
+        ];
+        for (name, samples, expected) in cases {
+            assert_eq!(chunk_has_speech(&samples), expected, "{name}");
+        }
+        assert!(pcm_has_voice(&tone(320, loud)));
+        assert!(!pcm_has_voice(&tone(320, quiet)));
+    }
+
+    #[test]
+    fn silence_skip_keeps_the_timeline_exact() {
+        let sequence = CaptionSequence::default();
+        let mut timeline = CaptionTimeline::new(10.0);
+        let mut buffer = CaptionChunkBuffer::new(1_600, 8);
+        let loud = dbfs(-30.0) * std::f64::consts::SQRT_2;
+        buffer.push_samples(vec![0; 1_600], 1, &sequence, &mut timeline);
+        buffer.push_samples(tone(1_600, loud), 1, &sequence, &mut timeline);
+        buffer.push_samples(vec![0; 1_600], 1, &sequence, &mut timeline);
+        let stamped = buffer.drain_pending();
+        let offsets: Vec<f64> = stamped.iter().map(|chunk| chunk.offset_seconds).collect();
+        assert_eq!(offsets, vec![10.0, 10.1, 10.2]);
+        // Offsets were stamped before the gate ran: the surviving chunk keeps
+        // its place even though its neighbours never upload.
+        let uploaded: Vec<&BufferedCaptionChunk> = stamped
+            .iter()
+            .filter(|chunk| chunk_has_speech(&chunk.samples))
+            .collect();
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(uploaded[0].seq, 2);
+        assert_eq!(uploaded[0].offset_seconds, 10.1);
+        assert_eq!(timeline.current_seconds(), 10.3);
+    }
+
+    #[tokio::test]
+    async fn chunk_purpose_follows_presentation() {
+        let state = test_caption_app_state();
+        let session = test_caption_session(&state, false);
+        assert_eq!(
+            session.chunk_purpose(),
+            crate::videorc_api::CaptionChunkPurpose::Listen
+        );
+        session.present.store(true, Ordering::Release);
+        assert_eq!(
+            session.chunk_purpose(),
+            crate::videorc_api::CaptionChunkPurpose::Captions
+        );
+    }
+
+    #[tokio::test]
+    async fn listen_only_task_presents_nothing_but_orcle_hears_every_final() {
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+        let session = test_caption_session(&state, false);
+
+        let mut status = CaptionsStatus::active(
+            CaptionsState::Degraded,
+            CaptionsTransport::Chunked,
+            &session.session_client_id,
+        );
+        status.provider_ready = true;
+        publish_status(&session, status.clone()).await;
+        session.emit_health(
+            crate::protocol::HealthLevel::Warn,
+            "captions-upload-failed",
+            "quiet",
+        );
+        surface_chunked_audio_drop(&session, 1.5, 2, true).await;
+        {
+            let coordinator = state.captions.lock().await;
+            assert!(
+                coordinator.status.is_none(),
+                "listen-only never touches the caption status"
+            );
+            assert_eq!(
+                coordinator
+                    .shadow_status
+                    .as_ref()
+                    .map(|status| status.reason_code.clone()),
+                Some(Some("captions-audio-dropped".to_string()))
+            );
+        }
+
+        let mut items = std::collections::HashMap::new();
+        let sequence = CaptionSequence::default();
+        let timeline = RealtimeCaptionTimeline {
+            capture_base_seconds: 4.0,
+            ms_at_anchor: 0.0,
+            socket_audio_base_ms: 0.0,
+            ms_sent: 6_000.0,
+            capture_epoch: 0,
+        };
+        handle_realtime_event(
+            &session,
+            RealtimeCaptionEvent::SpeechStarted {
+                item_id: "item-1".to_string(),
+                audio_start_ms: Some(500.0),
+            },
+            &mut items,
+            &sequence,
+            timeline,
+        )
+        .await;
+        handle_realtime_event(
+            &session,
+            RealtimeCaptionEvent::Partial {
+                item_id: "item-1".to_string(),
+                transcript: "clip th".to_string(),
+            },
+            &mut items,
+            &sequence,
+            timeline,
+        )
+        .await;
+        handle_realtime_event(
+            &session,
+            RealtimeCaptionEvent::Completed {
+                item_id: "item-1".to_string(),
+                transcript: "clip that".to_string(),
+            },
+            &mut items,
+            &sequence,
+            timeline,
+        )
+        .await;
+
+        assert!(
+            caption_event_names(&drain_events(&mut events)).is_empty(),
+            "listen-only must publish no caption status, update or health event"
+        );
+        let chunks = &state.captions.lock().await.chunks;
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].presented);
+        assert_eq!(chunks[0].text, "clip that");
+        let window = state
+            .cohost_transcript
+            .lock()
+            .unwrap()
+            .snapshot(std::time::Instant::now());
+        assert_eq!(window.text, "clip that");
+        let speech = crate::cohost::recent_speech_since(&state, None).expect("speech");
+        assert_eq!(speech.finals.len(), 1);
+        assert_eq!(speech.finals[0].text, "clip that");
+        assert_eq!(speech.finals[0].offset_seconds, 4.5);
+        assert!(!speech.finals[0].presented);
+    }
+
+    #[tokio::test]
+    async fn presenting_task_emits_updates_tagged_presented() {
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+        let session = test_caption_session(&state, true);
+        let mut items = std::collections::HashMap::new();
+        let sequence = CaptionSequence::default();
+        let timeline = RealtimeCaptionTimeline {
+            capture_base_seconds: 0.0,
+            ms_at_anchor: 0.0,
+            socket_audio_base_ms: 0.0,
+            ms_sent: 2_000.0,
+            capture_epoch: 0,
+        };
+        handle_realtime_event(
+            &session,
+            RealtimeCaptionEvent::SpeechStarted {
+                item_id: "item-1".to_string(),
+                audio_start_ms: Some(0.0),
+            },
+            &mut items,
+            &sequence,
+            timeline,
+        )
+        .await;
+        handle_realtime_event(
+            &session,
+            RealtimeCaptionEvent::Completed {
+                item_id: "item-1".to_string(),
+                transcript: "hello chat".to_string(),
+            },
+            &mut items,
+            &sequence,
+            timeline,
+        )
+        .await;
+        let names = caption_event_names(&drain_events(&mut events));
+        assert_eq!(names, vec!["captions.update".to_string()]);
+        assert!(state.captions.lock().await.chunks[0].presented);
+        let speech = crate::cohost::recent_speech_since(&state, None).expect("speech");
+        assert!(speech.finals[0].presented);
+    }
+
+    #[tokio::test]
+    async fn listen_block_ends_listening_only_and_never_a_presenting_caption_session() {
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+
+        // Both intents: the listen allowance runs out while captions present.
+        let session = test_caption_session(&state, true);
+        state.captions.lock().await.listen_wanted = true;
+        let outcome = handle_terminal_failure(
+            &session,
+            "listen-monthly-quota-exhausted",
+            "Listening is used up.",
+            CaptionsTransport::Chunked,
+            TerminalOrigin::Upload(crate::videorc_api::CaptionChunkPurpose::Listen),
+        )
+        .await;
+        assert_eq!(outcome, TerminalOutcome::Continue);
+        assert!(!state.captions.lock().await.listen_wanted);
+        assert!(
+            caption_event_names(&drain_events(&mut events)).is_empty(),
+            "a listen block is not a caption block"
+        );
+
+        // Listen only: the same block ends the task quietly.
+        let session = test_caption_session(&state, false);
+        state.captions.lock().await.listen_wanted = true;
+        let outcome = handle_terminal_failure(
+            &session,
+            "listen-disabled",
+            "Listening is off.",
+            CaptionsTransport::Chunked,
+            TerminalOrigin::Upload(crate::videorc_api::CaptionChunkPurpose::Listen),
+        )
+        .await;
+        assert_eq!(outcome, TerminalOutcome::EndTask);
+        assert!(caption_event_names(&drain_events(&mut events)).is_empty());
+
+        // A terminal failure that applies to listening too ends a listen-only
+        // task without a caption status, and a presenting task with the usual
+        // block.
+        state.captions.lock().await.listen_wanted = true;
+        let outcome = handle_terminal_failure(
+            &session,
+            "unauthorized",
+            "Sign in.",
+            CaptionsTransport::Chunked,
+            TerminalOrigin::Upload(crate::videorc_api::CaptionChunkPurpose::Listen),
+        )
+        .await;
+        assert_eq!(outcome, TerminalOutcome::EndTask);
+        assert!(caption_event_names(&drain_events(&mut events)).is_empty());
+        let presenting = test_caption_session(&state, true);
+        let outcome = handle_terminal_failure(
+            &presenting,
+            "cloud-ai-premium-required",
+            "Premium.",
+            CaptionsTransport::Chunked,
+            TerminalOrigin::Upload(crate::videorc_api::CaptionChunkPurpose::Captions),
+        )
+        .await;
+        assert_eq!(outcome, TerminalOutcome::EndTask);
+        let emitted = drain_events(&mut events);
+        assert!(emitted.iter().any(|event| {
+            event.event == "captions.status" && event.payload["state"] == "blocked"
+        }));
+        assert!(
+            emitted
+                .iter()
+                .any(|event| event.event == "captions.cleared")
+        );
+    }
+
+    #[tokio::test]
+    async fn intent_matrix_keeps_one_task_alive_while_either_intent_is_wanted() {
+        let _caption_test_guard = caption_lifecycle_test_lock().lock().await;
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+
+        // Listen only: an explicit caption stop answers idle and keeps the task.
+        let present = install_intent_test_task(&state, false, true).await;
+        let task_id = state.captions.lock().await.task.as_ref().unwrap().id();
+        let status = stop_captions(&state).await;
+        assert_eq!(status.state, CaptionsState::Idle);
+        assert!(!status.desired_enabled);
+        {
+            let coordinator = state.captions.lock().await;
+            assert!(coordinator_task_alive(&coordinator));
+            assert_eq!(coordinator.task.as_ref().unwrap().id(), task_id);
+            assert!(coordinator.listen_wanted);
+        }
+        assert!(TAP_ACTIVE.load(Ordering::Acquire));
+        assert!(!present.load(Ordering::Acquire));
+        drain_events(&mut events);
+        // Stopping listen with nothing presenting ends the task and the tap.
+        stop_listen(&state).await;
+        {
+            let coordinator = state.captions.lock().await;
+            assert!(coordinator.task.is_none());
+            assert!(!coordinator.listen_wanted);
+            assert!(coordinator.presentation.is_none());
+        }
+        assert!(!TAP_ACTIVE.load(Ordering::Acquire));
+        assert!(
+            caption_event_names(&drain_events(&mut events)).is_empty(),
+            "ending a listen-only task publishes no caption boundary"
+        );
+
+        // Both: captions off flips presentation, listen off ends the task.
+        let present = install_intent_test_task(&state, true, true).await;
+        let task_id = state.captions.lock().await.task.as_ref().unwrap().id();
+        stop_captions(&state).await;
+        {
+            let coordinator = state.captions.lock().await;
+            assert!(coordinator_task_alive(&coordinator));
+            assert_eq!(coordinator.task.as_ref().unwrap().id(), task_id);
+            assert!(!coordinator.desired_enabled);
+            assert_eq!(
+                coordinator.status.as_ref().unwrap().state,
+                CaptionsState::Idle
+            );
+        }
+        assert!(!present.load(Ordering::Acquire));
+        let names = caption_event_names(&drain_events(&mut events));
+        assert!(names.contains(&"captions.status".to_string()));
+        assert!(names.contains(&"captions.cleared".to_string()));
+        stop_listen(&state).await;
+        assert!(state.captions.lock().await.task.is_none());
+        assert!(!TAP_ACTIVE.load(Ordering::Acquire));
+
+        // Captions only: listen off is a no-op, captions off ends the task.
+        let present = install_intent_test_task(&state, true, false).await;
+        let task_id = state.captions.lock().await.task.as_ref().unwrap().id();
+        stop_listen(&state).await;
+        {
+            let coordinator = state.captions.lock().await;
+            assert!(coordinator_task_alive(&coordinator));
+            assert_eq!(coordinator.task.as_ref().unwrap().id(), task_id);
+            assert!(coordinator.desired_enabled);
+        }
+        assert!(present.load(Ordering::Acquire));
+        assert!(TAP_ACTIVE.load(Ordering::Acquire));
+        stop_captions(&state).await;
+        assert!(state.captions.lock().await.task.is_none());
+        assert!(!TAP_ACTIVE.load(Ordering::Acquire));
+        drain_events(&mut events);
+
+        // Captions on over a listen-only task: same task, presentation on,
+        // the renderer sees the transport state the task reached.
+        *state.recording.lock().await =
+            Some(crate::recording::test_active_recording_stub("listen-first"));
+        let present = install_intent_test_task(&state, false, true).await;
+        let task_id = state.captions.lock().await.task.as_ref().unwrap().id();
+        let status =
+            start_captions_with_bearer(&state, Some("en".into()), || Some("test-bearer".into()))
+                .await
+                .expect("captions join the listen task");
+        assert_eq!(status.state, CaptionsState::Degraded);
+        assert!(status.provider_ready);
+        assert_eq!(
+            status.session_client_id.as_deref(),
+            Some("captions-intent-test")
+        );
+        {
+            let coordinator = state.captions.lock().await;
+            assert_eq!(coordinator.task.as_ref().unwrap().id(), task_id);
+            assert!(coordinator.desired_enabled);
+            assert!(coordinator.listen_wanted);
+        }
+        assert!(present.load(Ordering::Acquire));
+        let emitted = drain_events(&mut events);
+        assert!(emitted.iter().any(|event| {
+            event.event == "captions.status" && event.payload["state"] == "degraded"
+        }));
+
+        // Listen on over a presenting caption task: joins, no caption emits.
+        stop_listen(&state).await;
+        assert!(state.captions.lock().await.task.as_ref().is_some());
+        drain_events(&mut events);
+        let listening =
+            start_listen_with_bearer(&state, "orcle-session", || Some("test-bearer".into())).await;
+        assert_eq!(listening, crate::cohost::CohostListening::on(None));
+        {
+            let coordinator = state.captions.lock().await;
+            assert_eq!(coordinator.task.as_ref().unwrap().id(), task_id);
+            assert!(coordinator.listen_wanted);
+        }
+        assert!(caption_event_names(&drain_events(&mut events)).is_empty());
+
+        stop_captions(&state).await;
+        stop_listen(&state).await;
+        *state.recording.lock().await = None;
+    }
+
+    #[tokio::test]
+    async fn listen_start_never_blocks_capture_or_raises_a_caption_block() {
+        let _caption_test_guard = caption_lifecycle_test_lock().lock().await;
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+
+        let listening = start_listen_with_bearer(&state, "orcle", || Some("b".into())).await;
+        assert_eq!(
+            listening.state,
+            crate::cohost::CohostListeningState::Blocked
+        );
+        assert_eq!(listening.reason_code.as_deref(), Some("no-capture"));
+
+        *state.recording.lock().await = Some(crate::recording::test_active_recording_stub(
+            "no-mic-session",
+        ));
+        let listening = start_listen_with_bearer(&state, "orcle", || Some("b".into())).await;
+        assert_eq!(listening.reason_code.as_deref(), Some("no-microphone"));
+        {
+            let coordinator = state.captions.lock().await;
+            assert!(
+                coordinator.task.is_none(),
+                "no task without an eligible microphone"
+            );
+            assert!(
+                coordinator.listen_wanted,
+                "the intent stays wanted for a later capture"
+            );
+            assert!(coordinator.status.is_none(), "never a caption status");
+            assert!(!coordinator.desired_enabled);
+        }
+        assert!(!TAP_ACTIVE.load(Ordering::Acquire));
+        assert!(
+            state.recording.lock().await.is_some(),
+            "listen never touches the capture session"
+        );
+        assert!(caption_event_names(&drain_events(&mut events)).is_empty());
+        stop_listen(&state).await;
+        assert!(!state.captions.lock().await.listen_wanted);
+        *state.recording.lock().await = None;
+    }
+
+    #[tokio::test]
+    async fn listen_only_recording_writes_the_srt_but_renders_no_cues() {
+        let root = std::env::temp_dir().join(format!(
+            "videorc-listen-only-artifact-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let recording_path = root.join("recording.mp4");
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+        let mut heard = chunk(1, 0.0, "orcle heard this", &[]);
+        heard.presented = false;
+        let artifact = FinalizedCaptionArtifact {
+            chunks: vec![heard],
+            style: CaptionStyleSnapshot {
+                output_width: 1_920,
+                output_height: 1_080,
+                ..CaptionStyleSnapshot::default()
+            },
+            artifact_generation: 0,
+        };
+        let artifact =
+            write_caption_artifacts(&state, "listen-only", &recording_path, artifact).await;
+        let srt = tokio::fs::read_to_string(recording_path.with_extension("srt"))
+            .await
+            .expect("the Publish tab needs the SRT even when captions never presented");
+        assert!(srt.contains("orcle heard this"));
+        assert_eq!(artifact.presented_chunk_count(), 0);
+        assert!(artifact.presented_chunks().is_empty());
+        begin_caption_cue_render(&state, "listen-only", "ffmpeg", &recording_path, &artifact).await;
+        assert!(
+            drain_events(&mut events)
+                .iter()
+                .all(|event| event.event != "captions.cues.render-request"),
+            "unpresented records never reach the compositor"
+        );
+        assert!(!recording_path.with_extension("captions-frames").exists());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    // --- Plan 068 review fixes ---------------------------------------------
+
+    fn purpose(listen: bool) -> crate::videorc_api::CaptionChunkPurpose {
+        if listen {
+            crate::videorc_api::CaptionChunkPurpose::Listen
+        } else {
+            crate::videorc_api::CaptionChunkPurpose::Captions
+        }
+    }
+
+    #[test]
+    fn terminal_failure_scope_table() {
+        use TerminalScope::{Both, Captions, Listen};
+        let captions_chunk = TerminalOrigin::Upload(purpose(false));
+        let listen_chunk = TerminalOrigin::Upload(purpose(true));
+        let cases: &[(&str, TerminalOrigin, TerminalScope)] = &[
+            // The listen allowance and switch end listening only.
+            ("listen-monthly-quota-exhausted", listen_chunk, Listen),
+            ("listen-disabled", listen_chunk, Listen),
+            // The caption allowance and the captions switch, answered to a
+            // caption-metered request, end captions only.
+            ("captions-monthly-quota-exhausted", captions_chunk, Captions),
+            ("ai-disabled", captions_chunk, Captions),
+            (
+                "captions-monthly-quota-exhausted",
+                TerminalOrigin::RealtimeMint,
+                Captions,
+            ),
+            ("ai-disabled", TerminalOrigin::RealtimeMint, Captions),
+            // The realtime socket is a caption-only transport.
+            (
+                "realtime-close-4401",
+                TerminalOrigin::RealtimeSocket,
+                Captions,
+            ),
+            // A listen chunk told `ai-disabled` means the global switch.
+            ("ai-disabled", listen_chunk, Both),
+            // What applies to listening too ends both.
+            ("unauthorized", captions_chunk, Both),
+            ("unauthorized", TerminalOrigin::RealtimeMint, Both),
+            ("cloud-ai-premium-required", captions_chunk, Both),
+            (
+                "cloud-ai-premium-required",
+                TerminalOrigin::RealtimeMint,
+                Both,
+            ),
+            ("ai-user-disabled", captions_chunk, Both),
+            ("captions-config-missing", captions_chunk, Both),
+            ("audio-path-stalled", TerminalOrigin::AudioPath, Both),
+        ];
+        for (code, origin, expected) in cases {
+            assert_eq!(
+                terminal_failure_scope(code, *origin),
+                *expected,
+                "{code} from {origin:?}"
+            );
+        }
+    }
+
+    /// Finding 1b: with both intents on, a caption quota or the captions
+    /// switch ends captions (with the caption block, exactly as before) and
+    /// the same task keeps transcribing for Orcle, metered as listen.
+    #[tokio::test]
+    async fn caption_scoped_failures_never_stop_orcle_listening() {
+        let _caption_test_guard = caption_lifecycle_test_lock().lock().await;
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+        for (code, origin) in [
+            (
+                "captions-monthly-quota-exhausted",
+                TerminalOrigin::Upload(purpose(false)),
+            ),
+            ("ai-disabled", TerminalOrigin::RealtimeMint),
+        ] {
+            let session = test_caption_session(&state, true);
+            {
+                let mut coordinator = state.captions.lock().await;
+                coordinator.listen_wanted = true;
+                coordinator.desired_enabled = true;
+            }
+            let outcome = handle_terminal_failure(
+                &session,
+                code,
+                "Monthly live-caption allowance exhausted.",
+                CaptionsTransport::Chunked,
+                origin,
+            )
+            .await;
+            assert_eq!(outcome, TerminalOutcome::Continue, "{code}");
+            assert!(!session.presenting(), "captions stop presenting ({code})");
+            assert_eq!(session.chunk_purpose(), purpose(true));
+            {
+                let coordinator = state.captions.lock().await;
+                assert!(coordinator.listen_wanted, "Orcle keeps listening ({code})");
+                let status = coordinator.status.as_ref().expect("caption block");
+                assert_eq!(status.state, CaptionsState::Blocked);
+                assert_eq!(status.reason_code.as_deref(), Some(code));
+            }
+            let emitted = drain_events(&mut events);
+            assert!(emitted.iter().any(|event| {
+                event.event == "captions.status"
+                    && event.payload["state"] == "blocked"
+                    && event.payload["reasonCode"] == code
+            }));
+            assert!(
+                emitted
+                    .iter()
+                    .any(|event| event.event == "captions.cleared")
+            );
+        }
+
+        // A realtime socket failure while Orcle listens falls back to chunks.
+        let session = test_caption_session(&state, true);
+        state.captions.lock().await.listen_wanted = true;
+        let outcome = handle_terminal_failure(
+            &session,
+            "realtime-close-4429",
+            "Realtime caption socket closed.",
+            CaptionsTransport::Realtime,
+            TerminalOrigin::RealtimeSocket,
+        )
+        .await;
+        assert!(matches!(
+            realtime_terminal_outcome(outcome, "closed"),
+            RealtimeOutcome::Fallback(_)
+        ));
+        assert!(state.captions.lock().await.listen_wanted);
+
+        // Captions only: the same caption block still ends the task.
+        let session = test_caption_session(&state, true);
+        state.captions.lock().await.listen_wanted = false;
+        let outcome = handle_terminal_failure(
+            &session,
+            "captions-monthly-quota-exhausted",
+            "Used up.",
+            CaptionsTransport::Chunked,
+            TerminalOrigin::Upload(purpose(false)),
+        )
+        .await;
+        assert_eq!(outcome, TerminalOutcome::EndTask);
+        assert!(matches!(
+            realtime_terminal_outcome(outcome, "x"),
+            RealtimeOutcome::Terminal
+        ));
+
+        // Both intents, but a failure that applies to listening too: the task
+        // ends and both stop.
+        for code in ["unauthorized", "cloud-ai-premium-required"] {
+            let session = test_caption_session(&state, true);
+            state.captions.lock().await.listen_wanted = true;
+            let outcome = handle_terminal_failure(
+                &session,
+                code,
+                "No.",
+                CaptionsTransport::Chunked,
+                TerminalOrigin::Upload(purpose(false)),
+            )
+            .await;
+            assert_eq!(outcome, TerminalOutcome::EndTask, "{code}");
+        }
+        // The global switch reaches the next listen chunk and ends it then.
+        let session = test_caption_session(&state, false);
+        state.captions.lock().await.listen_wanted = true;
+        let outcome = handle_terminal_failure(
+            &session,
+            "ai-disabled",
+            "Cloud AI is off.",
+            CaptionsTransport::Chunked,
+            TerminalOrigin::Upload(purpose(true)),
+        )
+        .await;
+        assert_eq!(outcome, TerminalOutcome::EndTask);
+    }
+
+    /// Finding 1a: a listen-only task never asks the caption-gated realtime
+    /// token route; it starts on the metered chunk path.
+    #[tokio::test]
+    async fn a_listen_only_task_never_tries_realtime() {
+        let _caption_test_guard = caption_lifecycle_test_lock().lock().await;
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+        // Closed receiver and no intent wanted: the chunk loop drains at once.
+        let session = test_caption_session(&state, false);
+        run_caption_session(session).await;
+        let shadow = state
+            .captions
+            .lock()
+            .await
+            .shadow_status
+            .clone()
+            .expect("the chunked shadow a later captions start adopts");
+        assert_eq!(shadow.transport, Some(CaptionsTransport::Chunked));
+        assert_eq!(shadow.reason_code.as_deref(), Some("realtime-fallback"));
+        // A realtime attempt would have said why it fell back.
+        assert_eq!(
+            shadow.message.as_deref(),
+            Some("Captions on with higher delay.")
+        );
+        assert!(state.captions.lock().await.status.is_none());
+        assert!(caption_event_names(&drain_events(&mut events)).is_empty());
+    }
+
+    fn chunk_response(text: &str, remaining_seconds: u64) -> CaptionChunkResponse {
+        CaptionChunkResponse {
+            text: text.to_string(),
+            chunk_seconds: 3,
+            remaining_seconds,
+            monthly_seconds_limit: 3_600,
+            latency_ms: None,
+            model: "test".to_string(),
+            segments: Vec::new(),
+        }
+    }
+
+    fn stamped_chunk(seq: u64, offset_seconds: f64) -> BufferedCaptionChunk {
+        BufferedCaptionChunk {
+            samples: Vec::new(),
+            seq,
+            offset_seconds,
+            duration_seconds: 3.0,
+            capture_epoch: 0,
+        }
+    }
+
+    /// Finding 10: captions turned off while an upload was in flight never
+    /// show its final; the record and Orcle still get it.
+    #[tokio::test]
+    async fn a_final_after_captions_turned_off_never_shows() {
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+        let session = test_caption_session(&state, true);
+        commit_chunk_transcript(
+            &session,
+            &stamped_chunk(1, 0.0),
+            true,
+            &chunk_response("one", 9),
+        )
+        .await;
+        let emitted = drain_events(&mut events);
+        let update = emitted
+            .iter()
+            .find(|event| event.event == "captions.update")
+            .expect("a presented final shows");
+        assert_eq!(update.payload["remainingSeconds"], 9);
+
+        // The upload was sent while presenting; captions.stop lands before
+        // its answer.
+        session.present.store(false, Ordering::Release);
+        commit_chunk_transcript(
+            &session,
+            &stamped_chunk(2, 3.0),
+            true,
+            &chunk_response("two", 6),
+        )
+        .await;
+        assert!(
+            caption_event_names(&drain_events(&mut events)).is_empty(),
+            "no captions.update after the caption boundary"
+        );
+        let coordinator = state.captions.lock().await;
+        assert_eq!(coordinator.chunks.len(), 2);
+        assert!(coordinator.chunks[0].presented);
+        assert!(!coordinator.chunks[1].presented);
+        drop(coordinator);
+        let speech = crate::cohost::recent_speech_since(&state, None).expect("speech");
+        assert_eq!(speech.finals.len(), 2);
+        assert_eq!(speech.finals[1].text, "two");
+    }
+
+    /// Finding 11: quiet is not "still starting", and the listen allowance
+    /// refreshes from listen-metered answers at most every 30 s.
+    #[test]
+    fn listen_readiness_reports_on_in_quiet_and_throttles_the_allowance() {
+        use crate::cohost::CohostListening;
+        let now = std::time::Instant::now();
+        let mut quiet = ListenReadiness::default();
+        // No frames yet: a skipped chunk proves nothing.
+        assert_eq!(quiet.silent_chunk_skipped(false), None);
+        assert_eq!(
+            quiet.silent_chunk_skipped(true),
+            Some(CohostListening::on(None))
+        );
+        assert_eq!(quiet.silent_chunk_skipped(true), None);
+        // The first listen-metered answer brings the allowance at once...
+        assert_eq!(
+            quiet.upload_succeeded(Some(500), now),
+            Some(CohostListening::on(Some(500)))
+        );
+        // ...then at most every 30 s.
+        assert_eq!(quiet.upload_succeeded(Some(497), now + secs(3)), None);
+        assert_eq!(quiet.upload_succeeded(Some(470), now + secs(29)), None);
+        assert_eq!(
+            quiet.upload_succeeded(Some(467), now + secs(30)),
+            Some(CohostListening::on(Some(467)))
+        );
+        // A caption-metered answer carries no listen allowance.
+        let mut captions_first = ListenReadiness::default();
+        assert_eq!(
+            captions_first.upload_succeeded(None, now),
+            Some(CohostListening::on(None))
+        );
+        assert_eq!(captions_first.upload_succeeded(None, now + secs(40)), None);
+        assert_eq!(
+            captions_first.upload_succeeded(Some(10), now + secs(41)),
+            Some(CohostListening::on(Some(10)))
+        );
+    }
+
+    fn secs(value: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(value)
+    }
+
+    /// Finding 11: a listen intent that joins a task already proven ready
+    /// reads `on` at once, not `starting`.
+    #[tokio::test]
+    async fn listen_joining_a_ready_task_is_on_at_once() {
+        let _caption_test_guard = caption_lifecycle_test_lock().lock().await;
+        let state = test_caption_app_state();
+        *state.recording.lock().await =
+            Some(crate::recording::test_active_recording_stub("ready-join"));
+        install_intent_test_task(&state, true, false).await;
+        {
+            let mut coordinator = state.captions.lock().await;
+            coordinator.shadow_status.as_mut().unwrap().provider_ready = false;
+        }
+        let listening =
+            start_listen_with_bearer(&state, "orcle", || Some("test-bearer".into())).await;
+        assert_eq!(listening, crate::cohost::CohostListening::starting());
+        stop_listen(&state).await;
+        let session = test_caption_session(&state, true);
+        session
+            .note_listen_ready(crate::cohost::CohostListening::on(None))
+            .await;
+        let listening =
+            start_listen_with_bearer(&state, "orcle", || Some("test-bearer".into())).await;
+        assert_eq!(listening, crate::cohost::CohostListening::on(None));
+        stop_captions(&state).await;
+        stop_listen(&state).await;
+        *state.recording.lock().await = None;
+    }
+
+    /// Finding 2: at a capture end Orcle's stop only clears the listen
+    /// intent; the listen-only task lives on until the capture seam drains it.
+    /// An explicit stop still aborts at once.
+    #[tokio::test]
+    async fn a_capture_end_drains_the_listen_task_and_an_explicit_stop_aborts_it() {
+        let _caption_test_guard = caption_lifecycle_test_lock().lock().await;
+        let state = test_caption_app_state();
+        let mut events = state.events.subscribe();
+
+        install_intent_test_task(&state, false, true).await;
+        let task_id = state.captions.lock().await.task.as_ref().unwrap().id();
+        stop_listen_with(&state, ListenStop::DrainWithCapture).await;
+        {
+            let coordinator = state.captions.lock().await;
+            assert!(!coordinator.listen_wanted);
+            assert!(
+                coordinator_task_alive(&coordinator),
+                "the task drains later"
+            );
+            assert_eq!(coordinator.task.as_ref().unwrap().id(), task_id);
+        }
+        assert!(
+            TAP_ACTIVE.load(Ordering::Acquire),
+            "the tap keeps feeding it"
+        );
+        // The capture seam closes the tap and joins the drained task.
+        finish_captions_for_capture(&state).await;
+        assert!(state.captions.lock().await.task.is_none());
+        assert!(!TAP_ACTIVE.load(Ordering::Acquire));
+
+        // session.stop with no capture running: nothing to drain with.
+        install_intent_test_task(&state, false, true).await;
+        stop_listen_with(&state, ListenStop::DrainIfCapturing).await;
+        assert!(state.captions.lock().await.task.is_none());
+
+        // session.stop while capturing: drains.
+        *state.recording.lock().await =
+            Some(crate::recording::test_active_recording_stub("draining"));
+        install_intent_test_task(&state, false, true).await;
+        stop_listen_with(&state, ListenStop::DrainIfCapturing).await;
+        assert!(coordinator_task_alive(&*state.captions.lock().await));
+        *state.recording.lock().await = None;
+        finish_captions_for_capture(&state).await;
+        assert!(state.captions.lock().await.task.is_none());
+
+        // An explicit stop (Orcle off, listening off) aborts at once.
+        install_intent_test_task(&state, false, true).await;
+        stop_listen_with(&state, ListenStop::Abort).await;
+        assert!(state.captions.lock().await.task.is_none());
+        assert!(!TAP_ACTIVE.load(Ordering::Acquire));
+        drain_events(&mut events);
+    }
+
+    /// Finding 2: a voice mark carries the capture the task transcribes, read
+    /// when the task started, so the capture-end drain needs no slot.
+    #[tokio::test]
+    async fn the_caption_task_carries_its_capture_to_every_final() {
+        let mut active = crate::recording::test_active_recording_stub("marked-stream");
+        let (eligible, target) = caption_capture_facts(Some(&active));
+        assert!(!eligible);
+        assert_eq!(
+            target,
+            Some(crate::clip_marks::MarkTarget {
+                session_id: "marked-stream".to_string(),
+                records_to_file: false,
+            })
+        );
+        active.output_path = Some(std::path::PathBuf::from("/tmp/marked-stream.mp4"));
+        let (_, target) = caption_capture_facts(Some(&active));
+        assert!(target.is_some_and(|target| target.records_to_file));
+        assert_eq!(caption_capture_facts(None), (false, None));
+
+        let state = test_caption_app_state();
+        let mut session = test_caption_session(&state, false);
+        session.mark_target = Some(crate::clip_marks::MarkTarget {
+            session_id: "marked-stream".to_string(),
+            records_to_file: true,
+        });
+        commit_chunk_transcript(
+            &session,
+            &stamped_chunk(1, 9.0),
+            false,
+            &chunk_response("hi", 1),
+        )
+        .await;
+        let speech = crate::cohost::recent_speech_since(&state, None).expect("speech");
+        assert_eq!(
+            speech.finals[0]
+                .mark_target
+                .as_ref()
+                .map(|t| t.session_id.as_str()),
+            Some("marked-stream")
+        );
+    }
+
+    /// Finding 4: sign-out ends Orcle's listening in the state too, and a
+    /// listening publish decided before an intent ended never lands after.
+    #[tokio::test]
+    async fn sign_out_and_stops_fence_late_listening_publishes() {
+        let _caption_test_guard = caption_lifecycle_test_lock().lock().await;
+        let state = test_caption_app_state();
+        let before = current_listen_epoch(&state).await;
+        install_intent_test_task(&state, false, true).await;
+        stop_listen(&state).await;
+        let after_stop = current_listen_epoch(&state).await;
+        assert!(after_stop > before);
+        stop_captions_for_sign_out(&state, || {}).await;
+        assert!(current_listen_epoch(&state).await > after_stop);
+        let coordinator = state.captions.lock().await;
+        assert!(!coordinator.listen_wanted);
+        assert!(!coordinator.listen_ready);
     }
 }

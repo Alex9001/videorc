@@ -4705,6 +4705,51 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Clip that (plan 068 D6): one mark for a session that records to a file.
+    pub fn insert_clip_mark(&self, mark: &crate::protocol::ClipMark) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO clip_marks (id, session_id, at_seconds, source, phrase, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                mark.id,
+                mark.session_id,
+                mark.at_seconds,
+                clip_mark_source_label(mark.source),
+                mark.phrase,
+                mark.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every clip mark of a session, earliest file time first.
+    pub fn list_clip_marks(&self, session_id: &str) -> Result<Vec<crate::protocol::ClipMark>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare(
+            "SELECT id, session_id, at_seconds, source, phrase, created_at
+             FROM clip_marks WHERE session_id = ?1
+             ORDER BY at_seconds ASC, created_at ASC, id ASC",
+        )?;
+        let rows = statement.query_map(params![session_id], |row| {
+            let source: String = row.get(3)?;
+            Ok(crate::protocol::ClipMark {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                at_seconds: row.get(2)?,
+                source: if source == "voice" {
+                    crate::protocol::ClipMarkSource::Voice
+                } else {
+                    crate::protocol::ClipMarkSource::Manual
+                },
+                phrase: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub(crate) fn remove_caption_private_artifact(&self, id: &str) -> Result<bool> {
         let conn = self.lock()?;
         Ok(conn.execute(
@@ -5886,6 +5931,18 @@ impl Database {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS clip_marks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                at_seconds REAL NOT NULL,
+                source TEXT NOT NULL,
+                phrase TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_clip_marks_session_at
+                ON clip_marks(session_id, at_seconds);
             ",
         )?;
         ensure_column(&conn, "sessions", "container", "container TEXT")?;
@@ -6623,6 +6680,13 @@ fn normalized_session_container(value: Option<String>) -> Option<String> {
     })
 }
 
+fn clip_mark_source_label(source: crate::protocol::ClipMarkSource) -> &'static str {
+    match source {
+        crate::protocol::ClipMarkSource::Voice => "voice",
+        crate::protocol::ClipMarkSource::Manual => "manual",
+    }
+}
+
 fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -7195,6 +7259,58 @@ mod tests {
         );
         let page = database.list_session_items_page(None, 20).unwrap();
         assert_eq!(page.items.len(), 1, "the user's capture must survive");
+    }
+
+    #[test]
+    fn clip_marks_persist_per_session_in_file_time_order_and_follow_deletes() {
+        use crate::protocol::{ClipMark, ClipMarkSource};
+        let database = test_database();
+        database.create_session(&sample_session("s-1")).unwrap();
+        database.create_session(&sample_session("s-2")).unwrap();
+        let mark = |id: &str, session_id: &str, at_seconds: f64, source: ClipMarkSource| ClipMark {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            at_seconds,
+            source,
+            phrase: (source == ClipMarkSource::Voice).then(|| "clip that".to_string()),
+            created_at: "2026-09-27T10:00:00Z".to_string(),
+        };
+        database
+            .insert_clip_mark(&mark("m-2", "s-1", 754.2, ClipMarkSource::Manual))
+            .unwrap();
+        database
+            .insert_clip_mark(&mark("m-1", "s-1", 61.5, ClipMarkSource::Voice))
+            .unwrap();
+        database
+            .insert_clip_mark(&mark("m-3", "s-2", 5.0, ClipMarkSource::Voice))
+            .unwrap();
+
+        let marks = database.list_clip_marks("s-1").unwrap();
+        assert_eq!(
+            marks
+                .iter()
+                .map(|mark| mark.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m-1", "m-2"]
+        );
+        assert_eq!(marks[0].source, ClipMarkSource::Voice);
+        assert_eq!(marks[0].phrase.as_deref(), Some("clip that"));
+        assert_eq!(marks[1].source, ClipMarkSource::Manual);
+        assert_eq!(marks[1].phrase, None);
+        assert!(database.list_clip_marks("missing").unwrap().is_empty());
+
+        // A mark needs its session row; deleting the session takes its marks.
+        assert!(
+            database
+                .insert_clip_mark(&mark("m-4", "nope", 1.0, ClipMarkSource::Manual))
+                .is_err()
+        );
+        database
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM sessions WHERE id = 's-2'", [])
+            .unwrap();
+        assert!(database.list_clip_marks("s-2").unwrap().is_empty());
     }
 
     fn sample_session(id: &str) -> NewSession {

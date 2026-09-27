@@ -24,12 +24,52 @@ function remoteIntentContext(overrides: Partial<RemoteIntentContext> = {}) {
     openWindow: vi.fn(async () => true),
     showCommentHighlight: vi.fn(async () => ({ ok: true })),
     clearCommentHighlight: vi.fn(async () => ({ ok: true })),
+    markClip: vi.fn(async () => ({ ok: true })),
     ...overrides
   }
   return { context, requests }
 }
 
 describe('executeRemoteIntent', () => {
+  it('marks a clip only while a session runs and relays the refusal reason (plan 068 D6)', async () => {
+    const idle = remoteIntentContext()
+    await executeRemoteIntent({ intentId: 'clip-idle', intent: { kind: 'clipMark' } }, idle.context)
+    expect(idle.context.markClip).not.toHaveBeenCalled()
+    expect(idle.requests).toEqual([
+      {
+        method: 'remote.intent.ack',
+        params: { intentId: 'clip-idle', ok: false, message: 'No active session.' }
+      }
+    ])
+
+    const live = remoteIntentContext({ sessionActive: true })
+    await executeRemoteIntent({ intentId: 'clip-live', intent: { kind: 'clipMark' } }, live.context)
+    expect(live.context.markClip).toHaveBeenCalledOnce()
+    expect(live.requests).toEqual([
+      { method: 'remote.intent.ack', params: { intentId: 'clip-live', ok: true } }
+    ])
+
+    const unsaved = remoteIntentContext({
+      sessionActive: true,
+      markClip: vi.fn(async () => ({
+        ok: false,
+        message: "Recording is off, so this clip can't be saved."
+      }))
+    })
+    await executeRemoteIntent(
+      { intentId: 'clip-unsaved', intent: { kind: 'clipMark' } },
+      unsaved.context
+    )
+    expect(unsaved.requests.at(-1)).toEqual({
+      method: 'remote.intent.ack',
+      params: {
+        intentId: 'clip-unsaved',
+        ok: false,
+        message: "Recording is off, so this clip can't be saved."
+      }
+    })
+  })
+
   it('starts through the Studio handler and acknowledges success', async () => {
     const { context, requests } = remoteIntentContext()
 

@@ -67,7 +67,8 @@ fn valid_windows_pilot_update_token(token: &str) -> bool {
 
 use crate::cohost::{
     CohostAlertKind, CohostErrorDetail, CohostFlagAction, CohostFlagKind, CohostFlagSeverity,
-    CohostFlagTarget, CohostHighlightType, CohostMood, CohostPriority, CohostReason, CohostTone,
+    CohostFlagTarget, CohostHighlightType, CohostMood, CohostPriority, CohostPromiseTriggerKind,
+    CohostReason, CohostTone,
 };
 use crate::streaming::StreamPlatform;
 
@@ -160,7 +161,7 @@ pub struct AiObjectUploadRequest<'a> {
     pub workflow_kind: &'a str,
 }
 
-// --- Live Co-host tick wire types (contract v2, additive over v1; field names are load-bearing) ---
+// --- Live Co-host tick wire types (contract v3, additive over v2 over v1; field names are load-bearing) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -172,15 +173,36 @@ pub struct CohostTickRequest {
     pub consent_to_process_chat: bool,
     pub tone: CohostTone,
     pub notes: String,
-    /// v2 only: the streamer's normalised chat rules. `None` in the v1
-    /// fallback, where the key must not appear at all (the v1 server rejects
-    /// unknown keys as `invalid-request`).
+    /// v2 and later: the streamer's normalised chat rules. `None` in the v1
+    /// fallback, where the key does not appear at all, so a v1 body stays
+    /// byte-identical to what a v1 desktop sends (the server strips unknown
+    /// keys now, but the older bodies are kept exact on purpose).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<String>>,
     pub stream_title: Option<String>,
     pub open_questions: Vec<CohostTickOpenQuestion>,
     pub messages: Vec<CohostTickMessage>,
     pub dropped_messages: u64,
+    /// v3 (plan 068 D7): transcript finals since the previous tick, newest
+    /// 1500 chars. Absent on v1/v2 and when nothing was said. `messages` may
+    /// be empty when this is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+    /// v3: the rolling stream summary the server returned last time (≤ 600
+    /// chars); the server is stateless, the desktop echoes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// v3: the open promises (≤ 20, text ≤ 160; the server rejects more as
+    /// `invalid-request`, so the desktop caps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_promises: Option<Vec<CohostTickOpenPromise>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostTickOpenPromise {
+    pub id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -201,6 +223,9 @@ pub struct CohostTickMessage {
     pub roles: Option<Vec<String>>,
     pub text: String,
     pub at: String,
+    /// v3: the author's first message in the channel. Absent on v1/v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<bool>,
 }
 
 /// Every v2 field is optional and absent means its default, so a v1 body
@@ -235,6 +260,39 @@ pub struct CohostTickResponse {
     pub alerts: Vec<CohostTickAlert>,
     #[serde(default)]
     pub mood_scores: Option<CohostTickMoodScores>,
+    /// v3 (plan 068 D7): the rolling stream summary (echoed back next tick).
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// v3: what the streamer is talking about (≤ 60 chars).
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// v3: the FULL open promise set, like `questions`: `id` echoed for a
+    /// promise the desktop sent, absent for a new one. `None` when the server
+    /// did not speak v3 (the desktop keeps its set).
+    #[serde(default, deserialize_with = "lenient_items_opt")]
+    pub promises: Option<Vec<CohostTickPromise>>,
+    /// v3: promise ids the transcript shows were kept.
+    #[serde(default)]
+    pub fulfilled_promise_ids: Vec<String>,
+    /// v3: a recap for viewers who asked what they missed (≤ 140 chars).
+    #[serde(default)]
+    pub recap: Option<String>,
+}
+
+/// `lenient_items` for an array the desktop must tell apart from an absent
+/// key: `None` when absent or `null`, otherwise the readable items.
+fn lenient_items_opt<'de, D, T>(deserializer: D) -> std::result::Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let items = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?;
+    Ok(items.map(|items| {
+        items
+            .into_iter()
+            .filter_map(|item| serde_json::from_value(item).ok())
+            .collect()
+    }))
 }
 
 /// Item-wise tolerant array: an entry that does not fit the desktop's shape is
@@ -268,6 +326,30 @@ pub struct CohostTickQuestion {
     pub suggested_reply: String,
     #[serde(default)]
     pub from_notes: bool,
+    /// v3: the question is about what the streamer is talking about.
+    #[serde(default)]
+    pub on_topic: bool,
+}
+
+/// v3 promise as the server returns it. An unknown trigger kind lands on
+/// `Unknown` and the engine reads it as `none`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostTickPromise {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub text: String,
+    #[serde(default)]
+    pub trigger: CohostTickPromiseTrigger,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostTickPromiseTrigger {
+    #[serde(default)]
+    pub kind: CohostPromiseTriggerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -903,6 +985,7 @@ impl VideorcApiClient {
         session_client_id: &str,
         wav: Vec<u8>,
         language: Option<&str>,
+        purpose: CaptionChunkPurpose,
     ) -> std::result::Result<CaptionChunkResponse, CaptionChunkFailure> {
         let file_part = multipart::Part::bytes(wav)
             .file_name("videorc-caption-chunk.wav")
@@ -913,6 +996,7 @@ impl VideorcApiClient {
             })?;
         let mut form = multipart::Form::new()
             .text("sessionClientId", session_client_id.to_string())
+            .text("purpose", purpose.as_str())
             .part("audio", file_part);
         if let Some(language) = language {
             form = form.text("language", language.to_string());
@@ -1118,6 +1202,40 @@ pub struct CaptionRealtimeToken {
     pub remaining_seconds: Option<u64>,
 }
 
+/// Which allowance one transcription chunk is metered against (plan 068 D5).
+/// `Captions` wins while captions present: one upload, one charge. `Listen`
+/// is Orcle's own bucket and an old chunk route ignores the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptionChunkPurpose {
+    Captions,
+    Listen,
+}
+
+impl CaptionChunkPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Captions => "captions",
+            Self::Listen => "listen",
+        }
+    }
+}
+
+/// Terminal codes that end only Orcle's listen intent (plan 068 D5): the
+/// listen allowance is separate from captions, so a presenting caption
+/// session keeps going when one of these arrives.
+pub fn is_listen_block_code(code: &str) -> bool {
+    matches!(code, "listen-monthly-quota-exhausted" | "listen-disabled")
+}
+
+/// Terminal codes a caption-metered request (a `captions` chunk, the realtime
+/// token) gets for captions alone: the caption allowance, or the captions
+/// switch. The web answers `ai-disabled` for its global AI switch as well; a
+/// listen chunk that follows tells the two apart. Premium, sign-in, the
+/// account blocklist and server configuration apply to listening too.
+pub fn is_caption_scoped_code(code: &str) -> bool {
+    matches!(code, "captions-monthly-quota-exhausted" | "ai-disabled")
+}
+
 #[derive(Debug, Clone)]
 pub enum CaptionChunkFailure {
     /// Stop the caption session and surface the reason (premium required,
@@ -1135,6 +1253,8 @@ fn classify_caption_failure(status: u16, code: String, message: String) -> Capti
         code.as_str(),
         "cloud-ai-premium-required"
             | "captions-monthly-quota-exhausted"
+            | "listen-monthly-quota-exhausted"
+            | "listen-disabled"
             | "ai-user-disabled"
             | "ai-disabled"
             | "ai-transcription-not-configured"
@@ -1506,6 +1626,25 @@ mod tests {
             CaptionChunkFailure::Transient { code: Some(code), .. }
                 if code == "captions-realtime-disabled"
         ));
+    }
+
+    #[test]
+    fn listen_allowance_failures_are_terminal_and_listen_scoped() {
+        for (status, code) in [
+            (429, "listen-monthly-quota-exhausted"),
+            (503, "listen-disabled"),
+        ] {
+            let failure = classify_caption_failure(status, code.to_string(), "no".to_string());
+            assert!(
+                matches!(&failure, CaptionChunkFailure::Terminal { code: got, .. } if got == code),
+                "{code} must end the listen intent instead of retrying forever"
+            );
+            assert!(is_listen_block_code(code));
+        }
+        assert!(!is_listen_block_code("captions-monthly-quota-exhausted"));
+        assert!(!is_listen_block_code("cloud-ai-premium-required"));
+        assert_eq!(CaptionChunkPurpose::Captions.as_str(), "captions");
+        assert_eq!(CaptionChunkPurpose::Listen.as_str(), "listen");
     }
 
     #[test]

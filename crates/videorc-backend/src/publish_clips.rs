@@ -1,9 +1,10 @@
 //! Clip suggestions and local clip export for the Publish tab.
 //!
-//! Moments are ranked LOCALLY from data the app already has — live-chat
-//! activity spikes aligned to the live-captions transcript — so a session
-//! with chat gets clip-worthy time ranges without any cloud call, and every
-//! suggestion exports as a real file via a local ffmpeg trim.
+//! Moments are ranked LOCALLY from data the app already has — clip marks the
+//! streamer placed by saying "clip that" or pressing Mark clip (plan 068 D6),
+//! then live-chat activity spikes aligned to the live-captions transcript —
+//! so a session gets clip-worthy time ranges without any cloud call, and
+//! every suggestion exports as a real file via a local ffmpeg trim.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -17,7 +18,8 @@ use crate::ai::{CaptionCue, parse_srt};
 use crate::ffmpeg::resolve_ffmpeg_path;
 use crate::process_job::output_owned_tokio;
 use crate::protocol::{
-    ClipExportParams, ClipExportResult, ClipMoment, ClipSuggestParams, ClipSuggestResult,
+    ClipExportParams, ClipExportResult, ClipMark, ClipMarkSource, ClipMoment, ClipMomentSource,
+    ClipSuggestParams, ClipSuggestResult,
 };
 use crate::state::AppState;
 
@@ -27,6 +29,9 @@ const CLIP_DEFAULT_LENGTH_MS: u64 = 45_000;
 const CLIP_MIN_LENGTH_MS: u64 = 5_000;
 const CLIP_MAX_LENGTH_MS: u64 = 90_000;
 const MAX_SUGGESTED_CLIPS: usize = 3;
+/// A mark points at the moment that just happened: the clip is what led up
+/// to it (plan 068 D6).
+const CLIP_MARK_LOOKBACK_MS: u64 = 30_000;
 const CLIP_EXPORT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 pub async fn suggest_clips(
@@ -57,7 +62,11 @@ pub async fn suggest_clips(
         .collect();
 
     let cues = captions_cues_for_session(&state, &params.session_id).await;
-    let moments = rank_chat_spike_moments(&message_offsets_ms, &cues, duration_ms);
+    let marks = state.database.list_clip_marks(&params.session_id)?;
+    let moments = merge_moments(
+        mark_moments(&marks, &cues, duration_ms),
+        rank_chat_spike_moments(&message_offsets_ms, &cues, duration_ms),
+    );
 
     Ok(ClipSuggestResult {
         session_id: params.session_id,
@@ -80,6 +89,93 @@ async fn captions_cues_for_session(state: &AppState, session_id: &str) -> Vec<Ca
         }
     }
     Vec::new()
+}
+
+/// Clip marks become moments first: `[mark - 30 s, mark]`, snapped to cues,
+/// labelled by who placed them. Pure.
+pub fn mark_moments(
+    marks: &[ClipMark],
+    cues: &[CaptionCue],
+    duration_ms: Option<u64>,
+) -> Vec<ClipMoment> {
+    let mut moments: Vec<ClipMoment> = marks
+        .iter()
+        .filter_map(|mark| {
+            let at_ms = (mark.at_seconds.max(0.0) * 1000.0).round() as u64;
+            let mut start_ms = at_ms.saturating_sub(CLIP_MARK_LOOKBACK_MS);
+            let mut end_ms = at_ms.max(start_ms + CLIP_MIN_LENGTH_MS);
+            if let Some(duration) = duration_ms {
+                end_ms = end_ms.min(duration);
+                start_ms = start_ms.min(end_ms.saturating_sub(CLIP_MIN_LENGTH_MS));
+            }
+            let (start_ms, end_ms) = snap_to_cues(start_ms, end_ms, cues);
+            if end_ms < start_ms + CLIP_MIN_LENGTH_MS {
+                return None;
+            }
+            let (reason, source) = match mark.source {
+                ClipMarkSource::Voice => (
+                    format!(
+                        "You said '{}'",
+                        mark.phrase.as_deref().unwrap_or("clip that")
+                    ),
+                    ClipMomentSource::Voice,
+                ),
+                ClipMarkSource::Manual => ("Marked".to_string(), ClipMomentSource::Manual),
+            };
+            Some(ClipMoment {
+                start_ms,
+                end_ms,
+                reason,
+                excerpt: cue_excerpt(cues, start_ms, end_ms),
+                source: Some(source),
+            })
+        })
+        .collect();
+    moments.sort_by_key(|moment| moment.start_ms);
+    moments
+}
+
+/// Marks first, in file order; then the chat spikes that do not overlap one.
+pub fn merge_moments(marks: Vec<ClipMoment>, chat: Vec<ClipMoment>) -> Vec<ClipMoment> {
+    let mut moments = marks;
+    for moment in chat {
+        let overlaps = moments
+            .iter()
+            .any(|existing| existing.start_ms < moment.end_ms && moment.start_ms < existing.end_ms);
+        if !overlaps {
+            moments.push(moment);
+        }
+    }
+    moments
+}
+
+/// Snap to caption cue boundaries so a clip never opens or cuts mid-sentence,
+/// then cap the length.
+fn snap_to_cues(mut start_ms: u64, mut end_ms: u64, cues: &[CaptionCue]) -> (u64, u64) {
+    if let Some(cue) = cues
+        .iter()
+        .find(|cue| cue.start_ms <= start_ms && start_ms < cue.end_ms)
+    {
+        start_ms = cue.start_ms;
+    }
+    if let Some(cue) = cues
+        .iter()
+        .find(|cue| cue.start_ms <= end_ms && end_ms < cue.end_ms)
+    {
+        end_ms = cue.end_ms;
+    }
+    (start_ms, end_ms.min(start_ms + CLIP_MAX_LENGTH_MS))
+}
+
+fn cue_excerpt(cues: &[CaptionCue], start_ms: u64, end_ms: u64) -> String {
+    cues.iter()
+        .filter(|cue| cue.end_ms > start_ms && cue.start_ms < end_ms)
+        .map(|cue| cue.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// Rank chat-activity spikes into clip moments. Pure so the whole ranking is
@@ -146,35 +242,13 @@ pub fn rank_chat_spike_moments(
                 end_ms = end_ms.min(duration);
                 start_ms = start_ms.min(end_ms.saturating_sub(CLIP_MIN_LENGTH_MS));
             }
-            // Snap to caption cue boundaries so a clip never opens or cuts
-            // mid-sentence.
-            if let Some(cue) = cues
-                .iter()
-                .find(|cue| cue.start_ms <= start_ms && start_ms < cue.end_ms)
-            {
-                start_ms = cue.start_ms;
-            }
-            if let Some(cue) = cues
-                .iter()
-                .find(|cue| cue.start_ms <= end_ms && end_ms < cue.end_ms)
-            {
-                end_ms = cue.end_ms;
-            }
-            end_ms = end_ms.min(start_ms + CLIP_MAX_LENGTH_MS);
-            let excerpt = cues
-                .iter()
-                .filter(|cue| cue.end_ms > start_ms && cue.start_ms < end_ms)
-                .map(|cue| cue.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(200)
-                .collect::<String>();
+            let (start_ms, end_ms) = snap_to_cues(start_ms, end_ms, cues);
             ClipMoment {
                 start_ms,
                 end_ms,
                 reason: format!("Chat spiked: {count} messages in 30s"),
-                excerpt,
+                excerpt: cue_excerpt(cues, start_ms, end_ms),
+                source: Some(ClipMomentSource::Chat),
             }
         })
         .filter(|moment| moment.end_ms > moment.start_ms + CLIP_MIN_LENGTH_MS)
@@ -384,6 +458,90 @@ mod tests {
         assert_eq!(moments.len(), 1);
         // 9 spike messages + the baseline message sharing the stronger bucket.
         assert!(moments[0].reason.contains("10 messages"));
+    }
+
+    fn mark(at_seconds: f64, source: ClipMarkSource, phrase: Option<&str>) -> ClipMark {
+        ClipMark {
+            id: format!("mark-{at_seconds}"),
+            session_id: "s-1".to_string(),
+            at_seconds,
+            source,
+            phrase: phrase.map(str::to_string),
+            created_at: "2026-09-27T10:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn marks_become_the_thirty_seconds_before_them_snapped_to_cues_and_labelled() {
+        let cues = [
+            cue(280_000, 292_000, "so I tried the risky refactor"),
+            cue(292_000, 305_000, "and it actually works first try"),
+            cue(305_000, 312_000, "clip that"),
+        ];
+        let marks = [
+            mark(754.2, ClipMarkSource::Manual, None),
+            mark(305.4, ClipMarkSource::Voice, Some("clip that")),
+        ];
+
+        let moments = mark_moments(&marks, &cues, Some(900_000));
+
+        assert_eq!(moments.len(), 2);
+        // The lookback (275.4 s) lands in no cue and stays; the mark itself
+        // is inside the "clip that" cue, so the clip runs to its end.
+        assert_eq!(moments[0].start_ms, 275_400);
+        assert_eq!(moments[0].end_ms, 312_000);
+        assert_eq!(moments[0].reason, "You said 'clip that'");
+        assert_eq!(moments[0].source, Some(ClipMomentSource::Voice));
+        assert!(moments[0].excerpt.contains("actually works"));
+        assert_eq!(moments[1].start_ms, 724_200);
+        assert_eq!(moments[1].end_ms, 754_200);
+        assert_eq!(moments[1].reason, "Marked");
+        assert_eq!(moments[1].source, Some(ClipMomentSource::Manual));
+
+        // A mark right after the start still yields a clip, bounded by the
+        // recording; one that cannot reach the minimum length is dropped.
+        let early = mark_moments(
+            &[mark(2.0, ClipMarkSource::Manual, None)],
+            &[],
+            Some(900_000),
+        );
+        assert_eq!((early[0].start_ms, early[0].end_ms), (0, 5_000));
+        assert!(
+            mark_moments(&[mark(2.0, ClipMarkSource::Manual, None)], &[], Some(3_000)).is_empty()
+        );
+    }
+
+    #[test]
+    fn marks_come_first_and_overlapping_chat_spikes_are_dropped() {
+        // Baseline: one message a minute. Spike: 8 messages around 5:10.
+        let mut offsets: Vec<u64> = (0..10).map(|index| index * 60_000).collect();
+        offsets.extend((0..8).map(|index| 310_000 + index * 1_000));
+        let chat = rank_chat_spike_moments(&offsets, &[], Some(900_000));
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0].source, Some(ClipMomentSource::Chat));
+
+        // A voice mark at 5:20 covers the same moment as the spike.
+        let marks = mark_moments(
+            &[mark(320.0, ClipMarkSource::Voice, Some("clip it"))],
+            &[],
+            Some(900_000),
+        );
+        let merged = merge_moments(marks.clone(), chat.clone());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].reason, "You said 'clip it'");
+
+        // A mark elsewhere keeps the spike after it.
+        let marks = mark_moments(
+            &[mark(700.0, ClipMarkSource::Manual, None)],
+            &[],
+            Some(900_000),
+        );
+        let merged = merge_moments(marks, chat);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].reason, "Marked");
+        assert!(merged[1].reason.starts_with("Chat spiked"));
+        // Marks first even though the spike is earlier in the file.
+        assert!(merged[0].start_ms > merged[1].start_ms);
     }
 
     #[test]

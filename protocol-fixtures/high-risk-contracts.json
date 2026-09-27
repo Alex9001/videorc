@@ -400,13 +400,25 @@
       "sessionId": "session-fixture",
       "messageId": "session-fixture:twitch:default:message-fixture"
     },
+    "promiseParams": {
+      "sessionId": "session-fixture",
+      "promiseId": "p_fixture"
+    },
+    "recapParams": {
+      "sessionId": "session-fixture"
+    },
+    "authorParams": {
+      "sessionId": "session-fixture",
+      "authorKey": "\"twitch\":viewer-fixture"
+    },
     "settingsPatch": {
       "enabled": true,
       "tone": "short",
       "notes": "Keyboard: Keychron Q1",
       "autoHighlight": false,
       "voiceHighlight": true,
-      "rules": ["No spoilers", "English only"]
+      "rules": ["No spoilers", "English only"],
+      "listen": true
     },
     "settings": {
       "enabled": true,
@@ -414,7 +426,8 @@
       "notes": "",
       "autoHighlight": false,
       "voiceHighlight": false,
-      "rules": []
+      "rules": [],
+      "listen": false
     },
     "state": {
       "sessionId": "session-fixture",
@@ -518,7 +531,21 @@
       "status": "listening",
       "reason": null,
       "detail": null,
-      "questions": [],
+      "questions": [
+        {
+          "id": "q_topic",
+          "text": "Which switches?",
+          "messageIds": ["session-fixture:twitch:default:message-fixture"],
+          "askers": ["Viewer"],
+          "platforms": ["twitch"],
+          "priority": "normal",
+          "suggestedReply": "Gateron Reds.",
+          "fromNotes": false,
+          "firstSeenAt": "2026-08-22T10:00:00Z",
+          "updatedAt": "2026-08-22T10:00:20Z",
+          "onTopic": true
+        }
+      ],
       "flags": [
         {
           "messageId": "session-fixture:twitch:default:message-fixture",
@@ -602,7 +629,51 @@
           "reason": "voice",
           "resolvedAt": "2026-08-22T10:00:20Z"
         }
-      ]
+      ],
+      "listening": {
+        "state": "blocked",
+        "reasonCode": "listen-monthly-quota-exhausted",
+        "message": "Orcle's listening allowance for this month is used up.",
+        "remainingSeconds": 0
+      },
+      "topic": "Mechanical keyboards",
+      "promises": [
+        {
+          "id": "p_fixture",
+          "text": "Giveaway at 100 viewers",
+          "trigger": { "kind": "viewers", "value": 100 },
+          "firstSeenAt": "2026-08-22T10:00:00Z"
+        },
+        {
+          "id": "p_fixture_2",
+          "text": "Show the build later",
+          "trigger": { "kind": "none" },
+          "firstSeenAt": "2026-08-22T10:00:10Z"
+        }
+      ],
+      "promiseReminder": {
+        "promiseId": "p_fixture",
+        "text": "Giveaway at 100 viewers",
+        "at": "2026-08-22T10:00:20Z"
+      },
+      "recap": {
+        "text": "So far: unboxed the Q1, compared switches.",
+        "at": "2026-08-22T10:00:20Z",
+        "expiresAt": "2026-08-22T10:05:20Z"
+      },
+      "sayHi": [
+        {
+          "authorKey": "\"twitch\":viewer-fixture",
+          "name": "x_Dark_Knight_x",
+          "platform": "twitch",
+          "firstSeenAt": "2026-08-22T10:00:05Z"
+        }
+      ],
+      "deadAirNudge": {
+        "key": "dead-air-1-1",
+        "text": "Dead air: say hi to x_Dark_Knight_x, it's their first chat.",
+        "at": "2026-08-22T10:00:25Z"
+      }
     },
     "legacyState": {
       "sessionId": null,
@@ -615,5 +686,38 @@
       "tickSeq": 0,
       "partial": false
     }
+  },
+  "clip": {
+    "markedSaved": {
+      "sessionId": "session-fixture",
+      "atSeconds": 754.2,
+      "source": "manual",
+      "saved": true
+    },
+    "markedUnsaved": {
+      "sessionId": "session-fixture",
+      "atSeconds": 61.5,
+      "source": "voice",
+      "saved": false,
+      "reason": "recording-off"
+    },
+    "listParams": { "sessionId": "session-fixture" },
+    "marks": [
+      {
+        "id": "mark-fixture-1",
+        "sessionId": "session-fixture",
+        "atSeconds": 61.5,
+        "source": "voice",
+        "phrase": "clip that",
+        "createdAt": "2026-09-27T10:01:01Z"
+      },
+      {
+        "id": "mark-fixture-2",
+        "sessionId": "session-fixture",
+        "atSeconds": 754.2,
+        "source": "manual",
+        "createdAt": "2026-09-27T10:12:34Z"
+      }
+    ]
   }
 }

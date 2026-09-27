@@ -13,6 +13,8 @@ export interface GlobalShortcutContext {
   startSession: () => Promise<unknown>
   stopSession: () => Promise<unknown>
   toggleMicrophoneMute: () => void
+  /** Plan 068 D6: mark a clip at the current moment. */
+  markClip?: () => void
   switchLayout?: (action: GlobalShortcutAction) => void
 }
 
@@ -43,6 +45,7 @@ export function executeGlobalShortcut(
     return
   }
   if (action === 'mic-toggle') context.toggleMicrophoneMute()
+  if (action === 'clip-mark') context.markClip?.()
 }
 
 // Plan 062: the latest per-action registration outcome, so Settings can mark

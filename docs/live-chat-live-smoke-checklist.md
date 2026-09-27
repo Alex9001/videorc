@@ -149,12 +149,14 @@ web has `VIDEORC_AI_COHOST_DISABLED` off. Offline proof: `pnpm smoke:cohost-fake
 
 ### Show on stream automatically (plan 060)
 
-Prerequisites: live captions ON with a working microphone (the "What I talk about" modes read the
-caption transcript), a real stream going out, and at least one viewer account that can post.
+Prerequisites: "Orcle hears you while you're live" or live captions ON with a working microphone
+(the "What I talk about" modes read the transcript), a real stream going out, and at least one
+viewer account that can post.
 
 - [ ] Settings → Streaming → Orcle → "Show on stream automatically" offers exactly Off, What I
       talk about, and What I talk about and Orcle's picks, with the helper line "What I talk
-      about needs live captions." The row is disabled without Premium like the rest of Orcle.
+      about needs Orcle to hear you (or live captions)." The row is disabled without Premium like
+      the rest of Orcle.
 - [ ] Off: chat, questions and highlights keep working and nothing ever goes on stream by itself.
 - [ ] What I talk about: have a viewer post a comment, then talk about it in your own words
       (do not read it out). Within a few seconds the comment row shows the quiet "Talking about

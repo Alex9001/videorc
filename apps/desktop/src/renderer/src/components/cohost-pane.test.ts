@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
 import { CohostFlagRow } from '@/components/cohost-flag-row'
-import { CohostPane } from '@/components/cohost-pane'
+import { CohostListenPrompt, CohostPane } from '@/components/cohost-pane'
 import { CohostQuestionRow } from '@/components/cohost-question-row'
 import { Command } from '@/components/ui/command'
 import type { CohostFlag, CohostQuestion, CohostState } from '@/lib/backend'
@@ -66,6 +66,30 @@ function renderPane(props: Partial<Parameters<typeof CohostPane>[0]> = {}): stri
 }
 
 describe('CohostQuestionRow', () => {
+  it('badges an on-topic question and nothing else (plan 068)', () => {
+    const onTopic = renderRow(
+      createElement(CohostQuestionRow, {
+        nowMs: NOW,
+        question: question({ onTopic: true }),
+        selected: false,
+        onReply: () => undefined,
+        onSelect: () => undefined
+      })
+    )
+    expect(onTopic).toContain('data-slot="cohost-on-topic"')
+    expect(onTopic).toContain('On topic')
+    const plain = renderRow(
+      createElement(CohostQuestionRow, {
+        nowMs: NOW,
+        question: question(),
+        selected: false,
+        onReply: () => undefined,
+        onSelect: () => undefined
+      })
+    )
+    expect(plain).not.toContain('data-slot="cohost-on-topic"')
+  })
+
   it('reads as one dense line: question, askers, age', () => {
     const markup = renderRow(
       createElement(CohostQuestionRow, {
@@ -192,10 +216,127 @@ describe('CohostFlagRow', () => {
 })
 
 describe('CohostPane', () => {
+  it('shows the topic, promises with their trigger hint, and the recap card (plan 068)', () => {
+    const markup = renderPane({
+      state: state({
+        topic: 'mechanical keyboards',
+        promises: [
+          {
+            id: 'p_1',
+            text: 'Giveaway at 100 viewers',
+            trigger: { kind: 'viewers', value: 100 },
+            firstSeenAt: '2026-08-22T11:50:00.000Z'
+          },
+          {
+            id: 'p_2',
+            text: 'Show the build',
+            trigger: { kind: 'none' },
+            firstSeenAt: '2026-08-22T11:55:00.000Z'
+          }
+        ],
+        // The pane clocks expiry on Date.now(); a far-future expiry keeps
+        // the card current whenever the test runs.
+        recap: {
+          text: 'So far: unboxed the parts.',
+          at: '2026-08-22T11:59:00.000Z',
+          expiresAt: '2099-01-01T00:00:00.000Z'
+        }
+      }),
+      onPromiseDone: () => undefined,
+      onPromiseDismiss: () => undefined,
+      onRecapDismiss: () => undefined,
+      onRecapPost: () => undefined,
+      onRecapDraft: () => undefined
+    })
+    expect(markup).toContain('data-slot="cohost-topic"')
+    expect(markup).toContain('Talking about:')
+    expect(markup).toContain('mechanical keyboards')
+    expect(markup).toContain('data-slot="cohost-promises"')
+    expect(markup).toContain('Giveaway at 100 viewers')
+    expect(markup).toContain('at 100 viewers')
+    expect(markup).toContain('Show the build')
+    expect(markup).toContain('>Done<')
+    expect(markup).toContain('>Dismiss<')
+    expect(markup).toContain('data-slot="cohost-recap"')
+    expect(markup).toContain('So far: unboxed the parts.')
+    expect(markup).toContain('Post to chat')
+    // A live recap card replaces the draft button; nothing sends from here.
+    expect(markup).not.toContain('Draft a recap')
+    expect(markup).not.toContain('>Send<')
+  })
+
+  it('lists first-time chatters to say hi to, each with a Greeted button (plan 068 D9)', () => {
+    const markup = renderPane({
+      state: state({
+        sayHi: [
+          {
+            authorKey: '"twitch":id-sam',
+            name: 'x_Dark_Knight_x',
+            platform: 'twitch',
+            firstSeenAt: '2026-08-22T11:57:00.000Z'
+          },
+          {
+            authorKey: '"youtube":id-bo',
+            name: 'Bo',
+            platform: 'youtube',
+            firstSeenAt: '2026-08-22T11:59:40.000Z'
+          }
+        ]
+      }),
+      onSayHiGreeted: () => undefined
+    })
+    expect(markup).toContain('data-slot="cohost-say-hi"')
+    expect(markup).toContain('>Say hi<')
+    expect(markup.split('data-slot="cohost-say-hi-row"')).toHaveLength(3)
+    expect(markup).toContain('x_Dark_Knight_x')
+    expect(markup).toContain('aria-label="Twitch"')
+    expect(markup).toContain('aria-label="YouTube"')
+    expect(markup).toContain('>Greeted<')
+    // Nothing waiting: no section at all.
+    expect(renderPane({ state: state() })).not.toContain('data-slot="cohost-say-hi"')
+    // Without the relay the button cannot act.
+    expect(
+      renderPane({
+        state: state({
+          sayHi: [
+            {
+              authorKey: 'k',
+              name: 'Sam',
+              platform: 'kick',
+              firstSeenAt: '2026-08-22T11:59:00.000Z'
+            }
+          ]
+        })
+      })
+    ).toMatch(/disabled=""[^>]*>Greeted</)
+  })
+
+  it('offers a recap draft while none is shown, and hides an expired recap', () => {
+    const drafting = renderPane({ state: state(), onRecapDraft: () => undefined })
+    expect(drafting).toContain('data-slot="cohost-recap-draft"')
+    expect(drafting).toContain('Draft a recap')
+    expect(drafting).not.toContain('data-slot="cohost-topic"')
+    expect(drafting).not.toContain('data-slot="cohost-promises"')
+    const expired = renderPane({
+      state: state({
+        recap: {
+          text: 'old',
+          at: '2026-08-22T09:00:00.000Z',
+          expiresAt: '2026-08-22T09:05:00.000Z'
+        }
+      }),
+      onRecapDraft: () => undefined
+    })
+    expect(expired).not.toContain('data-slot="cohost-recap"')
+    expect(expired).toContain('Draft a recap')
+    // Without a draft handler (no relay), nothing is offered.
+    expect(renderPane({ state: state() })).not.toContain('Draft a recap')
+  })
+
   it('names the empty state instead of showing nothing', () => {
     const markup = renderPane({ state: state({ questions: [], flags: [] }) })
-    expect(markup).toContain('Listening. Questions from chat will appear here.')
-    expect(markup).toContain('listening')
+    expect(markup).toContain('Reading chat. Questions will appear here.')
+    expect(markup).toContain('reading chat')
   })
 
   it('replaces itself with a one-line upsell for a Basic account', () => {
@@ -292,15 +433,15 @@ describe('CohostPane', () => {
     expect(markup).toContain('data-tone="destructive"')
     expect(markup).toContain(`title="${detail}"`)
     expect(markup).toContain('data-slot="cohost-error-detail"')
-    expect(markup).toContain('once Orcle is listening again')
-    expect(markup).not.toContain('Listening. Questions')
+    expect(markup).toContain('once Orcle is reading chat again')
+    expect(markup).not.toContain('Reading chat. Questions')
     // Monochrome: only the presence DOT carries the error accent; the label and
     // the detail line stay chrome.
     expect(markup).not.toContain('text-destructive')
 
     const healthy = renderPane({ state: state() })
     expect(healthy).not.toContain('data-slot="cohost-error-detail"')
-    expect(healthy).toContain('Listening. Questions from chat will appear here.')
+    expect(healthy).toContain('Reading chat. Questions will appear here.')
   })
   it('mirrors the working shimmer in the segment header while chat is queued', () => {
     const reading = renderPane({ state: state({ pendingMessages: 4 }) })
@@ -308,7 +449,7 @@ describe('CohostPane', () => {
     expect(reading).toContain('>reading 4 new…<')
     // The empty state stops claiming "Listening —" while there is real work.
     expect(reading).toContain('Reading 4 new messages…')
-    expect(reading).not.toContain('Listening. Questions')
+    expect(reading).not.toContain('Reading chat. Questions')
 
     const thinking = renderPane({ state: state({ tickInFlight: true, pendingMessages: 4 }) })
     expect(thinking).toContain('typing-dot-fast')
@@ -330,5 +471,30 @@ describe('CohostPane', () => {
     })
     expect(markup).toContain('grouped 2 questions')
     expect(markup).not.toContain('>1 q<')
+  })
+})
+
+describe('the one-time listening card (plan 068 D3)', () => {
+  const renderPrompt = (enabled: boolean, listen: boolean | undefined): string =>
+    renderToStaticMarkup(
+      createElement(CohostListenPrompt, { enabled, listen, onTurnOn: () => undefined })
+    )
+
+  it('asks an Orcle user with listening off', () => {
+    const markup = renderPrompt(true, false)
+    expect(markup).toContain('data-slot="cohost-listen-prompt"')
+    expect(markup).toContain('Orcle can hear you while you&#x27;re live')
+    // The consent names the cloud step and what is (not) kept (plan 068 D3).
+    expect(markup).toContain('goes to Videorc&#x27;s cloud speech-to-text to be turned into text')
+    expect(markup).toContain('Videorc servers don&#x27;t keep it.')
+    expect(markup).toContain('The transcript is saved with your recording on')
+    expect(markup).toContain('>Turn on<')
+    expect(markup).toContain('>Not now<')
+  })
+
+  it('stays away when listening is on or unknown, or Orcle cannot run', () => {
+    expect(renderPrompt(true, true)).toBe('')
+    expect(renderPrompt(true, undefined)).toBe('')
+    expect(renderPrompt(false, false)).toBe('')
   })
 })

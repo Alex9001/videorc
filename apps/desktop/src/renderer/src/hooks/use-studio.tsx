@@ -3,6 +3,7 @@ import { LazyLiveSourceSelectionController } from '@/lib/live-source-selection-l
 import { confirmedSourceSelection } from '@/lib/source-selection-confirmed'
 import type { LiveSourceSelectionState } from '@/lib/live-source-selection'
 import { globalShortcutLayout, nextEligibleLayout } from '../../../shared/global-shortcuts'
+import { clipMarkedToast } from '../../../shared/clip-marks'
 import { BUILTIN_LAYOUTS } from '@/lib/layout-framing-memory'
 import { useScenePresets } from '@/hooks/use-scene-presets'
 import {
@@ -194,10 +195,13 @@ import type {
   AccountCallbackEnvelope,
   AiCapabilities,
   CohostActionCommand,
+  CohostAuthorParams,
   CohostEnableCommand,
   CohostFlagParams,
+  CohostPromiseParams,
   CohostQuestion,
   CohostQuestionParams,
+  CohostRecapParams,
   CohostSettings,
   CohostSettingsPatch,
   CohostState,
@@ -223,6 +227,8 @@ import type {
   CompositorStatus,
   DiagnosticStats,
   ClipExportResult,
+  ClipMarkCommand,
+  ClipMarkedEvent,
   ClipSuggestResult,
   Device,
   DeviceList,
@@ -270,6 +276,7 @@ import type {
   OAuthCallbackEnvelope,
   OAuthStartResult,
   OAuthProviderCredentialStatus,
+  RecordingFinalizationEvent,
   RecordingStatus,
   RemoteControlStatus,
   RemoteLanPairing,
@@ -1281,6 +1288,9 @@ export type StudioContextValue = {
   suggestClips: (sessionId: string) => Promise<ClipSuggestResult | null>
   /** Trim a clip out of the recording locally (ffmpeg, next to the file). */
   exportClip: (sessionId: string, startMs: number, endMs: number) => Promise<void>
+  /** Mark the current moment for a clip (plan 068 D6). The `clip.marked`
+   * event, not the reply, carries the toast so every source reads the same. */
+  markClip: () => Promise<ClipMarkedEvent | null>
   assessRecording: (path: string) => Promise<FileAssessment>
   repairRecording: (path: string) => Promise<GateStatus>
   restoreRecording: (path: string) => Promise<boolean>
@@ -2008,6 +2018,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const sessionsRef = useRef<SessionSummary[]>([])
   sessionsRef.current = sessions
   const remuxSessionRef = useRef<((sessionId: string) => Promise<void>) | null>(null)
+  // Plan 068 D10: sessions whose transcript SRT landed (`captions-srt-written`
+  // precedes their `finalized` event), and the lazy post-stream pack trigger.
+  const transcriptWrittenSessionIdsRef = useRef(new Set<string>())
+  // Sessions whose Orcle listening reached `on`: only those make the pack.
+  const orcleListenedSessionIdsRef = useRef(new Set<string>())
+  const autoRunPostStreamPackRef = useRef<((event: RecordingFinalizationEvent) => void) | null>(
+    null
+  )
   const [sessionsNextCursor, setSessionsNextCursor] = useState<string | null>(null)
   const [sessionsLoadingMore, setSessionsLoadingMore] = useState(false)
   const sessionListGenerationRef = useRef(0)
@@ -2434,10 +2452,36 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           })
         })
     })
+    // Mark clip from the Stream Manager (plan 068 D6): the same relay shape
+    // as clear, resolved with where the mark landed.
+    const offClipMark = window.videorc?.onClipMarkRequest?.((command: ClipMarkCommand) => {
+      void (async () => {
+        if (!client) throw new Error('Backend socket is not connected.')
+        if (!isActiveRecordingState(recordingRef.current.state)) {
+          throw new Error('No session is running, so there is nothing to mark.')
+        }
+        return client.request<ClipMarkedEvent>('clip.mark')
+      })()
+        .then(async (event) => {
+          await window.videorc?.pushClipMarkResult?.({
+            requestId: command.requestId,
+            ok: true,
+            value: event
+          })
+        })
+        .catch(async (error) => {
+          await window.videorc?.pushClipMarkResult?.({
+            requestId: command.requestId,
+            ok: false,
+            error: error instanceof Error ? error.message : 'Could not mark the clip.'
+          })
+        })
+    })
     return () => {
       cancelled = true
       offState?.()
       offClear?.()
+      offClipMark?.()
     }
   }, [client])
   // Backend-authoritative comment highlight. The renderer owns only the
@@ -3701,6 +3745,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     if (merged === previous) return
     cohostStateRef.current = merged
     setCohostState(merged)
+    if (merged.sessionId && merged.listening?.state === 'on') {
+      orcleListenedSessionIdsRef.current.add(merged.sessionId)
+    }
     // Toast discipline: the pane and the destination chip already show every
     // co-host state. Only a NEW failure (reason + server error code) is news;
     // backoff retries of the same failure stay silent.
@@ -3712,6 +3759,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
 
   const cohostGate = useMemo(() => liveCohostGate(entitlements), [entitlements])
   const cohostEnabled = cohostSettings?.enabled === true
+  const cohostListen = cohostSettings?.listen === true
   const cohostLiveSessionId = liveChatSnapshot.sessionId ?? null
 
   // Persisted co-host preferences live in the backend profile, not in local
@@ -3780,8 +3828,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         | 'cohost.question.answered'
         | 'cohost.question.dismiss'
         | 'cohost.question.restore'
-        | 'cohost.flag.dismiss',
-      params: CohostQuestionParams | CohostFlagParams
+        | 'cohost.flag.dismiss'
+        | 'cohost.promise.done'
+        | 'cohost.promise.dismiss'
+        | 'cohost.recap.dismiss'
+        | 'cohost.recap.draft'
+        | 'cohost.author.greeted',
+      params:
+        | CohostQuestionParams
+        | CohostFlagParams
+        | CohostPromiseParams
+        | CohostRecapParams
+        | CohostAuthorParams
     ): Promise<CohostState> => {
       if (!client) throw new Error('Backend socket is not connected.')
       setCohostActionPending(true)
@@ -3907,9 +3965,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       entitlementReason: cohostGate.allowed ? null : cohostGate.reason,
       upgradeUrl: (cohostGate.allowed ? undefined : cohostGate.upgradeUrl) ?? null,
       consented: aiConsent,
-      enabled: cohostEnabled
+      enabled: cohostEnabled,
+      listen: cohostListen
     }),
-    [aiConsent, cohostEnabled, cohostGate, cohostState]
+    [aiConsent, cohostEnabled, cohostGate, cohostListen, cohostState]
   )
 
   const cohostWindowStateRef = useRef(cohostWindowState)
@@ -3918,21 +3977,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     void window.videorc?.pushCohostWindowState?.(cohostWindowState)
   }, [cohostWindowState])
 
-  // "Turn on co-host" from the Comments window's presence popover or nudge.
-  // Both settings (engine enabled, cloud-AI consent) are main-renderer owned,
-  // so the window asks and gets the resolved window state back.
+  // "Turn on co-host" from the Comments window's presence popover or nudge, and
+  // "Turn on" listening from its one-time card (plan 068 D3). The settings
+  // (engine enabled, listening, cloud-AI consent) are main-renderer owned, so
+  // the window asks and gets the resolved window state back.
   useEffect(() => {
     const off = window.videorc?.onCohostEnableRequest?.((command: CohostEnableCommand) => {
       void (async () => {
         if (command.grantConsent === true) setAiConsent(true)
-        const settingsPatch: CohostSettingsPatch = { enabled: command.enabled }
+        const settingsPatch: CohostSettingsPatch = {
+          enabled: command.enabled,
+          ...(typeof command.listen === 'boolean' ? { listen: command.listen } : {})
+        }
         if (!client) throw new Error('Backend socket is not connected.')
         const next = await client.request<CohostSettings>('cohost.settings.set', settingsPatch)
         setCohostSettings(next)
         return {
           ...cohostWindowStateRef.current,
           consented: command.grantConsent === true || cohostWindowStateRef.current.consented,
-          enabled: next.enabled
+          enabled: next.enabled,
+          listen: next.listen === true
         } satisfies CohostWindowState
       })()
         .then(async (state) => {
@@ -3961,6 +4025,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           return runCohostAction('cohost.flag.dismiss', {
             sessionId: command.sessionId,
             messageId: command.targetId
+          })
+        }
+        // Plan 068 D8: promises and recaps, relayed like questions.
+        if (command.kind === 'promise-done' || command.kind === 'promise-dismiss') {
+          return runCohostAction(
+            command.kind === 'promise-done' ? 'cohost.promise.done' : 'cohost.promise.dismiss',
+            { sessionId: command.sessionId, promiseId: command.targetId }
+          )
+        }
+        if (command.kind === 'recap-dismiss' || command.kind === 'recap-draft') {
+          return runCohostAction(
+            command.kind === 'recap-draft' ? 'cohost.recap.draft' : 'cohost.recap.dismiss',
+            { sessionId: command.sessionId }
+          )
+        }
+        // Plan 068 D9: the Greeted button on a "Say hi" row.
+        if (command.kind === 'author-greeted') {
+          return runCohostAction('cohost.author.greeted', {
+            sessionId: command.sessionId,
+            authorKey: command.targetId
           })
         }
         const method =
@@ -5826,6 +5910,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             }
           })
         }
+        if (event.state === 'finalized') {
+          autoRunPostStreamPackRef.current?.(event)
+        }
       }),
       nextClient.on('noiseCleanup.status', (payload) => {
         const job = payload
@@ -6007,6 +6094,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         }
         if (event.code.startsWith('recording-quality-')) {
           void refreshSessions(nextClient)
+        }
+        if (event.code === 'captions-srt-written' && event.sessionId) {
+          transcriptWrittenSessionIdsRef.current.add(event.sessionId)
         }
         if (event.code === 'microphone-input-lost') {
           void publishMicrophoneInputLost(event)
@@ -6283,6 +6373,15 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       }),
       nextClient.on('cohost.state', (payload) => {
         commitCohostState(payload as CohostState)
+      }),
+      // Clip that (plan 068 D6): one toast per mark, whether it came from a
+      // spoken phrase, a shortcut, a deck key, or the Stream Manager.
+      nextClient.on('clip.marked', (payload) => {
+        const copy = clipMarkedToast(payload as ClipMarkedEvent)
+        ;(copy.kind === 'success' ? toast.success : toast.warning)(copy.title, {
+          id: 'clip-marked',
+          description: copy.description
+        })
       }),
       nextClient.on('comments.highlight.status', (payload) => {
         commentHighlightRevision += 1
@@ -12937,6 +13036,36 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       reportError
     ]
   )
+  // Plan 068 D10: a finished streamed + recorded session with a transcript
+  // makes its own publish pack, once (lib/post-stream-pack.ts, lazy).
+  autoRunPostStreamPackRef.current = (event) => {
+    const activeClient = clientRef.current
+    const transcriptWritten = transcriptWrittenSessionIdsRef.current.delete(event.sessionId)
+    const orcleListened = orcleListenedSessionIdsRef.current.delete(event.sessionId)
+    if (!activeClient) return
+    void import('@/lib/post-stream-pack')
+      .then((pack) =>
+        pack.autoRunPostStreamPack(event, {
+          request: activeClient.request.bind(activeClient),
+          sessions: sessionsRef.current,
+          transcriptWritten,
+          orcleListened,
+          listenOn: cohostListen,
+          consent: aiConsent,
+          runningSessionId: aiRunningSessionId,
+          readiness: {
+            account,
+            capabilities: aiCapabilities,
+            error: aiReadinessError,
+            loading: aiReadinessLoading,
+            quota: aiQuota
+          },
+          setRunningSessionId: setAiRunningSessionId,
+          refreshSessions: () => refreshSessions(activeClient)
+        })
+      )
+      .catch(() => undefined)
+  }
 
   const exportPublishPack = useCallback(
     async (sessionId: string) => {
@@ -13009,6 +13138,26 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     },
     [client, reportError]
   )
+
+  const markClip = useCallback(async (): Promise<ClipMarkedEvent | null> => {
+    if (!client) {
+      toast.error('Mark clip', { description: 'Backend is not connected. Try again in a moment.' })
+      return null
+    }
+    if (!isActiveRecordingState(recordingRef.current.state)) {
+      toast.info('Nothing to mark yet.', {
+        id: 'clip-marked',
+        description: 'Start recording or go live, then mark the moments you want clipped.'
+      })
+      return null
+    }
+    try {
+      return await client.request<ClipMarkedEvent>('clip.mark')
+    } catch (error) {
+      reportError(error)
+      return null
+    }
+  }, [client, reportError])
 
   const assessRecording = useCallback(
     async (sessionId: string): Promise<FileAssessment> => {
@@ -13722,6 +13871,17 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             message: error instanceof Error ? error.message : 'Could not clear the comment.'
           }
         }
+      },
+      markClip: async () => {
+        try {
+          const event = await client.request<ClipMarkedEvent>('clip.mark')
+          return event.saved ? { ok: true } : { ok: false, message: clipMarkedToast(event).title }
+        } catch (error) {
+          return {
+            ok: false,
+            message: error instanceof Error ? error.message : 'Could not mark the clip.'
+          }
+        }
       }
     }
     const intentKind = (payload as { kind?: unknown } | null)?.kind
@@ -13937,6 +14097,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             microphoneMuted: !current.audio.microphoneMuted
           }
         }))
+      },
+      markClip: () => {
+        void markClip()
       }
     }
     if (action.startsWith('layout')) return context.switchLayout?.(action)
@@ -14299,6 +14462,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       exportPublishPack,
       suggestClips,
       exportClip,
+      markClip,
       assessRecording,
       repairRecording,
       restoreRecording,
@@ -14525,6 +14689,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       exportPublishPack,
       suggestClips,
       exportClip,
+      markClip,
       assessRecording,
       repairRecording,
       restoreRecording,

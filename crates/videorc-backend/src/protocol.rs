@@ -4085,6 +4085,29 @@ pub struct CohostFlagParams {
     pub message_id: String,
 }
 
+/// `cohost.promise.done` / `cohost.promise.dismiss` (plan 068 D8).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostPromiseParams {
+    pub session_id: String,
+    pub promise_id: String,
+}
+
+/// `cohost.recap.dismiss` / `cohost.recap.draft` (plan 068 D8).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostRecapParams {
+    pub session_id: String,
+}
+
+/// `cohost.author.greeted` (plan 068 D9): `authorKey` as `sayHi` carries it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CohostAuthorParams {
+    pub session_id: String,
+    pub author_key: String,
+}
+
 /// `cohost.settings.set`: every field optional; absent fields are unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -4102,6 +4125,9 @@ pub struct CohostSettingsPatch {
     /// Replaces the whole list; the engine normalises it (trim, <= 10 x 120).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<String>>,
+    /// Orcle hears the microphone while live (plan 068 D2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4149,6 +4175,63 @@ pub struct ClipMoment {
     pub end_ms: u64,
     pub reason: String,
     pub excerpt: String,
+    /// Where the moment came from (plan 068 D6). Omitted, never null, so an
+    /// older renderer keeps loading the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ClipMomentSource>,
+}
+
+/// What produced a clip suggestion: a spoken "clip that", a manual mark, or
+/// a chat spike.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipMomentSource {
+    Voice,
+    Manual,
+    Chat,
+}
+
+/// Who placed a clip mark (plan 068 D6).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipMarkSource {
+    Voice,
+    Manual,
+}
+
+/// One persisted clip mark: a recording-file time the streamer wants clipped.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipMark {
+    pub id: String,
+    pub session_id: String,
+    /// Recording-file time in seconds (capture-relative).
+    pub at_seconds: f64,
+    pub source: ClipMarkSource,
+    /// The spoken phrase for a voice mark ("clip that"). Omitted, never null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phrase: Option<String>,
+    pub created_at: String,
+}
+
+/// `clip.marked` event and the `clip.mark` reply: where the mark landed and
+/// whether it was stored. `saved: false` carries a `reason` code
+/// (`recording-off`) so the toast can say why nothing was kept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipMarkedEvent {
+    pub session_id: String,
+    pub at_seconds: f64,
+    pub source: ClipMarkSource,
+    pub saved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipMarksListParams {
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5449,6 +5532,34 @@ mod tests {
     }
 
     #[test]
+    fn shared_high_risk_contract_fixture_matches_clip_mark_dtos() {
+        let saved_wire = shared_high_risk_contract_fixture_value("/clip/markedSaved");
+        let saved: ClipMarkedEvent = serde_json::from_value(saved_wire.clone()).unwrap();
+        assert!(saved.saved);
+        assert_eq!(saved.source, ClipMarkSource::Manual);
+        assert_eq!(saved.reason, None);
+        // Omitted, never null: the serde-null trap.
+        assert_eq!(serde_json::to_value(saved).unwrap(), saved_wire);
+
+        let unsaved_wire = shared_high_risk_contract_fixture_value("/clip/markedUnsaved");
+        let unsaved: ClipMarkedEvent = serde_json::from_value(unsaved_wire.clone()).unwrap();
+        assert!(!unsaved.saved);
+        assert_eq!(unsaved.reason.as_deref(), Some("recording-off"));
+        assert_eq!(serde_json::to_value(unsaved).unwrap(), unsaved_wire);
+
+        let params_wire = shared_high_risk_contract_fixture_value("/clip/listParams");
+        let params: ClipMarksListParams = serde_json::from_value(params_wire).unwrap();
+        assert_eq!(params.session_id, "session-fixture");
+
+        let marks_wire = shared_high_risk_contract_fixture_value("/clip/marks");
+        let marks: Vec<ClipMark> = serde_json::from_value(marks_wire.clone()).unwrap();
+        assert_eq!(marks[0].source, ClipMarkSource::Voice);
+        assert_eq!(marks[0].phrase.as_deref(), Some("clip that"));
+        assert_eq!(marks[1].phrase, None);
+        assert_eq!(serde_json::to_value(marks).unwrap(), marks_wire);
+    }
+
+    #[test]
     fn shared_high_risk_contract_fixture_matches_cohost_dtos() {
         let start_wire = shared_high_risk_contract_fixture_value("/cohost/startParams");
         let start: CohostStartParams = serde_json::from_value(start_wire.clone()).unwrap();
@@ -5563,7 +5674,7 @@ mod tests {
         );
         assert_eq!(v2.recently_resolved[0].question.id, "q_fixture");
         assert_eq!(v2.recently_resolved[0].resolved_at, "2026-08-22T10:00:20Z");
-        assert_eq!(serde_json::to_value(v2).unwrap(), v2_wire);
+        assert_eq!(serde_json::to_value(&v2).unwrap(), v2_wire);
         // `voiceHighlight` (plan 060) defaults off on a settings row or patch
         // from before the field.
         assert!(settings_wire.get("voiceHighlight").is_some());
@@ -5574,6 +5685,19 @@ mod tests {
         assert!(legacy_settings.auto_highlight);
         assert!(!legacy_settings.voice_highlight);
         assert_eq!(patch.voice_highlight, Some(true));
+        // `listen` (plan 068) defaults off on a settings row from before the
+        // field; the patch carries it explicitly.
+        assert!(!legacy_settings.listen);
+        assert_eq!(patch.listen, Some(true));
+        assert_eq!(
+            v2.listening,
+            Some(crate::cohost::CohostListening {
+                state: crate::cohost::CohostListeningState::Blocked,
+                reason_code: Some("listen-monthly-quota-exhausted".to_string()),
+                message: Some("Orcle's listening allowance for this month is used up.".to_string()),
+                remaining_seconds: Some(0),
+            })
+        );
 
         // A payload from before `detail` and the presence fields existed still
         // parses (serde defaults).
@@ -5595,6 +5719,62 @@ mod tests {
         // The restore RPC reuses the question params verbatim.
         let restore: CohostQuestionParams = serde_json::from_value(question_wire).unwrap();
         assert_eq!(restore.question_id, "q_fixture");
+        // Plan 068 S5 (tick v3): promise and recap params, and the topic,
+        // promises, reminder, recap and on-topic flag on the state; every one
+        // of them absent (never null) on the legacy payload.
+        let promise_wire = shared_high_risk_contract_fixture_value("/cohost/promiseParams");
+        let promise: CohostPromiseParams = serde_json::from_value(promise_wire.clone()).unwrap();
+        assert_eq!(promise.promise_id, "p_fixture");
+        assert_eq!(serde_json::to_value(promise).unwrap(), promise_wire);
+        let recap_wire = shared_high_risk_contract_fixture_value("/cohost/recapParams");
+        let recap: CohostRecapParams = serde_json::from_value(recap_wire.clone()).unwrap();
+        assert_eq!(recap.session_id, "session-fixture");
+        assert_eq!(serde_json::to_value(recap).unwrap(), recap_wire);
+        assert_eq!(v2.topic.as_deref(), Some("Mechanical keyboards"));
+        assert_eq!(v2.promises.len(), 2);
+        assert_eq!(
+            v2.promises[0].trigger,
+            crate::cohost::CohostPromiseTrigger {
+                kind: crate::cohost::CohostPromiseTriggerKind::Viewers,
+                value: Some(100),
+            }
+        );
+        assert_eq!(
+            v2.promises[1].trigger.kind,
+            crate::cohost::CohostPromiseTriggerKind::None
+        );
+        assert_eq!(v2.promises[1].trigger.value, None);
+        assert_eq!(
+            v2.promise_reminder.as_ref().map(|r| r.promise_id.as_str()),
+            Some("p_fixture")
+        );
+        assert_eq!(
+            v2.recap.as_ref().map(|r| r.expires_at.as_str()),
+            Some("2026-08-22T10:05:20Z")
+        );
+        assert!(v2.questions[0].on_topic);
+        assert_eq!(legacy.topic, None);
+        assert!(legacy.promises.is_empty());
+        assert_eq!(legacy.promise_reminder, None);
+        assert_eq!(legacy.recap, None);
+        // Plan 068 S6: the Greeted params, "Say hi" and the dead-air nudge;
+        // both absent (never null) on the legacy payload.
+        let author_wire = shared_high_risk_contract_fixture_value("/cohost/authorParams");
+        let author: CohostAuthorParams = serde_json::from_value(author_wire.clone()).unwrap();
+        assert_eq!(author.author_key, "\"twitch\":viewer-fixture");
+        assert_eq!(serde_json::to_value(author).unwrap(), author_wire);
+        assert_eq!(v2.say_hi.len(), 1);
+        assert_eq!(v2.say_hi[0].name, "x_Dark_Knight_x");
+        assert_eq!(
+            v2.say_hi[0].platform,
+            crate::streaming::StreamPlatform::Twitch
+        );
+        assert_eq!(
+            v2.dead_air_nudge.as_ref().map(|nudge| nudge.key.as_str()),
+            Some("dead-air-1-1")
+        );
+        assert!(legacy.say_hi.is_empty());
+        assert_eq!(legacy.dead_air_nudge, None);
     }
 
     #[test]

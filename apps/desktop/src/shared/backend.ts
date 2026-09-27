@@ -2891,12 +2891,47 @@ export interface AiWorkflowResult {
   artifacts: AiArtifact[]
 }
 
-/** A clip-worthy time range, ranked locally from chat activity + captions. */
+/** Where a clip suggestion came from (plan 068 D6). */
+export type ClipMomentSource = 'voice' | 'manual' | 'chat'
+
+/** A clip-worthy time range: a mark the streamer placed, or a chat spike,
+ * snapped to captions. */
 export interface ClipMoment {
   startMs: number
   endMs: number
   reason: string
   excerpt: string
+  /** Omitted by an older backend, so a missing source reads as chat. */
+  source?: ClipMomentSource
+}
+
+/** Who placed a clip mark: a spoken "clip that" or the Mark clip control. */
+export type ClipMarkSource = 'voice' | 'manual'
+
+/** One persisted clip mark at a recording-file time (plan 068 D6). */
+export interface ClipMark {
+  id: string
+  sessionId: string
+  atSeconds: number
+  source: ClipMarkSource
+  /** The spoken phrase for a voice mark. Omitted, never null. */
+  phrase?: string
+  createdAt: string
+}
+
+/** `clip.marked` event and the `clip.mark` reply. `saved: false` carries a
+ * reason code (`recording-off`): the moment was heard but nothing was kept. */
+export interface ClipMarkedEvent {
+  sessionId: string
+  atSeconds: number
+  source: ClipMarkSource
+  saved: boolean
+  reason?: string
+}
+
+/** Stream Manager → main renderer: mark a clip now (plan 068 D6). */
+export interface ClipMarkCommand {
+  requestId: string
 }
 
 export interface ClipSuggestResult {
@@ -3687,6 +3722,8 @@ export interface GlobalShortcutsConfig {
   recordToggle?: string
   streamToggle?: string
   micToggle?: string
+  /** Mark a clip at the current moment (plan 068 D6). Unbound by default. */
+  clipMark?: string
 }
 
 export interface GlobalShortcutsResult {
@@ -3756,6 +3793,12 @@ export interface VideorcApi {
   pushCommentsClearResult: (
     resolution: CommentsCommandResolution<LiveChatSnapshot>
   ) => Promise<boolean>
+  /** Mark clip from the Stream Manager (plan 068 D6): the MAIN renderer owns
+   * the backend socket and makes the `clip.mark` RPC; the reply says where the
+   * mark landed and whether it was saved. */
+  markClipFromCommentsWindow: (command: ClipMarkCommand) => Promise<ClipMarkedEvent>
+  onClipMarkRequest: (callback: (command: ClipMarkCommand) => void) => () => void
+  pushClipMarkResult: (resolution: CommentsCommandResolution<ClipMarkedEvent>) => Promise<boolean>
   /** Co-host relay: the main renderer pushes state, the window seeds + follows
    * it, and window actions come back through the same correlated broker. */
   pushCohostWindowState: (state: CohostWindowState) => Promise<void>
@@ -4237,11 +4280,16 @@ export interface CohostSettings {
   autoHighlight: boolean
   /**
    * The comment the streamer is talking about goes on stream by itself
-   * (default off; needs live captions, wired in plan 060 S3).
+   * (default off; needs `listen` or live captions, wired in plan 060 S3).
    */
   voiceHighlight: boolean
   /** Plain-language chat rules the co-host flags against; ≤ 10 × 120 chars. */
   rules: string[]
+  /**
+   * Orcle hears the microphone for the whole live stream, as text, even with
+   * live captions off (plan 068; default off).
+   */
+  listen: boolean
 }
 
 /** `cohost.settings.set`: absent fields are unchanged. */
@@ -4253,6 +4301,19 @@ export interface CohostSettingsPatch {
   voiceHighlight?: boolean
   /** Replaces the whole list; the backend trims, drops empties and caps it. */
   rules?: string[]
+  listen?: boolean
+}
+
+/** Whether Orcle hears the streamer right now (plan 068). */
+export type CohostListeningState = 'off' | 'starting' | 'on' | 'blocked'
+
+export interface CohostListening {
+  state: CohostListeningState
+  /** Present while `blocked`: `no-microphone`, `no-capture`, `signed-out`, `consent-required`, `listen-monthly-quota-exhausted`, `listen-disabled`, … */
+  reasonCode?: string
+  message?: string
+  /** Listen allowance left this month, when the server reported it. */
+  remainingSeconds?: number
 }
 
 /** One open viewer question grouped across platforms and askers. */
@@ -4269,6 +4330,57 @@ export interface CohostQuestion {
   fromNotes: boolean
   firstSeenAt: string
   updatedAt: string
+  /** Tick v3 (plan 068): about what the streamer is talking about right now.
+   * Omitted by the backend while false. */
+  onTopic?: boolean
+}
+
+export type CohostPromiseTriggerKind = 'none' | 'viewers' | 'minutes'
+
+/** When a promise reminder fires: at `value` viewers, after `value` minutes,
+ * or (`none`) 20 minutes after Orcle first heard it. */
+export interface CohostPromiseTrigger {
+  kind: CohostPromiseTriggerKind | (string & Record<never, never>)
+  value?: number
+}
+
+/** A promise the streamer made out loud (plan 068 D8); private until they act. */
+export interface CohostPromise {
+  id: string
+  text: string
+  trigger: CohostPromiseTrigger
+  firstSeenAt: string
+}
+
+/** The engine's latest met trigger, keyed on the promise: toast once per id. */
+export interface CohostPromiseReminder {
+  promiseId: string
+  text: string
+  at: string
+}
+
+/** A recap for viewers who asked what they missed, or one the streamer
+ * drafted; never posted by Orcle. Gone after `expiresAt`. */
+export interface CohostRecap {
+  text: string
+  at: string
+  expiresAt: string
+}
+
+/** A first-time chatter nobody greeted yet (plan 068 D9). */
+export interface CohostSayHi {
+  /** The engine's author key; `cohost.author.greeted` takes it back. */
+  authorKey: string
+  name: string
+  platform: StreamPlatform
+  firstSeenAt: string
+}
+
+/** A private dead-air suggestion (plan 068 D9): toast each `key` once. */
+export interface CohostDeadAirNudge {
+  key: string
+  text: string
+  at: string
 }
 
 export interface CohostFlag {
@@ -4431,6 +4543,27 @@ export interface CohostState {
    * at most three; absent while empty (never null).
    */
   recentlyResolved?: CohostRecentlyResolved[]
+  /**
+   * Whether Orcle hears the streamer (plan 068); absent without a session or
+   * from a backend before the field (never null).
+   */
+  listening?: CohostListening
+  /**
+   * Tick v3 (plan 068 D7/D8). All absent (never null) until the engine has
+   * them: what the streamer is talking about, the open promises (oldest
+   * first, at most 20), the latest met promise trigger, and the recap.
+   */
+  topic?: string
+  promises?: CohostPromise[]
+  promiseReminder?: CohostPromiseReminder
+  recap?: CohostRecap
+  /**
+   * Plan 068 D9, both absent (never null) while empty: first-time chatters
+   * not greeted yet (oldest first, at most five, gone after 15 minutes) and
+   * the latest dead-air nudge while it is fresh.
+   */
+  sayHi?: CohostSayHi[]
+  deadAirNudge?: CohostDeadAirNudge
 }
 
 /**
@@ -4481,6 +4614,23 @@ export interface CohostFlagParams {
   messageId: string
 }
 
+/** `cohost.promise.done` / `cohost.promise.dismiss` (plan 068 D8). */
+export interface CohostPromiseParams {
+  sessionId: string
+  promiseId: string
+}
+
+/** `cohost.recap.dismiss` / `cohost.recap.draft` (plan 068 D8). */
+export interface CohostRecapParams {
+  sessionId: string
+}
+
+/** `cohost.author.greeted` (plan 068 D9). */
+export interface CohostAuthorParams {
+  sessionId: string
+  authorKey: string
+}
+
 /**
  * What the detached Comments window needs to render the Co-host segment. The
  * MAIN renderer owns the backend socket, the entitlement snapshot and the
@@ -4498,6 +4648,11 @@ export interface CohostWindowState {
   consented: boolean
   /** Persisted `cohost.settings.enabled`. */
   enabled: boolean
+  /**
+   * Persisted `cohost.settings.listen` (plan 068). Absent from a relay seeded
+   * without it (smokes); the window then never offers the listening card.
+   */
+  listen?: boolean
 }
 
 /**
@@ -4511,11 +4666,34 @@ export function offCohostWindowState(): CohostWindowState {
     entitlementReason: null,
     upgradeUrl: null,
     consented: false,
-    enabled: false
+    enabled: false,
+    listen: false
   }
 }
 
-export type CohostActionKind = 'answered' | 'dismiss-question' | 'dismiss-flag' | 'restore'
+export type CohostActionKind =
+  | 'answered'
+  | 'dismiss-question'
+  | 'dismiss-flag'
+  | 'restore'
+  | 'promise-done'
+  | 'promise-dismiss'
+  | 'recap-dismiss'
+  | 'recap-draft'
+  | 'author-greeted'
+
+/** Every action kind the relay accepts; main validates against it. */
+export const COHOST_ACTION_KINDS: readonly CohostActionKind[] = [
+  'answered',
+  'dismiss-question',
+  'dismiss-flag',
+  'restore',
+  'promise-done',
+  'promise-dismiss',
+  'recap-dismiss',
+  'recap-draft',
+  'author-greeted'
+]
 
 /** Correlated co-host action from the Comments window, brokered through main
  * to the main renderer (which makes the actual `cohost.*` RPC). */
@@ -4523,7 +4701,9 @@ export interface CohostActionCommand {
   requestId: string
   sessionId: string
   kind: CohostActionKind
-  /** Question id for question actions; the flagged message id for flags. */
+  /** Question id for question actions; the flagged message id for flags; the
+   * promise id for promise actions; the session id again for recap actions
+   * (they have no target of their own); the author key for `author-greeted`. */
   targetId: string
 }
 
@@ -4537,6 +4717,8 @@ export interface CohostEnableCommand {
   enabled: boolean
   /** Grant renderer-local cloud-AI consent in the same click. */
   grantConsent?: boolean
+  /** Also set `cohost.settings.listen` in the same save (plan 068 D3). */
+  listen?: boolean
 }
 
 // Live captions (captions.* RPCs + events; premium cloud-AI feature).

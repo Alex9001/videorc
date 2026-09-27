@@ -5,8 +5,13 @@ import { describe, expect, it } from 'vitest'
 import { normalizeLayoutSettings } from '../renderer/src/lib/capture'
 import type {
   AccountCallbackEnvelope,
+  ClipMark,
+  ClipMarkedEvent,
+  CohostAuthorParams,
   CohostFlagParams,
+  CohostPromiseParams,
   CohostQuestionParams,
+  CohostRecapParams,
   CohostSettings,
   CohostSettingsPatch,
   CohostStartParams,
@@ -68,6 +73,9 @@ interface HighRiskContractFixtures {
     startParams: CohostStartParams
     questionParams: CohostQuestionParams
     flagParams: CohostFlagParams
+    promiseParams: CohostPromiseParams
+    recapParams: CohostRecapParams
+    authorParams: CohostAuthorParams
     settingsPatch: CohostSettingsPatch
     settings: CohostSettings
     state: CohostState
@@ -76,6 +84,12 @@ interface HighRiskContractFixtures {
     timeoutState: CohostState
     stateV2: CohostState
     legacyState: CohostState
+  }
+  clip: {
+    markedSaved: ClipMarkedEvent
+    markedUnsaved: ClipMarkedEvent
+    listParams: BackendRpcParams<'clip.marks.list'>
+    marks: ClipMark[]
   }
 }
 
@@ -168,6 +182,25 @@ describe('shared high-risk protocol fixture', () => {
     expect(
       validateBackendRpcParams('cohost.flag.dismiss', fixtures.cohost.flagParams)
     ).toStrictEqual(fixtures.cohost.flagParams)
+    for (const method of ['cohost.promise.done', 'cohost.promise.dismiss'] as const) {
+      expect(validateBackendRpcParams(method, fixtures.cohost.promiseParams)).toStrictEqual(
+        fixtures.cohost.promiseParams
+      )
+    }
+    for (const method of ['cohost.recap.dismiss', 'cohost.recap.draft'] as const) {
+      expect(validateBackendRpcParams(method, fixtures.cohost.recapParams)).toStrictEqual(
+        fixtures.cohost.recapParams
+      )
+    }
+    expect(
+      validateBackendRpcParams('cohost.author.greeted', fixtures.cohost.authorParams)
+    ).toStrictEqual(fixtures.cohost.authorParams)
+    expect(() =>
+      validateBackendRpcParams('cohost.author.greeted', {
+        ...fixtures.cohost.authorParams,
+        extra: true
+      })
+    ).toThrow()
     expect(
       validateBackendRpcParams('cohost.settings.set', fixtures.cohost.settingsPatch)
     ).toStrictEqual(fixtures.cohost.settingsPatch)
@@ -181,7 +214,12 @@ describe('shared high-risk protocol fixture', () => {
       'cohost.question.answered',
       'cohost.question.dismiss',
       'cohost.question.restore',
-      'cohost.flag.dismiss'
+      'cohost.flag.dismiss',
+      'cohost.promise.done',
+      'cohost.promise.dismiss',
+      'cohost.recap.dismiss',
+      'cohost.recap.draft',
+      'cohost.author.greeted'
     ] as const) {
       expect(validateBackendRpcResult(method, fixtures.cohost.state)).toStrictEqual(
         fixtures.cohost.state
@@ -225,10 +263,59 @@ describe('shared high-risk protocol fixture', () => {
       fixtures.cohost.stateV2
     )
     expect(fixtures.cohost.stateV2.flags.map((flag) => flag.kind)).toContain('unknown')
-    for (const key of ['highlights', 'alerts', 'moodScores'] as const) {
+    for (const key of [
+      'highlights',
+      'alerts',
+      'moodScores',
+      'topic',
+      'promises',
+      'promiseReminder',
+      'recap',
+      'sayHi',
+      'deadAirNudge'
+    ] as const) {
       expect(() =>
         validateBackendEventPayload('cohost.state', { ...fixtures.cohost.stateV2, [key]: null })
       ).toThrow('cohost.state')
+    }
+    // Plan 068 S6: "Say hi" and the dead-air nudge ride the state; absent on
+    // the legacy payload; an extra key on an entry is refused.
+    expect(fixtures.cohost.stateV2.sayHi?.[0]).toStrictEqual({
+      authorKey: '"twitch":viewer-fixture',
+      name: 'x_Dark_Knight_x',
+      platform: 'twitch',
+      firstSeenAt: '2026-08-22T10:00:05Z'
+    })
+    expect(fixtures.cohost.stateV2.deadAirNudge?.key).toBe('dead-air-1-1')
+    for (const key of ['sayHi', 'deadAirNudge'] as const) {
+      expect(fixtures.cohost.legacyState).not.toHaveProperty(key)
+    }
+    expect(() =>
+      validateBackendEventPayload('cohost.state', {
+        ...fixtures.cohost.stateV2,
+        sayHi: [{ ...fixtures.cohost.stateV2.sayHi![0], greeted: true }]
+      })
+    ).toThrow('cohost.state')
+    // Tick v3 (plan 068 S5): topic, promises, reminder, recap and the
+    // on-topic flag ride the state; absent on the legacy payload; an unknown
+    // trigger kind still validates.
+    expect(fixtures.cohost.stateV2.topic).toBe('Mechanical keyboards')
+    expect(fixtures.cohost.stateV2.promises?.[0]).toStrictEqual({
+      id: 'p_fixture',
+      text: 'Giveaway at 100 viewers',
+      trigger: { kind: 'viewers', value: 100 },
+      firstSeenAt: '2026-08-22T10:00:00Z'
+    })
+    expect(fixtures.cohost.stateV2.questions[0]?.onTopic).toBe(true)
+    const futureTrigger = {
+      ...fixtures.cohost.stateV2,
+      promises: [
+        { ...fixtures.cohost.stateV2.promises![0], trigger: { kind: 'followers', value: 5 } }
+      ]
+    }
+    expect(validateBackendEventPayload('cohost.state', futureTrigger)).toStrictEqual(futureTrigger)
+    for (const key of ['topic', 'promises', 'promiseReminder', 'recap'] as const) {
+      expect(fixtures.cohost.legacyState).not.toHaveProperty(key)
     }
     expect(() =>
       validateBackendEventPayload('cohost.state', {
@@ -273,12 +360,37 @@ describe('shared high-risk protocol fixture', () => {
       resolvedAt: '2026-08-22T10:00:20Z',
       question: fixtures.cohost.state.questions[0]
     })
-    for (const key of ['spotlight', 'recentlyResolved'] as const) {
+    for (const key of ['spotlight', 'recentlyResolved', 'listening'] as const) {
       expect(() =>
         validateBackendEventPayload('cohost.state', { ...fixtures.cohost.stateV2, [key]: null })
       ).toThrow('cohost.state')
       expect(fixtures.cohost.legacyState).not.toHaveProperty(key)
     }
+    // Plan 068: `listening` rides the state while a session runs; its optional
+    // fields are omitted (never null) and `state` is a closed enum.
+    expect(fixtures.cohost.stateV2.listening).toStrictEqual({
+      state: 'blocked',
+      reasonCode: 'listen-monthly-quota-exhausted',
+      message: "Orcle's listening allowance for this month is used up.",
+      remainingSeconds: 0
+    })
+    expect(fixtures.cohost.state).not.toHaveProperty('listening')
+    const listeningOn = { ...fixtures.cohost.stateV2, listening: { state: 'on' } }
+    expect(validateBackendEventPayload('cohost.state', listeningOn)).toStrictEqual(listeningOn)
+    expect(() =>
+      validateBackendEventPayload('cohost.state', {
+        ...fixtures.cohost.stateV2,
+        listening: { state: 'on', reasonCode: null }
+      })
+    ).toThrow('cohost.state')
+    expect(() =>
+      validateBackendEventPayload('cohost.state', {
+        ...fixtures.cohost.stateV2,
+        listening: { state: 'humming' }
+      })
+    ).toThrow('cohost.state')
+    expect(fixtures.cohost.settings.listen).toBe(false)
+    expect(fixtures.cohost.settingsPatch.listen).toBe(true)
     const futureReason = {
       ...fixtures.cohost.stateV2,
       recentlyResolved: [
@@ -347,6 +459,22 @@ describe('shared high-risk protocol fixture', () => {
         [fixtures.comments.deletionOperation]
       )
     }
+  })
+
+  it('keeps clip marks and the marked event identical across languages (plan 068 D6)', () => {
+    for (const event of [fixtures.clip.markedSaved, fixtures.clip.markedUnsaved]) {
+      expect(validateBackendEventPayload('clip.marked', event)).toStrictEqual(event)
+      expect(validateBackendRpcResult('clip.mark', event)).toStrictEqual(event)
+    }
+    expect(fixtures.clip.markedSaved).not.toHaveProperty('reason')
+    expect(fixtures.clip.markedUnsaved.reason).toBe('recording-off')
+    expect(validateBackendRpcParams('clip.marks.list', fixtures.clip.listParams)).toStrictEqual(
+      fixtures.clip.listParams
+    )
+    expect(validateBackendRpcResult('clip.marks.list', fixtures.clip.marks)).toStrictEqual(
+      fixtures.clip.marks
+    )
+    expect(fixtures.clip.marks[1]).not.toHaveProperty('phrase')
   })
 
   it('loads chat rows with and without structured event details', () => {

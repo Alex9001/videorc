@@ -17,6 +17,7 @@ import {
   COHOST_TICK_MESSAGE_KEYS,
   COHOST_TICK_PATH,
   COHOST_TICK_REQUEST_KEYS,
+  COHOST_TICK_V3_REQUEST_KEYS,
   startFakeCohostService
 } from './lib/fake-cohost-service.mjs'
 import { connectBackend, request } from './smoke-recording-session.mjs'
@@ -36,7 +37,9 @@ import { connectBackend, request } from './smoke-recording-session.mjs'
 //   premium-required -> 503 errors server-unconfigured with an escalating
 //   backoff -> dismiss removes a question for good -> a single trickle message
 //   ticks by the 20 s rule -> liveChat.send with inReplyToQuestionId marks the
-//   question answered -> idle chat sends NO tick for 30 s -> stop.
+//   question answered -> first-time chatters wait in `sayHi`, the Greeted
+//   button (`cohost.author.greeted`) and the reply each take theirs off ->
+//   idle chat sends NO tick for 30 s -> stop.
 //
 // A second scenario (plan 060 S5) then proves the caption-fed spotlight lane
 // and the automatic on-stream card on a real stream session:
@@ -55,7 +58,10 @@ import { connectBackend, request } from './smoke-recording-session.mjs'
 //   exactly once and leaves by expiry -> picks mode fires nothing for 45 s
 //   after the previous card left the stream, then picks the LOWEST-ranked
 //   suggestion: the flagged one, the two already shown (by voice and by a
-//   manual card) and the previous card's author all outrank it.
+//   manual card) and the previous card's author all outrank it. The lane is
+//   Kick, which the first scenario never used, so its authors are first-time
+//   chatters (plan 068 S6): the cards greet two of them "on stream", and a
+//   final that says the third one's name greets them by voice.
 //
 // No production bearer, real account, or external network is involved. The
 // API base override is honored by debug backends only; a local router puts
@@ -88,8 +94,10 @@ const COOLDOWN_TOLERANCE_MS = 1_500
 const PICK_AFTER_COOLDOWN_DEADLINE_MS = 8_000
 const BREAKER_PROOF_MS = 6_000
 const CAPTION_AUDIO_PUMP_MS = 1_000
+// Kick: no scenario before this one chatted there, so every author here is a
+// first-time chatter (plan 068 S6, "Say hi").
 const SPOTLIGHT_LANE = {
-  platform: 'twitch',
+  platform: 'kick',
   targetId: 'spotlight-main',
   count: 5,
   intervalMs: 400,
@@ -110,7 +118,9 @@ const SPOTLIGHT_FINALS = Object.freeze({
   mention: `Somebody in chat wants to know about my ${MENTION_PHRASE}, it clicks a lot.`,
   answerOnce: `So yes, it is a ${ANSWER_PHRASE} with brown switches.`,
   answerTwice: `Right, the ${ANSWER_PHRASE}, no number pad on it.`,
-  breaker: ['Okay, back to the code for a second.', 'Let me scroll down here.', 'And save.']
+  breaker: ['Okay, back to the code for a second.', 'Let me scroll down here.', 'And save.'],
+  // Plan 068 S6: says the name of the one author no card greeted.
+  greeting: 'Welcome in, Test Viewer, glad you found us.'
 })
 
 const stateRoot = mkdtempSync(join(tmpdir(), 'videorc-cohost-smoke-'))
@@ -497,6 +507,39 @@ try {
     'Dismissed question returned on a later tick.'
   )
 
+  // --- Plan 068 S6: first-time chatters wait in "Say hi" ---------------------
+  // The fresh profile has never seen these authors: Test Viewer 0-2 on Twitch
+  // and Test Viewer 0 on YouTube and X, oldest first, at most five.
+  phase('say hi: first-time chatters wait; Greeted takes one off')
+  const hiBefore = (await request(backend, timeoutMs, 'cohost.status', {})).sayHi ?? []
+  expect(
+    hiBefore.length === 5 &&
+      hiBefore.every((entry) => /^Test Viewer [0-2]$/.test(entry.name)) &&
+      hiBefore.some((entry) => entry.platform === 'x'),
+    `Every fresh fake author should wait in sayHi: ${JSON.stringify(hiBefore)}`
+  )
+  const byHand = hiBefore.find(
+    (entry) => entry.platform === 'twitch' && entry.name === 'Test Viewer 1'
+  )
+  expect(byHand, `Test Viewer 1 on Twitch should wait in sayHi: ${JSON.stringify(hiBefore)}`)
+  const greetedByHand = await request(backend, timeoutMs, 'cohost.author.greeted', {
+    sessionId,
+    authorKey: byHand.authorKey
+  })
+  expect(
+    !(greetedByHand.sayHi ?? []).some((entry) => entry.authorKey === byHand.authorKey) &&
+      (greetedByHand.sayHi ?? []).length === hiBefore.length - 1,
+    `cohost.author.greeted should take exactly that viewer off: ${JSON.stringify(greetedByHand.sayHi)}`
+  )
+  await expectRejected(
+    () =>
+      request(backend, timeoutMs, 'cohost.author.greeted', {
+        sessionId: 'not-this-session',
+        authorKey: byHand.authorKey
+      }),
+    'cohost.author.greeted for another session'
+  )
+
   // --- Reply via liveChat.send marks the question answered -------------------
   phase('liveChat.send with inReplyToQuestionId')
   const operationId = randomUUID()
@@ -520,6 +563,15 @@ try {
   expect(
     !statusAfterReply.questions.some((question) => question.id === dup9.id),
     'cohost.status still lists the answered question.'
+  )
+  // A reply greets whoever asked: Test Viewer 0 on every platform asked the
+  // repeated question, so only Test Viewer 2 still waits.
+  const hiAfterReply = statusAfterReply.sayHi ?? []
+  expect(
+    hiAfterReply.length === 1 &&
+      hiAfterReply[0].name === 'Test Viewer 2' &&
+      hiAfterReply[0].platform === 'twitch',
+    `The reply should greet the question's askers: ${JSON.stringify(hiAfterReply)}`
   )
 
   // --- Idle: no tick for 30 s --------------------------------------------------
@@ -577,7 +629,8 @@ try {
       `off-shaped presence defaults, pending-bucket emit with nextTickAt, tickInFlight toggle, ` +
       `wire shape, 5-asker grouping across ${contributingTicks.size} ticks, flag, ` +
       `429/403/503 status+reason mapping with Retry-After and backoff honored, dismiss, ` +
-      `20 s trickle rule, reply-answered, and ${IDLE_PROOF_MS / 1000} s idle without a tick.`
+      `20 s trickle rule, reply-answered, say hi (Greeted and reply), and ` +
+      `${IDLE_PROOF_MS / 1000} s idle without a tick.`
   )
 
   await runSpotlightScenario({ ready, startedAt })
@@ -633,17 +686,23 @@ function assertGap(earlier, later, minimumMs, label) {
 }
 
 function assertRequestShape(body) {
-  // Wire v2 adds `rules`; everything else is the v1 key set.
+  // Wire v2 adds `rules`; v3 adds the optional transcript, summary and
+  // openPromises (plan 068 D7); everything else is the v1 key set.
   const keys = Object.keys(body)
-    .filter((key) => key !== 'rules')
+    .filter((key) => key !== 'rules' && !COHOST_TICK_V3_REQUEST_KEYS.includes(key))
     .sort()
-  expect(Array.isArray(body.rules), 'A v2 tick request must carry the rules array.')
+  expect(Array.isArray(body.rules), 'A v2+ tick request must carry the rules array.')
   expect(
     JSON.stringify(keys) === JSON.stringify([...COHOST_TICK_REQUEST_KEYS]),
     `Tick request keys drifted from the contract: ${keys.join(',')}`
   )
   expect(
-    body.promptVersion === 2 &&
+    body.transcript === undefined ||
+      (typeof body.transcript === 'string' && body.transcript.length > 0),
+    'A v3 tick request omits transcript when nothing was said.'
+  )
+  expect(
+    body.promptVersion === 3 &&
       body.consentToProcessChat === true &&
       typeof body.clientVersion === 'string' &&
       body.clientVersion.startsWith('videorc-desktop/'),
@@ -898,6 +957,21 @@ async function runSpotlightScenario({ ready, startedAt }) {
     expect(
       answerQuestion,
       `No open question for ${answerId}: ${JSON.stringify(tickState.questions)}`
+    )
+    // Plan 068 S6: the lane's three authors are first-time chatters.
+    const hiState = await waitForEvent(
+      events,
+      'cohost.state',
+      (state) => state.sessionId === streamSessionId && (state.sayHi ?? []).length === 3,
+      'three first-time chatters in sayHi',
+      10_000
+    )
+    expect(
+      hiState.sayHi.every(
+        (entry) =>
+          entry.platform === SPOTLIGHT_LANE.platform && /^Test Viewer [0-2]$/.test(entry.name)
+      ),
+      `Kick's first-time chatters should wait in sayHi: ${JSON.stringify(hiState.sayHi)}`
     )
     fake.setSpotlightMatches([
       { whenTranscriptIncludes: MENTION_PHRASE, messageId: mentionId, about: 0.92 },
@@ -1213,6 +1287,45 @@ async function runSpotlightScenario({ ready, startedAt }) {
       `The pick must skip the flagged, shown and previous-author rows that outrank it and take ${answerId}: ${JSON.stringify({ pick, flaggedId, mentionId, manualId, sameAuthorId })}`
     )
 
+    // --- Plan 068 S6: greeted on stream, then by voice ----------------------------
+    // Both cards put Test Viewer 0 (#0 by hand) and Test Viewer 1 (#1 by
+    // voice) on stream, which greets them. Test Viewer 2 (#2, flagged, never
+    // shown) still waits until the streamer says the name.
+    phase('say hi: the cards greeted two, a final greets the third by voice')
+    const hiBeforeVoice = (await request(backend, timeoutMs, 'cohost.status', {})).sayHi ?? []
+    expect(
+      hiBeforeVoice.length === 1 && hiBeforeVoice[0].name === 'Test Viewer 2',
+      `Only the never-shown author should still wait: ${JSON.stringify(hiBeforeVoice)}`
+    )
+    for (const name of ['Test Viewer 0', 'Test Viewer 1']) {
+      expect(
+        events.list.some(
+          (entry) =>
+            entry.event === 'log' &&
+            entry.payload?.message?.includes(`${name} (kick) was greeted on stream`)
+        ),
+        `${name}'s card should have greeted them on stream.`
+      )
+    }
+    const greeting = await emitFinal(events, SPOTLIGHT_FINALS.greeting)
+    const greetedState = await waitForEvent(
+      events,
+      'cohost.state',
+      (state) => state.sessionId === streamSessionId && (state.sayHi ?? []).length === 0,
+      'Test Viewer 2 leaving sayHi after the greeting final',
+      5_000,
+      greeting.emittedAt
+    )
+    const greetedByVoiceMs = greetedState.at - greeting.emittedAt
+    await waitForEvent(
+      events,
+      'log',
+      (payload) => payload?.message?.includes('Test Viewer 2 (kick) was greeted by voice'),
+      'the greeted-by-voice log line',
+      2_000,
+      greeting.emittedAt
+    )
+
     // --- Whole-scenario safety invariants ---------------------------------------
     const sessionStates = events.list
       .filter((entry) => entry.event === 'cohost.state')
@@ -1243,7 +1356,8 @@ async function runSpotlightScenario({ ready, startedAt }) {
         `and restored, 404 breaker held ${BREAKER_PROOF_MS / 1000} s, first pick ` +
         `${(pickDelayMs / 1000).toFixed(1)} s after the previous card left (cooldown 45 s) ` +
         `took the lowest-ranked suggestion: the flagged (0.99), shown by voice, shown by hand ` +
-        `and previous-author rows all outranked it and were skipped.`
+        `and previous-author rows all outranked it and were skipped; two first-time ` +
+        `chatters greeted on stream and one by voice ${greetedByVoiceMs} ms after the final.`
     )
   } finally {
     await stopSpotlightResources().catch(() => {})

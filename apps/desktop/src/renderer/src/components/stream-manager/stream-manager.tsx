@@ -9,8 +9,8 @@ import {
 } from 'react'
 import { toast } from 'sonner'
 
-import { CohostPane } from '@/components/cohost-pane'
-import { CohostStatus } from '@/components/cohost-status'
+import { CohostListenPrompt, CohostPane } from '@/components/cohost-pane'
+import { CohostListeningIndicator, CohostStatus } from '@/components/cohost-status'
 import { ActivityPane } from '@/components/stream-manager/activity-pane'
 import {
   ChatPane,
@@ -27,7 +27,9 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useTrafficLightGutter } from '@/components/window-frame'
 import type {
   CohostFlag,
+  CohostPromise,
   CohostQuestion,
+  CohostSayHi,
   CohostState,
   CommentHighlightAnchor,
   CommentHighlightState,
@@ -43,10 +45,14 @@ import { useCohostSensitivity } from '@/hooks/use-cohost-sensitivity'
 import { cohostGroupedDeltaFlash } from '@/lib/cohost-presence'
 import { activeCohostSpotlight, cohostCommentMarks } from '@/lib/cohost-marks'
 import {
+  cohostDeadAirToast,
   cohostNudgeVisible,
+  cohostPromiseReminderToast,
   cohostQuestionToast,
   cohostStateForSensitivity,
   draftForQuestion,
+  COHOST_DEAD_AIR_TOAST_ID,
+  COHOST_PROMISE_TOAST_ID,
   COHOST_QUESTION_TOAST_ID
 } from '@/lib/cohost-view'
 import type { EntitlementUiGate } from '@/lib/entitlement-ui'
@@ -163,6 +169,8 @@ export interface StreamManagerProps {
   onBackToLive?: () => void
   onHighlight?: (message: LiveChatMessage) => void
   onClear?: () => void
+  /** Mark the current moment for a clip (plan 068 D6); shown only on air. */
+  onMarkClip?: () => void
   onOpenPreview?: () => void
   sendPending?: boolean
   sendOperation?: CommentsSendOperation | null
@@ -175,13 +183,25 @@ export interface StreamManagerProps {
   cohostActionPending?: boolean
   cohostStarting?: boolean
   cohostNudgeDismissedForever?: boolean
+  /** Persisted `cohost.settings.listen` (plan 068); unknown hides its card. */
+  cohostListen?: boolean
   onCohostEnable?: (enabled: boolean) => void
+  /** Turn listening on from the one-time card (plan 068 D3). */
+  onCohostListenOn?: () => void
   onCohostNudgeDismiss?: () => void
   onCohostShowOnStream?: (question: CohostQuestion) => void
   onCohostAnswered?: (question: CohostQuestion) => void
   onCohostRestoreQuestion?: (question: CohostQuestion) => void
   onCohostDismissQuestion?: (question: CohostQuestion) => void
   onCohostDismissFlag?: (flag: CohostFlag) => void
+  /** Promises and recaps (plan 068 D8). The draft resolves with the relayed
+   * state; its `recap.text` pre-fills the composer. */
+  onCohostPromiseDone?: (promise: CohostPromise) => void
+  onCohostPromiseDismiss?: (promise: CohostPromise) => void
+  onCohostRecapDismiss?: () => void
+  onCohostRecapDraft?: () => Promise<CohostState | null>
+  /** The Greeted button on a "Say hi" row (plan 068 D9). */
+  onCohostAuthorGreeted?: (entry: CohostSayHi) => void
   onCohostEnableConsent?: () => void
   onCohostUpgrade?: (url: string) => void
 }
@@ -206,6 +226,7 @@ export function StreamManager({
   onBackToLive,
   onHighlight,
   onClear,
+  onMarkClip,
   onOpenPreview,
   sendPending = false,
   sendOperation = null,
@@ -218,13 +239,20 @@ export function StreamManager({
   cohostActionPending = false,
   cohostStarting = false,
   cohostNudgeDismissedForever = false,
+  cohostListen,
   onCohostEnable,
+  onCohostListenOn,
   onCohostNudgeDismiss,
   onCohostShowOnStream,
   onCohostAnswered,
   onCohostRestoreQuestion,
   onCohostDismissQuestion,
   onCohostDismissFlag,
+  onCohostPromiseDone,
+  onCohostPromiseDismiss,
+  onCohostRecapDismiss,
+  onCohostRecapDraft,
+  onCohostAuthorGreeted,
   onCohostEnableConsent,
   onCohostUpgrade
 }: StreamManagerProps): ReactElement {
@@ -264,6 +292,7 @@ export function StreamManager({
   const cohostPaneOpenRef = useRef(true)
   const previousCohostStateRef = useRef<CohostState | null>(null)
   const cohostToastAtRef = useRef<number | null>(null)
+  const deadAirToastKeyRef = useRef<string | null>(null)
   const [cohostNudgeDismissedSessionId, setCohostNudgeDismissedSessionId] = useState<string | null>(
     null
   )
@@ -282,6 +311,15 @@ export function StreamManager({
     if (questionToast) {
       cohostToastAtRef.current = questionToast.atMs
       toast(questionToast.message, { id: COHOST_QUESTION_TOAST_ID })
+    }
+    // A met promise trigger (plan 068 D8): private, keyed, once per promise.
+    const reminder = cohostPromiseReminderToast({ previous, next: cohostState })
+    if (reminder) toast(reminder, { id: COHOST_PROMISE_TOAST_ID })
+    // Dead air (plan 068 D9): private, keyed, each nudge once.
+    const deadAir = cohostDeadAirToast(cohostState, deadAirToastKeyRef.current)
+    if (deadAir) {
+      deadAirToastKeyRef.current = deadAir.key
+      toast(deadAir.text, { id: COHOST_DEAD_AIR_TOAST_ID })
     }
     const delta = cohostGroupedDeltaFlash(previous, cohostState)
     if (delta) setCohostFlash(delta)
@@ -408,11 +446,15 @@ export function StreamManager({
   }, [cohostVisible, showOrcle])
 
   const sendTargets = sendablePlatforms(snapshot.providers)
+  // Pre-fill only: the composer is the one place a send starts (plan 068 D8).
+  const prefillComposer = (text: string): void => {
+    setPrefill((current) => ({ seq: (current?.seq ?? 0) + 1, text }))
+    setNarrowPane('chat')
+  }
   const thankInChat = (item: ActivityItem): void => {
     const text = thankYouDraft(item)
     if (!text) return
-    setPrefill((current) => ({ seq: (current?.seq ?? 0) + 1, text }))
-    setNarrowPane('chat')
+    prefillComposer(text)
   }
   const showActivityOnStream = (item: ActivityItem): void => {
     const message = messages.find((candidate) => candidate.id === item.messageId)
@@ -428,7 +470,9 @@ export function StreamManager({
         )}
         data-slot="orcle-pane-header"
       >
-        <span className="text-xs font-medium">Orcle</span>
+        <span className="shrink-0 text-xs font-medium">Orcle</span>
+        {/* Whether Orcle hears you (plan 068); nothing while listening is off. */}
+        {cohostVisible ? <CohostListeningIndicator listening={cohostState?.listening} /> : null}
         <span className="flex-1" />
         <CohostStatus
           consented={cohostConsented}
@@ -444,6 +488,16 @@ export function StreamManager({
           onUpgrade={onCohostUpgrade}
         />
       </div>
+      {/* The one-time listening card (plan 068 D3), on air or off, above the
+          scroll so it never scrolls away. Same gate as the pane itself:
+          Premium, cloud-AI consent, and Orcle on. */}
+      {onCohostListenOn ? (
+        <CohostListenPrompt
+          enabled={cohostEnabled && cohostConsented && cohostGate?.allowed === true}
+          listen={cohostListen}
+          onTurnOn={onCohostListenOn}
+        />
+      ) : null}
       {cohostVisible ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <CohostPane
@@ -467,6 +521,21 @@ export function StreamManager({
               setNarrowPane('chat')
               setJumpTo((current) => ({ messageId, seq: (current?.seq ?? 0) + 1 }))
             }}
+            onPromiseDismiss={onCohostPromiseDismiss}
+            onPromiseDone={onCohostPromiseDone}
+            onSayHiGreeted={onCohostAuthorGreeted}
+            onRecapDismiss={onCohostRecapDismiss}
+            onRecapDraft={
+              onCohostRecapDraft
+                ? () => {
+                    void onCohostRecapDraft().then((state) => {
+                      const text = state?.recap?.text
+                      if (text) prefillComposer(text)
+                    })
+                  }
+                : undefined
+            }
+            onRecapPost={(recap) => prefillComposer(recap.text)}
             onReply={(question) => {
               setPrefill((current) => ({
                 seq: (current?.seq ?? 0) + 1,
@@ -657,6 +726,7 @@ export function StreamManager({
         providers={snapshot.providers}
         onClear={onClear}
         onHighlightAnchorChange={onHighlightAnchorChange}
+        onMarkClip={onAir ? onMarkClip : undefined}
         onOpenPreview={onOpenPreview}
         onToggleAlwaysOnTop={onToggleAlwaysOnTop}
       />

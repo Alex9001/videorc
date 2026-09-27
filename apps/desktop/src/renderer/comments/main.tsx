@@ -6,7 +6,9 @@ import { AppErrorBoundary } from '@/components/error-boundary'
 import { StreamManager } from '@/components/stream-manager/stream-manager'
 import { WindowFrame } from '@/components/window-frame'
 import type {
+  CohostActionKind,
   CohostQuestion,
+  CohostState,
   CohostWindowState,
   CommentHighlightAnchor,
   CommentHighlightState,
@@ -26,6 +28,7 @@ import {
   COHOST_NUDGE_STORAGE_KEY
 } from '@/lib/cohost-view'
 import { Toaster } from '@/components/ui/sonner'
+import { clipMarkedToast } from '../../shared/clip-marks'
 import type { EntitlementUiGate } from '@/lib/entitlement-ui'
 import { chatSendFailures, pendingCommentsSendOperation } from '@/lib/chat-send'
 import type { ChatSendFailure } from '@/lib/chat-send'
@@ -244,20 +247,26 @@ function CommentsWindowApp(): ReactElement {
   // Co-host actions are correlated commands: the MAIN renderer owns the
   // backend socket and makes the real `cohost.*` RPC, exactly like send and
   // highlight.
+  // Resolves with the relayed state (null when nothing was sent or the
+  // action failed); the recap draft reads its text from it.
   const sendCohostAction =
-    (kind: 'answered' | 'dismiss-question' | 'dismiss-flag' | 'restore') =>
-    (targetId: string): void => {
-      if (!snapshot.sessionId) return
+    (kind: CohostActionKind) =>
+    (targetId: string): Promise<CohostState | null> => {
+      if (!snapshot.sessionId) return Promise.resolve(null)
+      const send = window.videorc?.sendCohostAction
+      if (!send) return Promise.resolve(null)
       setCohostActionPending(true)
-      void window.videorc
-        ?.sendCohostAction?.({
-          requestId: crypto.randomUUID(),
-          sessionId: snapshot.sessionId,
-          kind,
-          targetId
+      return send({
+        requestId: crypto.randomUUID(),
+        sessionId: snapshot.sessionId,
+        kind,
+        targetId
+      })
+        .then((state) => {
+          setCohost((current) => ({ ...current, state }))
+          return state
         })
-        .then((state) => setCohost((current) => ({ ...current, state })))
-        .catch((error) =>
+        .catch((error) => {
           setSendFailures([
             {
               destinationId: 'cohost-command',
@@ -265,16 +274,24 @@ function CommentsWindowApp(): ReactElement {
               reason: error instanceof Error ? error.message : 'Orcle action failed.'
             }
           ])
-        )
+          return null
+        })
         .finally(() => setCohostActionPending(false))
     }
 
   // Turning the co-host on (and, from the consent CTA, granting cloud-AI
-  // consent) is main-renderer owned; the relay reply carries the truth back so
-  // the switch reflects what actually happened, not what was clicked.
-  const setCohostEnabled = (enabled: boolean, grantConsent = false): void => {
+  // consent, or from the one-time card, listening) is main-renderer owned; the
+  // relay reply carries the truth back so the switch reflects what actually
+  // happened, not what was clicked. The listening card shows only while Orcle
+  // is on, so its Turn on keeps `enabled` true.
+  const setCohostEnabled = (enabled: boolean, grantConsent = false, listen?: boolean): void => {
     void window.videorc
-      ?.sendCohostEnable?.({ requestId: crypto.randomUUID(), enabled, grantConsent })
+      ?.sendCohostEnable?.({
+        requestId: crypto.randomUUID(),
+        enabled,
+        grantConsent,
+        ...(listen === undefined ? {} : { listen })
+      })
       .then((state) => state && setCohost(state))
       .catch((error) =>
         toast.error(
@@ -332,19 +349,30 @@ function CommentsWindowApp(): ReactElement {
         cohostConsented={cohost.consented}
         cohostEnabled={cohost.enabled}
         cohostGate={cohostGate}
+        cohostListen={cohost.listen}
         cohostNudgeDismissedForever={cohostNudgeDismissed}
         cohostStarting={cohostStarting}
         cohostState={cohost.state}
-        onCohostAnswered={(question) => sendCohostAction('answered')(question.id)}
-        onCohostRestoreQuestion={(question) => sendCohostAction('restore')(question.id)}
+        onCohostAnswered={(question) => void sendCohostAction('answered')(question.id)}
+        onCohostRestoreQuestion={(question) => void sendCohostAction('restore')(question.id)}
+        onCohostPromiseDone={(promise) => void sendCohostAction('promise-done')(promise.id)}
+        onCohostPromiseDismiss={(promise) => void sendCohostAction('promise-dismiss')(promise.id)}
+        onCohostRecapDismiss={() =>
+          void sendCohostAction('recap-dismiss')(snapshot.sessionId ?? '')
+        }
+        onCohostRecapDraft={() => sendCohostAction('recap-draft')(snapshot.sessionId ?? '')}
+        onCohostAuthorGreeted={(entry) => void sendCohostAction('author-greeted')(entry.authorKey)}
         onCohostEnable={(enabled) => setCohostEnabled(enabled)}
         onCohostEnableConsent={() => setCohostEnabled(true, true)}
+        onCohostListenOn={() => setCohostEnabled(true, false, true)}
         onCohostNudgeDismiss={() => {
           setCohostNudgeDismissed(true)
           localStorage.setItem(COHOST_NUDGE_STORAGE_KEY, '1')
         }}
-        onCohostDismissFlag={(flag) => sendCohostAction('dismiss-flag')(flag.messageId)}
-        onCohostDismissQuestion={(question) => sendCohostAction('dismiss-question')(question.id)}
+        onCohostDismissFlag={(flag) => void sendCohostAction('dismiss-flag')(flag.messageId)}
+        onCohostDismissQuestion={(question) =>
+          void sendCohostAction('dismiss-question')(question.id)
+        }
         onCohostShowOnStream={live ? showQuestionOnStream : undefined}
         onBackToLive={
           view.mode.kind === 'history'
@@ -376,6 +404,29 @@ function CommentsWindowApp(): ReactElement {
             : undefined
         }
         onHighlight={live ? requestHighlight : undefined}
+        onMarkClip={
+          live
+            ? () => {
+                void window.videorc
+                  ?.markClipFromCommentsWindow?.({ requestId: crypto.randomUUID() })
+                  .then((event) => {
+                    const copy = clipMarkedToast(event)
+                    ;(copy.kind === 'success' ? toast.success : toast.warning)(copy.title, {
+                      id: 'clip-marked',
+                      description: copy.description
+                    })
+                  })
+                  .catch((error) =>
+                    toast.error(
+                      error instanceof Error ? error.message : 'Could not mark the clip.',
+                      {
+                        id: 'clip-marked'
+                      }
+                    )
+                  )
+              }
+            : undefined
+        }
         onOpenPreview={() => void window.videorc?.openPreviewWindow?.()}
         onSend={(text, options) => {
           if (!snapshot.sessionId) return

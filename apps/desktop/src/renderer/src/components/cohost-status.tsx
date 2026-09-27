@@ -1,4 +1,4 @@
-import { CohostIcon } from '@/components/icons'
+import { CohostIcon, MicrophoneIcon } from '@/components/icons'
 import { useState, type ReactElement } from 'react'
 
 import { Badge } from '@/components/ui/badge'
@@ -13,9 +13,9 @@ import {
   PopoverTrigger
 } from '@/components/ui/popover'
 import { Switch } from '@/components/ui/switch'
-import type { CohostState } from '@/lib/backend'
+import type { CohostListening, CohostState } from '@/lib/backend'
 import { cohostPresenceView, type CohostPresenceView } from '@/lib/cohost-presence'
-import { COHOST_CONSENT_SENTENCE } from '@/lib/cohost-view'
+import { COHOST_CONSENT_SENTENCE, cohostListeningView } from '@/lib/cohost-view'
 import { CHAT_HEADER_TIGHT_HIDDEN, CHAT_HEADER_TIGHT_SR_ONLY } from '@/lib/chat-header-tiers'
 import type { EntitlementUiGate } from '@/lib/entitlement-ui'
 import { cn } from '@/lib/utils'
@@ -226,6 +226,45 @@ export function CohostPresenceDot({
       data-slot="cohost-presence-dot"
       data-tone={view.dotTone}
     />
+  )
+}
+
+/**
+ * Whether Orcle hears the streamer (plan 068): a microphone and a few words
+ * beside Orcle's status, nothing at all while listening is off. The icon
+ * carries the tone (green on, amber blocked) and the words stay chrome; in a
+ * tight header only the icon shows and the words move to the tooltip.
+ */
+export function CohostListeningIndicator({
+  listening,
+  className
+}: {
+  listening: CohostListening | null | undefined
+  className?: string
+}): ReactElement | null {
+  const view = cohostListeningView(listening)
+  if (!view) return null
+  return (
+    <span
+      className={cn('flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground', className)}
+      data-listening-state={view.state}
+      data-slot="cohost-listening"
+      title={view.detail}
+    >
+      <MicrophoneIcon
+        aria-hidden
+        className={cn(
+          'size-3.5 shrink-0',
+          view.state === 'on'
+            ? 'text-success'
+            : view.state === 'blocked'
+              ? 'text-warning'
+              : 'text-muted-foreground'
+        )}
+        weight={view.state === 'on' ? 'fill' : 'regular'}
+      />
+      <span className={cn('min-w-0 truncate', CHAT_HEADER_TIGHT_SR_ONLY)}>{view.label}</span>
+    </span>
   )
 }
 

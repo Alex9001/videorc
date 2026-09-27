@@ -3,9 +3,12 @@ import { createServer } from 'node:http'
 /**
  * Local, credential-free stand-in for videorc-web's `POST /api/ai/cohost/tick`
  * used by `pnpm smoke:cohost-fake`. It implements the Live Co-host wire contract
- * deterministically (no model), serving both v1 and v2 keyed off the request's
- * `promptVersion` like the real server (v2 = v1 plus the optional `rules`): every message groups into a question by its
- * normalized text, existing open-question ids echoed by the desktop are kept,
+ * deterministically (no model), serving v1, v2 and v3 keyed off the request's
+ * `promptVersion` like the real server (v2 = v1 plus the optional `rules`; v3,
+ * plan 068 D7, adds the optional `transcript`, `summary`, `openPromises` and
+ * per-message `firstMessage`, and answers with `summary`, `topic`, `promises`,
+ * `fulfilledPromiseIds`, `recap` and per-question `onTopic`): every message
+ * groups into a question by its normalized text, existing open-question ids echoed by the desktop are kept,
  * new questions mint `q_<n>` ids, a marker token flags a message, and the smoke
  * can queue scripted failures (429 + Retry-After, 403 premium-required, 503
  * cohost-disabled, ...) for the next tick. Every request body is recorded.
@@ -17,8 +20,20 @@ import { createServer } from 'node:http'
  * per repeated message therefore yields one asker per destination.
  */
 
-export const COHOST_PROMPT_VERSION = 2
-export const COHOST_PROMPT_VERSIONS = Object.freeze([1, 2])
+export const COHOST_PROMPT_VERSION = 3
+export const COHOST_PROMPT_VERSIONS = Object.freeze([1, 2, 3])
+/** v3 request keys, all optional; a v1/v2 body must not carry them. */
+export const COHOST_TICK_V3_REQUEST_KEYS = Object.freeze(['openPromises', 'summary', 'transcript'])
+export const COHOST_TICK_TRANSCRIPT_MAX_CHARS = 1500
+export const COHOST_TICK_SUMMARY_MAX_CHARS = 600
+export const COHOST_TICK_OPEN_PROMISES_CAP = 20
+export const COHOST_TICK_PROMISE_MAX_CHARS = 160
+export const COHOST_TICK_TOPIC_MAX_CHARS = 60
+export const COHOST_TICK_RECAP_MAX_CHARS = 140
+/** A transcript containing this mints a promise with a viewers trigger. */
+export const COHOST_PROMISE_PHRASE = 'i promise'
+/** A message containing this earns a recap. */
+export const COHOST_RECAP_PHRASE = 'what did i miss'
 export const COHOST_RULES_MAX = 10
 export const COHOST_RULE_MAX_CHARS = 120
 export const COHOST_TICK_PATH = '/api/ai/cohost/tick'
@@ -51,6 +66,7 @@ export const COHOST_TICK_REQUEST_KEYS = Object.freeze([
 export const COHOST_TICK_MESSAGE_KEYS = Object.freeze([
   'at',
   'author',
+  'firstMessage',
   'id',
   'platform',
   'roles',
@@ -58,7 +74,8 @@ export const COHOST_TICK_MESSAGE_KEYS = Object.freeze([
 ])
 
 const TONES = new Set(['friendly', 'short', 'professional'])
-const PLATFORMS = new Set(['twitch', 'youtube', 'x'])
+// Kick is a valid chat platform in every version (plan 068).
+const PLATFORMS = new Set(['twitch', 'youtube', 'x', 'kick'])
 
 export function normalizeQuestionText(text) {
   return String(text ?? '')
@@ -103,10 +120,17 @@ export function validateCohostTickRequest(body) {
       message: `promptVersion ${String(body.promptVersion)} is not supported.`
     }
   }
-  // v2 adds the optional `rules`; a v1 body must not carry it.
+  // v2 adds the optional `rules`; a v1 body must not carry it. v3 adds the
+  // optional transcript, summary and openPromises; a v1/v2 body must not.
+  const v3 = body.promptVersion >= 3
   const keys = Object.keys(body)
     .filter((key) => !(key === 'rules' && body.promptVersion >= 2))
+    .filter((key) => !(v3 && COHOST_TICK_V3_REQUEST_KEYS.includes(key)))
     .sort()
+  if (v3) {
+    const v3Failure = validateV3RequestExtras(body)
+    if (v3Failure) return v3Failure
+  }
   if (body.rules !== undefined && body.promptVersion >= 2) {
     const rulesOk =
       Array.isArray(body.rules) &&
@@ -182,6 +206,12 @@ export function validateCohostTickRequest(body) {
     if (messageKeys.length > 0) {
       return invalid(`message carries unexpected keys: ${messageKeys.join(',')}.`)
     }
+    if (message.firstMessage !== undefined) {
+      if (!v3) return invalid('message.firstMessage is a v3 field.')
+      if (typeof message.firstMessage !== 'boolean') {
+        return invalid('message.firstMessage must be a boolean when present.')
+      }
+    }
     if (typeof message.id !== 'string' || !message.id) {
       return invalid('message.id must be a non-empty string.')
     }
@@ -209,6 +239,122 @@ export function validateCohostTickRequest(body) {
 
 function invalid(message) {
   return { status: 400, code: 'invalid-request', message }
+}
+
+/** The v3 extras the way `cohost.ts` checks them: the transcript is only
+ * truncated (never rejected), the summary and promises are capped hard. */
+function validateV3RequestExtras(body) {
+  if (body.transcript !== undefined && typeof body.transcript !== 'string') {
+    return invalid('transcript must be a string when present.')
+  }
+  if (
+    body.summary !== undefined &&
+    (typeof body.summary !== 'string' || body.summary.length > COHOST_TICK_SUMMARY_MAX_CHARS)
+  ) {
+    return invalid(`summary must be a string of at most ${COHOST_TICK_SUMMARY_MAX_CHARS}.`)
+  }
+  if (body.openPromises !== undefined) {
+    if (
+      !Array.isArray(body.openPromises) ||
+      body.openPromises.length > COHOST_TICK_OPEN_PROMISES_CAP
+    ) {
+      return invalid(`openPromises must be an array of at most ${COHOST_TICK_OPEN_PROMISES_CAP}.`)
+    }
+    for (const promise of body.openPromises) {
+      if (
+        !promise ||
+        typeof promise.id !== 'string' ||
+        !promise.id ||
+        typeof promise.text !== 'string' ||
+        promise.text.length < 1 ||
+        promise.text.length > COHOST_TICK_PROMISE_MAX_CHARS
+      ) {
+        return invalid(
+          `openPromises entries must carry id and a text of 1-${COHOST_TICK_PROMISE_MAX_CHARS} characters.`
+        )
+      }
+    }
+  }
+  return null
+}
+
+const TOPIC_STOP_WORDS = new Set([
+  'the',
+  'and',
+  'that',
+  'this',
+  'with',
+  'have',
+  'from',
+  'just',
+  'like',
+  'what',
+  'your',
+  'about',
+  'will',
+  'promise'
+])
+
+function contentWords(text) {
+  return String(text ?? '')
+    .toLocaleLowerCase('en-US')
+    .split(/[^a-z0-9]+/u)
+    .filter((word) => word.length >= 4 && !TOPIC_STOP_WORDS.has(word))
+}
+
+/**
+ * Deterministic v3 speech planner (pure, plan 068 D7): the rolling summary
+ * appends the newest transcript (capped from the front), the topic is the
+ * first content words of the transcript, `i promise ...` mints a promise
+ * (no id) with a 100-viewer trigger while echoed open promises keep their
+ * ids, `promise kept` fulfils every open promise, a message asking "what did
+ * I miss" earns a recap from the summary, and a question is on topic when it
+ * shares a content word with the transcript.
+ */
+export function planCohostSpeech(body, questions) {
+  const transcript = String(body.transcript ?? '').trim()
+  const previous = String(body.summary ?? '').trim()
+  let summary = [previous, transcript].filter(Boolean).join(' ')
+  if (summary.length > COHOST_TICK_SUMMARY_MAX_CHARS) {
+    summary = summary.slice(summary.length - COHOST_TICK_SUMMARY_MAX_CHARS)
+  }
+  const transcriptWords = contentWords(transcript)
+  const topic = transcript ? transcriptWords.slice(0, 3).join(' ').slice(0, COHOST_TICK_TOPIC_MAX_CHARS) : ''
+  const lower = transcript.toLocaleLowerCase('en-US')
+  const promises = (body.openPromises ?? []).map((open) => ({
+    id: open.id,
+    text: open.text,
+    trigger: { kind: 'viewers', value: 100 }
+  }))
+  const fulfilledPromiseIds = lower.includes('promise kept')
+    ? promises.map((promise) => promise.id)
+    : []
+  const kept = promises.filter((promise) => !fulfilledPromiseIds.includes(promise.id))
+  const promiseAt = lower.indexOf(COHOST_PROMISE_PHRASE)
+  if (promiseAt >= 0) {
+    const text = transcript
+      .slice(promiseAt + COHOST_PROMISE_PHRASE.length)
+      .split(/[.!?]/u)[0]
+      .trim()
+      .slice(0, COHOST_TICK_PROMISE_MAX_CHARS)
+    if (text && !kept.some((promise) => promise.text === text)) {
+      kept.push({ text, trigger: { kind: 'viewers', value: 100 } })
+    }
+  }
+  const asked = (body.messages ?? []).some((message) =>
+    String(message.text ?? '')
+      .toLocaleLowerCase('en-US')
+      .includes(COHOST_RECAP_PHRASE)
+  )
+  const recap = asked && summary ? `So far: ${summary}`.slice(0, COHOST_TICK_RECAP_MAX_CHARS) : null
+  const transcriptSet = new Set(transcriptWords)
+  const onTopic = new Map(
+    questions.map((question) => [
+      question.id,
+      contentWords(question.text).some((word) => transcriptSet.has(word))
+    ])
+  )
+  return { summary, topic, promises: kept, fulfilledPromiseIds, recap, onTopic }
 }
 
 export const COHOST_SPOTLIGHT_REQUEST_KEYS = Object.freeze([
@@ -492,6 +638,17 @@ export function planCohostTick(
   }
   const scriptedHighlights = planTickHighlights(body.messages, highlights, flagMarker)
   if (scriptedHighlights) response.highlights = scriptedHighlights
+  if ((body.promptVersion ?? 0) >= 3) {
+    const speech = planCohostSpeech(body, questions)
+    for (const question of questions) {
+      question.onTopic = speech.onTopic.get(question.id) === true
+    }
+    response.summary = speech.summary
+    response.topic = speech.topic
+    response.promises = speech.promises
+    response.fulfilledPromiseIds = speech.fulfilledPromiseIds
+    if (speech.recap) response.recap = speech.recap
+  }
   return response
 }
 

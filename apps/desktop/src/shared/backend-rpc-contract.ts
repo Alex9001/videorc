@@ -10,11 +10,16 @@ import type {
   ScheduledStreamCandidate,
   CaptureRecoveryStatus,
   CohostFlagParams,
+  CohostAuthorParams,
+  CohostPromiseParams,
+  CohostRecapParams,
   CohostQuestionParams,
   CohostSettings,
   CohostSettingsPatch,
   CohostStartParams,
   CohostState,
+  ClipMark,
+  ClipMarkedEvent,
   CompositorFrameReady,
   CompositorStatus,
   SceneEditorDraftAck,
@@ -241,8 +246,15 @@ export interface BackendRpcMethodMap {
   'cohost.question.dismiss': BackendRpcDefinition<CohostQuestionParams, CohostState>
   'cohost.question.restore': BackendRpcDefinition<CohostQuestionParams, CohostState>
   'cohost.flag.dismiss': BackendRpcDefinition<CohostFlagParams, CohostState>
+  'cohost.promise.done': BackendRpcDefinition<CohostPromiseParams, CohostState>
+  'cohost.promise.dismiss': BackendRpcDefinition<CohostPromiseParams, CohostState>
+  'cohost.recap.dismiss': BackendRpcDefinition<CohostRecapParams, CohostState>
+  'cohost.recap.draft': BackendRpcDefinition<CohostRecapParams, CohostState>
+  'cohost.author.greeted': BackendRpcDefinition<CohostAuthorParams, CohostState>
   'cohost.settings.get': BackendRpcDefinition<undefined, CohostSettings>
   'cohost.settings.set': BackendRpcDefinition<CohostSettingsPatch, CohostSettings>
+  'clip.mark': BackendRpcDefinition<undefined, ClipMarkedEvent>
+  'clip.marks.list': BackendRpcDefinition<{ sessionId: string }, ClipMark[]>
 }
 
 export type BackendRpcMethod = keyof BackendRpcMethodMap
@@ -269,6 +281,7 @@ export interface BackendEventMap {
   'capture.recovery.status': CaptureRecoveryStatus
   'diagnostics.stats': DiagnosticStats
   'cohost.state': CohostState
+  'clip.marked': ClipMarkedEvent
   'performance.check.progress': PerformanceCheckProgress
   'performance.check.completed': PerformanceCheckState
 }
@@ -1821,7 +1834,9 @@ const cohostSettingsSchema = objectSchema(
     notes: cohostNotesSchema,
     autoHighlight: booleanSchema,
     voiceHighlight: booleanSchema,
-    rules: cohostRulesSchema
+    rules: cohostRulesSchema,
+    // Plan 068: Orcle hears the microphone while live.
+    listen: booleanSchema
   },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostSettings>
@@ -1833,7 +1848,8 @@ const cohostSettingsPatchSchema = objectSchema(
     autoHighlight: optionalSchema(booleanSchema),
     voiceHighlight: optionalSchema(booleanSchema),
     // The patch is what the streamer typed; the backend trims and caps it.
-    rules: optionalSchema(arraySchema(stringSchema({ maxLength: 2000 }), { maxLength: 100 }))
+    rules: optionalSchema(arraySchema(stringSchema({ maxLength: 2000 }), { maxLength: 100 })),
+    listen: optionalSchema(booleanSchema)
   },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostSettingsPatch>
@@ -1848,8 +1864,50 @@ const cohostQuestionSchema = objectSchema(
     suggestedReply: stringSchema({ maxLength: 2000 }),
     fromNotes: booleanSchema,
     firstSeenAt: timestamp,
-    updatedAt: timestamp
+    updatedAt: timestamp,
+    // Tick v3 (plan 068): omitted by the backend while false.
+    onTopic: optionalSchema(booleanSchema)
   },
+  { allowUnknown: false }
+)
+// Plan 068 D8: promises, the reminder and the recap. The trigger kind
+// vocabulary may grow; an unknown one still validates (the engine already
+// read it as `none`).
+const cohostPromiseSchema = objectSchema(
+  {
+    id: boundedString,
+    text: stringSchema({ maxLength: 160 }),
+    trigger: objectSchema(
+      {
+        kind: stringSchema({ minLength: 1, maxLength: 32 }),
+        value: optionalSchema(nonNegativeInteger)
+      },
+      { allowUnknown: false }
+    ),
+    firstSeenAt: timestamp
+  },
+  { allowUnknown: false }
+)
+const cohostPromiseReminderSchema = objectSchema(
+  { promiseId: boundedString, text: stringSchema({ maxLength: 160 }), at: timestamp },
+  { allowUnknown: false }
+)
+const cohostRecapSchema = objectSchema(
+  { text: stringSchema({ maxLength: 140 }), at: timestamp, expiresAt: timestamp },
+  { allowUnknown: false }
+)
+// Plan 068 D9: "Say hi" and the dead-air nudge.
+const cohostSayHiSchema = objectSchema(
+  {
+    authorKey: boundedString,
+    name: stringSchema({ minLength: 1, maxLength: 512 }),
+    platform: streamPlatformSchema,
+    firstSeenAt: timestamp
+  },
+  { allowUnknown: false }
+)
+const cohostDeadAirNudgeSchema = objectSchema(
+  { key: boundedString, text: stringSchema({ minLength: 1, maxLength: 1024 }), at: timestamp },
   { allowUnknown: false }
 )
 // `unknown` is the backend's serde catch-all for a kind newer than this build;
@@ -1948,6 +2006,42 @@ const cohostErrorDetailSchema = objectSchema(
   },
   { allowUnknown: false }
 )
+// Plan 068 D6: clip marks. Optional fields are omitted by the backend when
+// absent (never null).
+const clipMarkSourceSchema = enumSchema(['voice', 'manual'])
+const clipMarkSchema = objectSchema(
+  {
+    id: boundedString,
+    sessionId: boundedString,
+    atSeconds: numberSchema({ min: 0, max: 1_000_000_000 }),
+    source: clipMarkSourceSchema,
+    phrase: optionalSchema(stringSchema({ minLength: 1, maxLength: 128 })),
+    createdAt: timestamp
+  },
+  { allowUnknown: false }
+) as RuntimeSchema<ClipMark>
+const clipMarkedEventSchema = objectSchema(
+  {
+    sessionId: boundedString,
+    atSeconds: numberSchema({ min: 0, max: 1_000_000_000 }),
+    source: clipMarkSourceSchema,
+    saved: booleanSchema,
+    reason: optionalSchema(stringSchema({ minLength: 1, maxLength: 128 }))
+  },
+  { allowUnknown: false }
+) as RuntimeSchema<ClipMarkedEvent>
+
+// Plan 068: whether Orcle hears the streamer. Every optional field is omitted
+// by the backend when absent (never null).
+const cohostListeningSchema = objectSchema(
+  {
+    state: enumSchema(['off', 'starting', 'on', 'blocked']),
+    reasonCode: optionalSchema(stringSchema({ minLength: 1, maxLength: 128 })),
+    message: optionalSchema(stringSchema({ maxLength: 2000 })),
+    remainingSeconds: optionalSchema(nonNegativeInteger)
+  },
+  { allowUnknown: false }
+)
 const cohostStateSchema = objectSchema(
   {
     sessionId: nullableSchema(boundedString),
@@ -1987,7 +2081,16 @@ const cohostStateSchema = objectSchema(
     autoHighlight: optionalSchema(cohostAutoHighlightSchema),
     // Plan 060 S3: absent while there is no spotlight / nothing resolved.
     spotlight: optionalSchema(cohostSpotlightSchema),
-    recentlyResolved: optionalSchema(arraySchema(cohostRecentlyResolvedSchema, { maxLength: 3 }))
+    recentlyResolved: optionalSchema(arraySchema(cohostRecentlyResolvedSchema, { maxLength: 3 })),
+    // Plan 068: absent without a session or from a backend before the field.
+    listening: optionalSchema(cohostListeningSchema),
+    // Tick v3 (plan 068 D7/D8): all absent until the engine has them.
+    topic: optionalSchema(stringSchema({ maxLength: 60 })),
+    promises: optionalSchema(arraySchema(cohostPromiseSchema, { maxLength: 20 })),
+    promiseReminder: optionalSchema(cohostPromiseReminderSchema),
+    recap: optionalSchema(cohostRecapSchema),
+    sayHi: optionalSchema(arraySchema(cohostSayHiSchema, { maxLength: 5 })),
+    deadAirNudge: optionalSchema(cohostDeadAirNudgeSchema)
   },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostState>
@@ -2007,6 +2110,18 @@ const cohostFlagParamsSchema = objectSchema(
   { sessionId: boundedString, messageId: boundedString },
   { allowUnknown: false }
 ) as RuntimeSchema<CohostFlagParams>
+const cohostPromiseParamsSchema = objectSchema(
+  { sessionId: boundedString, promiseId: boundedString },
+  { allowUnknown: false }
+) as RuntimeSchema<CohostPromiseParams>
+const cohostRecapParamsSchema = objectSchema(
+  { sessionId: boundedString },
+  { allowUnknown: false }
+) as RuntimeSchema<CohostRecapParams>
+const cohostAuthorParamsSchema = objectSchema(
+  { sessionId: boundedString, authorKey: boundedString },
+  { allowUnknown: false }
+) as RuntimeSchema<CohostAuthorParams>
 
 const scheduledMutationSchema = objectSchema(
   {
@@ -2442,8 +2557,18 @@ const runtimeContracts = {
   'cohost.question.dismiss': { params: cohostQuestionParamsSchema, result: cohostStateSchema },
   'cohost.question.restore': { params: cohostQuestionParamsSchema, result: cohostStateSchema },
   'cohost.flag.dismiss': { params: cohostFlagParamsSchema, result: cohostStateSchema },
+  'cohost.promise.done': { params: cohostPromiseParamsSchema, result: cohostStateSchema },
+  'cohost.promise.dismiss': { params: cohostPromiseParamsSchema, result: cohostStateSchema },
+  'cohost.recap.dismiss': { params: cohostRecapParamsSchema, result: cohostStateSchema },
+  'cohost.recap.draft': { params: cohostRecapParamsSchema, result: cohostStateSchema },
+  'cohost.author.greeted': { params: cohostAuthorParamsSchema, result: cohostStateSchema },
   'cohost.settings.get': { params: undefinedSchema, result: cohostSettingsSchema },
-  'cohost.settings.set': { params: cohostSettingsPatchSchema, result: cohostSettingsSchema }
+  'cohost.settings.set': { params: cohostSettingsPatchSchema, result: cohostSettingsSchema },
+  'clip.mark': { params: undefinedSchema, result: clipMarkedEventSchema },
+  'clip.marks.list': {
+    params: objectSchema({ sessionId: boundedString }, { allowUnknown: false }),
+    result: arraySchema(clipMarkSchema, { maxLength: 10_000 })
+  }
 } satisfies Record<BackendRpcMethod, RuntimeBackendRpcContract>
 
 export function isTypedBackendRpcMethod(method: string): method is BackendRpcMethod {
@@ -2487,6 +2612,7 @@ const runtimeEventSchemas = {
   'capture.recovery.status': captureRecoveryStatusSchema,
   'diagnostics.stats': diagnosticStatsSchema,
   'cohost.state': cohostStateSchema,
+  'clip.marked': clipMarkedEventSchema,
   'performance.check.progress': performanceCheckProgressSchema,
   'performance.check.completed': performanceCheckStateSchema
 } satisfies Record<BackendEvent, RuntimeSchema<unknown>>

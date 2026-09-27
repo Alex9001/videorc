@@ -3,7 +3,7 @@ import { act, createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { CohostSettings } from '@/lib/backend'
+import type { CohostListening, CohostSettings } from '@/lib/backend'
 
 import {
   COHOST_SHOW_ON_STREAM_PATCHES,
@@ -11,8 +11,14 @@ import {
   cohostShowOnStreamMode
 } from './cohost-settings-section'
 
-const mocked = vi.hoisted(() => ({ core: {} as Record<string, unknown> }))
-vi.mock('@/hooks/use-studio', () => ({ useStudioCore: () => mocked.core }))
+const mocked = vi.hoisted(() => ({
+  core: {} as Record<string, unknown>,
+  chat: { cohostState: null } as Record<string, unknown>
+}))
+vi.mock('@/hooks/use-studio', () => ({
+  useStudioCore: () => mocked.core,
+  useStudioChat: () => mocked.chat
+}))
 
 let root: Root
 let container: HTMLDivElement
@@ -26,6 +32,7 @@ function settings(overrides: Partial<CohostSettings> = {}): CohostSettings {
     autoHighlight: false,
     voiceHighlight: false,
     rules: [],
+    listen: false,
     ...overrides
   }
 }
@@ -46,9 +53,11 @@ afterEach(async () => {
 
 async function render(
   current: CohostSettings,
-  gate: Record<string, unknown> = { allowed: true }
+  gate: Record<string, unknown> = { allowed: true },
+  listening?: CohostListening
 ): Promise<void> {
   mocked.core = { cohostSettings: current, cohostGate: gate, patchCohostSettings }
+  mocked.chat = { cohostState: listening ? { listening } : null }
   await act(async () => root.render(createElement(CohostSettingsSection)))
 }
 
@@ -82,7 +91,9 @@ describe('Show on stream automatically', () => {
   it('renders the choice with its helper lines and writes both flags', async () => {
     await render(settings())
     expect(document.body.textContent).toContain('Show on stream automatically')
-    expect(document.body.textContent).toContain('What I talk about needs live captions.')
+    expect(document.body.textContent).toContain(
+      'What I talk about needs Orcle to hear you (or live captions).'
+    )
     expect(document.body.textContent).toContain('nothing Orcle flagged is ever shown')
     expect(option('Off').getAttribute('data-state')).toBe('on')
 
@@ -128,8 +139,60 @@ describe('Show on stream automatically', () => {
 
   it('names the transcript in the consent sentence', async () => {
     await render(settings())
+    expect(document.body.textContent).toContain('Orcle reads live chat with Videorc cloud AI.')
     expect(document.body.textContent).toContain(
-      'while live captions are on, it also reads short windows of what you say, as text (never audio), which are not kept.'
+      "While you're live, your microphone audio goes to Videorc's cloud speech-to-text to be turned into text, even with live captions off. Videorc servers don't keep it. The transcript is saved with your recording on this computer."
+    )
+  })
+})
+
+describe('Orcle hears you while you are live (plan 068)', () => {
+  function listenSwitch(): HTMLButtonElement {
+    const control = document.getElementById('cohost-listen') as HTMLButtonElement | null
+    expect(control).toBeTruthy()
+    return control!
+  }
+
+  it('is a switch bound to the listen setting', async () => {
+    await render(settings())
+    expect(document.body.textContent).toContain("Orcle hears you while you're live")
+    expect(listenSwitch().getAttribute('data-state')).toBe('unchecked')
+    await act(async () => listenSwitch().click())
+    expect(patchCohostSettings).toHaveBeenLastCalledWith({ listen: true })
+  })
+
+  it('turns listening off again', async () => {
+    await render(settings({ listen: true }))
+    expect(listenSwitch().getAttribute('data-state')).toBe('checked')
+    await act(async () => listenSwitch().click())
+    expect(patchCohostSettings).toHaveBeenLastCalledWith({ listen: false })
+  })
+
+  it('is locked with the rest of the section for a Basic account', async () => {
+    await render(settings(), { allowed: false, featureId: 'live-cohost', reason: 'Premium.' })
+    expect(listenSwitch().disabled).toBe(true)
+  })
+
+  it('shows listening time left only when the server reported it', async () => {
+    await render(settings({ listen: true }))
+    expect(document.querySelector('[data-slot="cohost-listen-allowance"]')).toBeNull()
+
+    await render(
+      settings({ listen: true }),
+      { allowed: true },
+      { state: 'on', remainingSeconds: 5_400 }
+    )
+    expect(document.querySelector('[data-slot="cohost-listen-allowance"]')?.textContent).toBe(
+      '1 h 30 min of listening left this month.'
+    )
+
+    await render(
+      settings({ listen: true }),
+      { allowed: true },
+      { state: 'blocked', reasonCode: 'listen-monthly-quota-exhausted', message: 'Used up.' }
+    )
+    expect(document.querySelector('[data-slot="cohost-listen-allowance"]')?.textContent).toBe(
+      'Your listening time for this month is used up.'
     )
   })
 })

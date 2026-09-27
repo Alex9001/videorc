@@ -83,6 +83,9 @@ pub enum RemoteIntent {
         message_id: String,
     },
     CommentHighlightClear,
+    /// Mark the current moment for a clip (plan 068 D6). Idempotent by time:
+    /// the backend stamps the capture clock, never a toggle.
+    ClipMark,
 }
 
 /// Live-chat message ids are `{platform}:{providerMessageId}`; anything far
@@ -109,6 +112,7 @@ impl RemoteIntent {
             Self::TakeoverShow { .. } | Self::TakeoverHide => "takeover",
             Self::WindowFront { .. } => "window",
             Self::CommentHighlight { .. } | Self::CommentHighlightClear => "highlight",
+            Self::ClipMark => "clip",
         }
     }
 
@@ -303,6 +307,14 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<RemoteIntent>(r#"{"kind":"commentHighlightClear"}"#).unwrap(),
             RemoteIntent::CommentHighlightClear
+        );
+        let intent = serde_json::from_str::<RemoteIntent>(r#"{"kind":"clipMark"}"#).unwrap();
+        assert_eq!(intent, RemoteIntent::ClipMark);
+        assert!(intent.validate().is_ok());
+        assert_eq!(intent.debounce_kind(), "clip");
+        assert_eq!(
+            serde_json::to_value(&intent).unwrap(),
+            serde_json::json!({ "kind": "clipMark" })
         );
     }
 

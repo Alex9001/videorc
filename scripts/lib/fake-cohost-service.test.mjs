@@ -5,8 +5,10 @@ import {
   COHOST_SPOTLIGHT_PATH,
   COHOST_SPOTLIGHT_REQUEST_KEYS,
   COHOST_TICK_REQUEST_KEYS,
+  COHOST_TICK_V3_REQUEST_KEYS,
   askerLabel,
   normalizeQuestionText,
+  planCohostSpeech,
   planCohostSpotlight,
   planCohostTick,
   planTickHighlights,
@@ -123,7 +125,7 @@ describe('fake co-host planner', () => {
       'consent-required'
     )
     assert.equal(
-      validateCohostTickRequest(tickBody({ promptVersion: 3 })).code,
+      validateCohostTickRequest(tickBody({ promptVersion: 4 })).code,
       'prompt-version-unsupported'
     )
     // v2 = v1 plus the optional, already-normalised `rules`.
@@ -150,6 +152,94 @@ describe('fake co-host planner', () => {
       'invalid-request'
     )
     assert.deepEqual(Object.keys(tickBody()).sort(), [...COHOST_TICK_REQUEST_KEYS])
+  })
+
+  it('accepts the v3 extras only on v3, caps promises, and takes Kick in every version', () => {
+    assert.deepEqual([...COHOST_TICK_V3_REQUEST_KEYS], ['openPromises', 'summary', 'transcript'])
+    const v3 = (overrides = {}) => tickBody({ promptVersion: 3, rules: [], ...overrides })
+    assert.equal(validateCohostTickRequest(v3()), null)
+    assert.equal(
+      validateCohostTickRequest(
+        v3({
+          transcript: 'x'.repeat(4000),
+          summary: 'so far',
+          openPromises: [{ id: 'p_1', text: 'Giveaway at 100 viewers' }],
+          messages: [{ ...message('lane-a', 0, { platform: 'kick' }), firstMessage: true }]
+        })
+      ),
+      null
+    )
+    assert.equal(
+      validateCohostTickRequest(tickBody({ promptVersion: 2, rules: [], transcript: 'hi' })).code,
+      'invalid-request'
+    )
+    assert.equal(
+      validateCohostTickRequest(
+        tickBody({ promptVersion: 2, rules: [], messages: [{ ...message('a', 0), firstMessage: true }] })
+      ).code,
+      'invalid-request'
+    )
+    assert.equal(
+      validateCohostTickRequest(tickBody({ messages: [message('a', 0, { platform: 'kick' })] })),
+      null
+    )
+    assert.equal(
+      validateCohostTickRequest(v3({ summary: 'x'.repeat(601) })).code,
+      'invalid-request'
+    )
+    assert.equal(
+      validateCohostTickRequest(
+        v3({ openPromises: Array.from({ length: 21 }, (_, i) => ({ id: `p_${i}`, text: 't' })) })
+      ).code,
+      'invalid-request'
+    )
+    assert.equal(
+      validateCohostTickRequest(v3({ openPromises: [{ id: 'p', text: 'x'.repeat(161) }] })).code,
+      'invalid-request'
+    )
+  })
+
+  it('answers v3 with a topic, promises, a recap on request and on-topic questions', () => {
+    let next = 1
+    const mintId = () => `q_${next++}`
+    const body = tickBody({
+      promptVersion: 3,
+      rules: [],
+      transcript: 'Today we are building a mechanical keyboard. I promise a giveaway later.',
+      summary: 'Unboxed the parts.',
+      openPromises: [{ id: 'p_old', text: 'Show the build' }],
+      messages: [
+        { ...message('lane-a', 0), text: 'Which keyboard switches are those?' },
+        { ...message('lane-a', 1), text: 'what did I miss?' }
+      ]
+    })
+    const planned = planCohostTick(body, { mintId })
+    assert.equal(planned.promptVersion, 3)
+    assert.equal(planned.topic, 'today building mechanical')
+    assert.ok(planned.summary.startsWith('Unboxed the parts. Today we are'))
+    assert.deepEqual(planned.promises, [
+      { id: 'p_old', text: 'Show the build', trigger: { kind: 'viewers', value: 100 } },
+      { text: 'a giveaway later', trigger: { kind: 'viewers', value: 100 } }
+    ])
+    assert.deepEqual(planned.fulfilledPromiseIds, [])
+    assert.ok(planned.recap.startsWith('So far: Unboxed the parts.'))
+    assert.ok(planned.recap.length <= 140)
+    const switches = planned.questions.find((q) => q.text.includes('switches'))
+    const missed = planned.questions.find((q) => q.text.includes('miss'))
+    assert.equal(switches.onTopic, true)
+    assert.equal(missed.onTopic, false)
+
+    // v2 answers carry none of it; "promise kept" fulfils; no recap unasked.
+    const v2 = planCohostTick(tickBody({ promptVersion: 2, rules: [] }), { mintId })
+    assert.equal('topic' in v2, false)
+    assert.equal('promises' in v2, false)
+    const kept = planCohostSpeech(
+      { transcript: 'promise kept', openPromises: [{ id: 'p_old', text: 'Show' }], messages: [] },
+      []
+    )
+    assert.deepEqual(kept.fulfilledPromiseIds, ['p_old'])
+    assert.deepEqual(kept.promises, [])
+    assert.equal(kept.recap, null)
   })
 })
 
