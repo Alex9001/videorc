@@ -265,9 +265,19 @@ smoke forwards those lines to its own log unconditionally, and with
 `VIDEORC_MATRIX_PRINT_BRIDGE_DIAGNOSTICS=1` its printed diagnostics line
 carries `linuxVaapiArgProfile`, `linuxRenderNodes` and any named fallback
 reason. The backend tries the
-standard argument set first and, only if the same node rejects it, a compat
-set (constant bitrate, no B-frames) as defence in depth. Both sets pin the
-level in `h264_vaapi`'s own spelling (`-level 4`, not `-level 4.0`).
+standard argument set (VBR, no B-frames) first and, only if the same node
+rejects it, a compat set (constant bitrate, no B-frames) as defence in depth.
+Both sets pin the level in `h264_vaapi`'s own spelling (`-level 4`, not
+`-level 4.0`).
+
+Neither set may use B-frames. `h264_vaapi` defaults to `bf=2`, and that
+reorder delay deadlocks FFmpeg's `-shortest` sync queue whenever audio
+arrives after the first video frames. In the app that is every session,
+because bridge audio waits for the video epoch. On ogre `renderD128`
+(2026-09-27) video stalled at about frame 4 until Stop and the audio FIFO
+backed up. When no packet got out before the stall, the session failed the
+8s "positive output media progress" gate. A standalone FIFO replay with
+audio 300ms late reproduced it. `-bf 0` and libopenh264 ran clean.
 
 Finding from the ogre bisect (Plan 0001, 2026-09-24): Intel iHD's
 "Failed to end picture encode issue: 24" was the `-level 4.0` spelling.
@@ -277,7 +287,7 @@ level the driver rejects at end-of-picture. Rate control and B-frames were
 never the cause. Expect `linuxVaapiArgProfile: "standard"` in the bridge
 diagnostics on a healthy node; a `compat` selection now means a real driver
 rejection worth a bisect: copy the logged standard command and remove one
-item at a time (`-rc_mode VBR` → `CBR`, add `-bf 0`, drop
+item at a time (`-rc_mode VBR` → `CBR`, drop
 `-flags +global_header`, drop `-force_key_frames`, 1080p → 720p) and record
 the first passing set and every failing stderr in the test report.
 
