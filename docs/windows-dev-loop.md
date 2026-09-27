@@ -377,13 +377,20 @@ diagnostic command without compiling Rust. Physical worker cases additionally
 need the matching capture worker described below.
 
 The incident matrix crosses both profiles with local recording, one receiver,
-two receivers, and recording plus two receivers; controlled tone, real capture
+two receivers, and recording plus two receivers; native PCM controlled tone,
+an additional independent FFmpeg tone control, real capture
 worker, and an injected worker-open failure into real DirectShow fallback;
 three same-process attempts versus three backend restarts. Its fixed preview
 state is the backend compositor without a presenter. Controlled audio selects the
 existing portable debug native PCM fixture: continuous 440 Hz tone, with
 runner-owned fixture flags. Its CoreAudio-prefixed synthetic device ID does not
-represent a physical CoreAudio device on Windows. An absent microphone would
+represent a physical CoreAudio device on Windows. The fixture keeps an anchored
+sample clock after delayed scheduling, catches up at most one second, and reports
+any skipped expired samples. `--audio ffmpeg-control` selects a separate debug and
+smoke gated lavfi 880 Hz source, requires no selected microphone, and bypasses the
+native PCM bus. Both modes keep the same strict artifact gates and retain separate
+reports; the FFmpeg control does not replace failed native PCM evidence.
+An absent microphone would
 produce intentional silence and is not used as tone evidence. A named case can be run:
 
 ```powershell
@@ -410,7 +417,10 @@ analyzer's -50 dB silence threshold; a quiet-room failure alone does not establi
 a capture-device fault. Controlled tone rejects 20 ms or more total interior
 silence. Both checks clip silence across the 500 ms lead-in and 300 ms tail, so
 a wholly silent artifact cannot pass by touching those boundaries. Every artifact
-also enforces the maintained recording-matrix 100 ms A/V stop-tail bound.
+also enforces the maintained recording-matrix 100 ms A/V stop-tail bound. A bounded
+ffprobe packet pass measures terminal video and audio PTS plus packet duration,
+including FLV receivers whose stream durations are absent. Missing terminal timing
+fails closed; a null container duration cannot bypass the stop-tail check.
 
 Use a new empty output directory for every invocation. Every failed start and
 cleanup outcome is retained before the next attempt. Reports include OS/adapter
@@ -420,5 +430,5 @@ path, and final artifact cadence, motion, audio gaps/digital zeroes, and A/V
 stream timestamp skew. Perceptual microphone offset remains unmeasured without
 a physical flash/click reference. A nonzero runner exit means a failed or
 blocked diagnostic case, not a reason to relax the existing analyzer limits.
-The hosted Windows diagnostic job runs controlled audio only; it cannot close
+The hosted Windows diagnostic job runs both synthetic audio controls; it cannot close
 the affected Intel/DirectShow incident or physical/provider acceptance.

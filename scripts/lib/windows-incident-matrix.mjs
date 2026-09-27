@@ -2,7 +2,7 @@
 export function buildWindowsIncidentMatrix() {
   return [1080, 720].flatMap((height) =>
     ['record', 'single', 'dual', 'record-dual'].flatMap((topology) =>
-      ['controlled', 'worker', 'direct-fallback'].flatMap((audio) =>
+      ['controlled', 'ffmpeg-control', 'worker', 'direct-fallback'].flatMap((audio) =>
         ['same-process', 'restart'].map((retry) => ({
           id: `${height}p30-${topology}-${audio}-${retry}`,
           width: height === 1080 ? 1920 : 1280,
@@ -116,14 +116,15 @@ export function incidentAudioEnvironment(audio) {
   return {
     VIDEORC_CAPTION_CONTRACT_TEST: audio === 'controlled' ? '1' : '0',
     VIDEORC_LIVE_SOURCE_SWITCH_TEST: audio === 'controlled' ? '1' : '0',
-    VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '0'
+    VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '0',
+    VIDEORC_INCIDENT_FFMPEG_TONE: audio === 'ffmpeg-control' ? '1' : '0'
   }
 }
 
 export function incidentSessionParams(scenario, targets, microphoneId) {
   if (targets.length !== scenario.receivers) throw new Error('Missing incident receiver')
   targets.forEach(assertOwnedLoopbackTarget)
-  if (scenario.audio !== 'controlled' && !microphoneId)
+  if (['worker', 'direct-fallback'].includes(scenario.audio) && !microphoneId)
     throw new Error('Physical microphone required for worker/fallback incident case')
   const now = new Date().toISOString()
   const video = {
@@ -147,7 +148,11 @@ export function incidentSessionParams(scenario, targets, microphoneId) {
     sources: {
       testPattern: true,
       microphoneId:
-        scenario.audio === 'controlled' ? 'microphone:coreaudio:4294967295' : microphoneId
+        scenario.audio === 'controlled'
+          ? 'microphone:coreaudio:4294967295'
+          : scenario.audio === 'ffmpeg-control'
+            ? undefined
+            : microphoneId
     },
     scene: {
       id: 'incident-motion',
@@ -251,7 +256,10 @@ export function evaluateWindowsIncidentRun(scenario, run) {
       artifact.verdict !== 'PASS' ||
       artifact.width !== scenario.width ||
       artifact.height !== scenario.height ||
-      artifact.hasAudio !== true
+      artifact.hasAudio !== true ||
+      artifact.packetTail?.pass !== true ||
+      !Number.isFinite(artifact.packetTail?.tailMismatchMs) ||
+      artifact.packetTail.tailMismatchMs > 100
     )
       failures.push(
         `${role} analyzed A/V artifact missing or failed${artifact?.reason ? `: ${artifact.reason}` : artifact?.failures?.length ? `: ${artifact.failures.join('; ')}` : ''}`
@@ -330,8 +338,9 @@ export function validateIncidentAudibleInterior(scenario, analysis) {
     silentSeconds += Math.max(0, silence.end - Math.max(cursor, silence.start))
     cursor = Math.max(cursor, silence.end)
   }
-  const pass =
-    scenario.audio === 'controlled' ? silentSeconds < 0.02 : silentSeconds < (end - start) * 0.9
+  const pass = ['controlled', 'ffmpeg-control'].includes(scenario.audio)
+    ? silentSeconds < 0.02
+    : silentSeconds < (end - start) * 0.9
   return {
     pass,
     silentInteriorMs: silentSeconds * 1000,
@@ -339,11 +348,17 @@ export function validateIncidentAudibleInterior(scenario, analysis) {
   }
 }
 
-export function incidentAudioPath(fallbackReason, firstPcm, requestedAudio) {
+export function incidentAudioPath(
+  fallbackReason,
+  firstPcm,
+  requestedAudio,
+  ffmpegToneObserved = false
+) {
   if (fallbackReason)
     return fallbackReason.includes('Injected incident capture-worker')
       ? 'direct-fallback'
       : 'unexpected-direct-fallback'
+  if (requestedAudio === 'ffmpeg-control') return ffmpegToneObserved ? 'ffmpeg-control' : 'unknown'
   if (requestedAudio === 'controlled') return 'controlled'
   if (firstPcm) return 'worker'
   return 'unknown'

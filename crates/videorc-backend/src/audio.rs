@@ -12,6 +12,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::protocol::{AudioMeterResult, AudioMeterStatus, Device, DeviceKind, DeviceStatus};
 
+#[cfg(debug_assertions)]
+#[path = "audio_fixture_clock.rs"]
+pub(crate) mod fixture_clock;
+
 pub const NATIVE_AUDIO_SAMPLE_RATE: u32 = 48_000;
 pub const NATIVE_AUDIO_CHANNELS: u16 = 2;
 const WINDOWS_DSHOW_MICROPHONE_PREFIX: &str = "microphone:windows-dshow:";
@@ -920,9 +924,8 @@ fn start_contract_test_audio_source(
         let samples_per_channel = (u64::from(NATIVE_AUDIO_SAMPLE_RATE)
             * CAPTION_CONTRACT_TEST_PACKET_MS
             / 1_000) as usize;
-        let packet_duration = Duration::from_millis(CAPTION_CONTRACT_TEST_PACKET_MS);
-        let mut frame_cursor = 0_u64;
-        let mut next_tick = Instant::now();
+        let fixture_started = Instant::now();
+        let mut clock = fixture_clock::FixtureAudioClock::new(fixture_started);
         let raw_settings = AudioProcessingSettingsHandle::new(AudioProcessingSettings::default());
 
         while !producer_stop.load(Ordering::Acquire)
@@ -930,6 +933,18 @@ fn start_contract_test_audio_source(
                 .source_disconnect_requested
                 .load(Ordering::Acquire)
         {
+            if let Some(wait) = clock.deadline().checked_duration_since(Instant::now()) {
+                thread::sleep(wait);
+            }
+            let timing = clock.next_packet(Instant::now());
+            if timing.skipped_frames > 0 {
+                producer_stats.record_dropped_frames(timing.skipped_frames);
+                tracing::warn!(
+                    skipped_frames = timing.skipped_frames,
+                    "Debug synthetic microphone skipped expired samples after scheduler stall"
+                );
+            }
+            let frame_cursor = timing.frame_cursor;
             let inject_tone = producer_injector
                 .packets_remaining
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -956,14 +971,14 @@ fn start_contract_test_audio_source(
                 let sample = phase.sin() * raw_peak;
                 input.extend_from_slice(&[sample, sample]);
             }
-            let frame = processed_capture_frame_with_handle(
+            let mut frame = processed_capture_frame_with_handle(
                 &input,
                 SOURCE_CHANNELS,
                 &raw_settings,
                 timestamp_for_frame(frame_cursor),
             );
+            frame.captured_at = timing.captured_at;
             let frame_count = frame.frame_count() as u64;
-            frame_cursor = frame_cursor.saturating_add(frame_count);
             producer_stats.record_captured_frames(frame_count);
 
             match sender.try_send(frame) {
@@ -978,17 +993,13 @@ fn start_contract_test_audio_source(
                     .packets_generated
                     .fetch_add(1, Ordering::Release);
             }
-
-            next_tick = next_tick
-                .checked_add(packet_duration)
-                .unwrap_or_else(Instant::now);
-            let now = Instant::now();
-            if next_tick > now {
-                thread::sleep(next_tick.duration_since(now));
-            } else {
-                next_tick = now;
-            }
         }
+        tracing::info!(
+            produced_frames = producer_stats.captured_frames(),
+            dropped_frames = producer_stats.dropped_frames(),
+            elapsed_ms = fixture_started.elapsed().as_millis(),
+            "Debug synthetic microphone producer stopped"
+        );
     });
 
     Ok(NativeAudioSource {

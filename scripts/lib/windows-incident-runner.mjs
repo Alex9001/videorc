@@ -32,6 +32,8 @@ import {
   redactWindowsStreamSecrets
 } from './windows-stream-performance.mjs'
 
+import { probeIncidentPacketTail } from './windows-incident-packet-tail.mjs'
+
 const rpcDeadlineMs = 45000
 const hash = (path) => createHash('sha256').update(readFileSync(path)).digest('hex')
 const reason = (error) =>
@@ -122,6 +124,11 @@ export async function runWindowsIncident(argv) {
       throw new Blocked(
         'Incident harness requires a debug backend; release binaries ignore worker failure injection'
       )
+    if (
+      options.scenarios.some((scenario) => scenario.audio === 'ffmpeg-control') &&
+      capability.ffmpegToneControl !== true
+    )
+      throw new Blocked('Backend does not support the independently gated FFmpeg tone control')
     aggregate.backendCapabilities = capability
     const version = spawnSync(ffmpegPath, ['-version'], {
       encoding: 'utf8',
@@ -185,7 +192,7 @@ export async function runWindowsIncident(argv) {
           })
           group.backendPid = backend.child.pid
           group.backendVersion = backend.health.version
-          if (scenario.audio !== 'controlled') {
+          if (['worker', 'direct-fallback'].includes(scenario.audio)) {
             if (!options.microphone)
               throw new Blocked(
                 'A real microphone must be selected with --microphone; sine is not worker/fallback evidence'
@@ -438,7 +445,7 @@ async function runAttempt({
         const params = incidentSessionParams(
           scenario,
           receivers,
-          scenario.audio === 'controlled' ? null : microphone
+          ['controlled', 'ffmpeg-control'].includes(scenario.audio) ? null : microphone
         )
         params.output.ffmpegPath = ffmpegPath
         params.output.outputDirectory = join(runDirectory, 'recordings')
@@ -495,7 +502,12 @@ async function runAttempt({
         const diagnostic = session?.finalDiagnostics
         const log = (code) => logs.find((item) => item.code === code)?.message ?? null
         const fallbackReason = log('microphone-capture-worker-fallback')
-        const observedAudio = incidentAudioPath(fallbackReason, firstPcm, scenario.audio)
+        const observedAudio = incidentAudioPath(
+          fallbackReason,
+          firstPcm,
+          scenario.audio,
+          Boolean(log('incident-ffmpeg-tone-enabled'))
+        )
 
         return {
           sessionId,
@@ -521,7 +533,9 @@ async function runAttempt({
           audioInputProvenance:
             scenario.audio === 'controlled'
               ? 'Portable debug native PCM fixture: continuous 440 Hz tone; coreaudio-prefixed fixture ID does not mean physical CoreAudio capture'
-              : 'Selected physical Windows microphone',
+              : scenario.audio === 'ffmpeg-control'
+                ? 'Independent FFmpeg lavfi 880 Hz tone; native PCM capture bus bypassed, no physical microphone selected'
+                : 'Selected physical Windows microphone',
           fallbackReason,
           milestones: events,
           logs,
@@ -567,6 +581,12 @@ async function runAttempt({
             })
             const audibleInterior = validateIncidentAudibleInterior(scenario, analysis)
             analysis.incidentAudibleInterior = audibleInterior
+            const packetTail = probeIncidentPacketTail(artifact.path, ffprobePath)
+            analysis.incidentPacketTail = packetTail
+            if (!packetTail.pass) {
+              analysis.verdict.pass = false
+              analysis.verdict.failures.push(packetTail.reason)
+            }
             if (!audibleInterior.pass) {
               analysis.verdict.pass = false
               analysis.verdict.failures.push(audibleInterior.reason)
@@ -580,6 +600,7 @@ async function runAttempt({
               height: analysis.probe.video?.height,
               hasAudio: analysis.probe.audio?.length > 0,
               metrics: analysis.metrics,
+              packetTail,
               failures: analysis.verdict.failures,
               avSyncMethod: 'encoded stream timestamp skew; perceptual source offset not measured'
             })

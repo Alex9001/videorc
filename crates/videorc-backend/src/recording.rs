@@ -3273,8 +3273,25 @@ async fn start_session_with_timeline(
     let session_start_publication_permit =
         authorize_session_start_publication(&state, &session_id, &params, has_native_audio).await?;
     // Input topology is fixed for the lifetime of this output process. An empty
-    // selection has a real paced zero-PCM producer, never a device or test tone.
-    let silent_audio_fifo = if capture.microphone.is_none() {
+    // selection has a real paced zero-PCM producer. The separately opted-in
+    // debug control below deliberately bypasses that bus with FFmpeg tone.
+    let diagnostic_ffmpeg_tone = incident_ffmpeg_tone_allowed(
+        cfg!(debug_assertions),
+        std::env::var("VIDEORC_ENABLE_SMOKE_RPC").as_deref() == Ok("1"),
+        std::env::var("VIDEORC_INCIDENT_FFMPEG_TONE").as_deref() == Ok("1"),
+        params.sources.microphone_id.is_some(),
+        capture.microphone.is_some(),
+    );
+    if diagnostic_ffmpeg_tone {
+        emit_health_event(
+            &state,
+            Some(&session_id),
+            HealthLevel::Info,
+            "incident-ffmpeg-tone-enabled",
+            "Diagnostic control: FFmpeg lavfi 880 Hz tone; native PCM and physical microphone capture are not used.",
+        )?;
+    }
+    let silent_audio_fifo = if capture.microphone.is_none() && !diagnostic_ffmpeg_tone {
         let path = native_audio_fifo_path(&session_id);
         create_native_audio_fifo(&path)?;
         startup_resources.track_fifo(&path);
@@ -10713,6 +10730,18 @@ async fn resolve_primary_screen_video_input(
 
 /// Maximum time to wait for the microphone to warm up before starting the video pipeline.
 const MICROPHONE_WARMUP_TIMEOUT: Duration = Duration::from_millis(1500);
+// Independent incident control only. Missing/failed real microphones retain
+// their shipping silent-PCM behavior, including in debug builds by default.
+fn incident_ffmpeg_tone_allowed(
+    debug_build: bool,
+    smoke_enabled: bool,
+    tone_requested: bool,
+    requested_microphone: bool,
+    resolved_microphone: bool,
+) -> bool {
+    debug_build && smoke_enabled && tone_requested && !requested_microphone && !resolved_microphone
+}
+
 /// Opening a CoreAudio input is a blocking call that can park on the OS
 /// microphone permission check. It runs off the async runtime and is bounded
 /// so a stalled device open degrades to video-only instead of holding the
@@ -20355,6 +20384,23 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             assert_eq!(encoder_bridge_lifecycle_snapshot().live_resources, 0);
+        }
+    }
+
+    #[test]
+    fn incident_ffmpeg_tone_requires_debug_smoke_opt_in_and_no_microphone() {
+        assert!(incident_ffmpeg_tone_allowed(true, true, true, false, false));
+        for (debug, smoke, tone, requested, resolved) in [
+            (false, true, true, false, false),
+            (true, false, true, false, false),
+            (true, true, false, false, false),
+            (true, true, true, true, false),
+            (true, true, true, false, true),
+            (true, true, true, true, true),
+        ] {
+            assert!(!incident_ffmpeg_tone_allowed(
+                debug, smoke, tone, requested, resolved
+            ));
         }
     }
 

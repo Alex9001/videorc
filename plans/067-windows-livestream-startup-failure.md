@@ -690,3 +690,26 @@ no app/backend leak or workaround occurred. Remaining native-smoke and hosted
 Windows results are recorded in the PR's verification section and checks, which
 are the live acceptance record for this implementation. This checkpoint is not
 a claim that affected Intel/DirectShow or real provider acceptance has passed.
+
+### Hosted-control diagnosis follow-up
+
+The Windows source gates, installer, JS, Rust and Linux checks passed on
+`16c1e6b0`; the incident artifact matrix remained red. Retained native PCM
+artifacts showed load-sensitive silence and overlapping sample timestamps.
+A deterministic regression identified cumulative clock drift in the debug
+synthetic microphone: late wakes reset its deadline while sample timestamps
+continued at the original rate. The fixture now preserves its sample schedule,
+with bounded catch-up and explicit accounting for expired samples. This is a
+fixture correction, not a change to physical microphone clock policy.
+
+The matrix adds an independent, explicitly gated debug FFmpeg tone control,
+bringing selectable coverage to 64 cases / 192 attempts. Hosted CI retains
+both 48-attempt synthetic controls separately, including failures. Neither
+control qualifies physical microphone or Intel Quick Sync behavior.
+
+Review also found that FLV stream durations can be absent, leaving the previous
+duration-based tail metric unknown. Incident validation now measures terminal
+audio/video packet ends and fails closed when timing cannot be measured. The
+100 ms bound remains unchanged. A real generated FLV regression covers both
+aligned and excessive audio tails. Earlier receiver passes with unknown tails
+are not acceptance evidence for that bound. Final results remain in PR #472.

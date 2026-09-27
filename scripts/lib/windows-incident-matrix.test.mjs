@@ -12,10 +12,10 @@ import {
 
 test('incident matrix crosses every topology, profile, audio and retry policy three times', () => {
   const cases = buildWindowsIncidentMatrix()
-  assert.equal(cases.length, 48)
+  assert.equal(cases.length, 64)
   assert.equal(
     cases.reduce((count, item) => count + item.repetitions, 0),
-    144
+    192
   )
   assert.deepEqual([...new Set(cases.map((item) => item.receivers))].sort(), [0, 1, 2])
   const same = cases.find((item) => item.retry === 'same-process')
@@ -205,7 +205,7 @@ test('incident audio evidence rejects silence spanning lead, measured interior a
     metrics: { durationSeconds: 3.008, digitalZeroRunCount: 0 },
     findings: { silences: [{ start: 0, end: 3.008, duration: 3.008 }] }
   }
-  for (const audio of ['controlled', 'worker', 'direct-fallback']) {
+  for (const audio of ['controlled', 'ffmpeg-control', 'worker', 'direct-fallback']) {
     assert.equal(validateIncidentAudibleInterior({ audio }, analysis).pass, false)
   }
   analysis.findings.silences = [{ start: 0, end: 0.1, duration: 0.1 }]
@@ -303,14 +303,68 @@ test('controlled audio selects the portable debug PCM fixture and owns its enabl
   assert.deepEqual(incidentAudioEnvironment('controlled'), {
     VIDEORC_CAPTION_CONTRACT_TEST: '1',
     VIDEORC_LIVE_SOURCE_SWITCH_TEST: '1',
-    VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '0'
+    VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '0',
+    VIDEORC_INCIDENT_FFMPEG_TONE: '0'
   })
   for (const audio of ['worker', 'direct-fallback']) {
     assert.deepEqual(incidentAudioEnvironment(audio), {
       VIDEORC_CAPTION_CONTRACT_TEST: '0',
       VIDEORC_LIVE_SOURCE_SWITCH_TEST: '0',
-      VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '0'
+      VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '0',
+      VIDEORC_INCIDENT_FFMPEG_TONE: '0'
     })
   }
   assert.equal(incidentAudioPath(null, { frames: 100 }, 'controlled'), 'controlled')
+})
+
+test('FFmpeg tone is an additional independent control with observed enabling evidence', async () => {
+  const { incidentAudioEnvironment, incidentAudioPath } =
+    await import('./windows-incident-matrix.mjs')
+  const cases = parseWindowsIncidentArgs(['--incident', '--audio', 'ffmpeg-control']).scenarios
+  assert.equal(cases.length, 16)
+  assert.equal(
+    cases.reduce((n, c) => n + c.repetitions, 0),
+    48
+  )
+  assert.equal(buildWindowsIncidentMatrix().filter((c) => c.audio === 'controlled').length, 16)
+  const scenario = cases.find((c) => c.topology === 'record')
+  assert.equal(incidentSessionParams(scenario, []).sources.microphoneId, undefined)
+  assert.equal(incidentAudioEnvironment('ffmpeg-control').VIDEORC_INCIDENT_FFMPEG_TONE, '1')
+  assert.equal(incidentAudioEnvironment('controlled').VIDEORC_INCIDENT_FFMPEG_TONE, '0')
+  assert.equal(incidentAudioPath(null, null, 'ffmpeg-control', false), 'unknown')
+  assert.equal(incidentAudioPath(null, null, 'ffmpeg-control', true), 'ffmpeg-control')
+})
+
+test('an artifact cannot pass incident acceptance without a measured bounded packet tail', () => {
+  const scenario = buildWindowsIncidentMatrix()[0]
+  const run = {
+    startOutcome: 'running',
+    cleanup: { sessionIdle: true, receiversReaped: true },
+    evidence: {
+      finalDiagnostics: {},
+      sessionId: 'session',
+      ffmpegStartup: 'ready',
+      ffmpegTail: 'tail',
+      startTimeline: {},
+      stopTimeline: {},
+      bridgeFrames: 1,
+      effectiveEncoder: 'libopenh264',
+      effectiveOutput: 'raw-yuv420p',
+      audioPath: 'controlled'
+    },
+    artifacts: [
+      {
+        role: 'recording',
+        verdict: 'PASS',
+        width: scenario.width,
+        height: scenario.height,
+        hasAudio: true
+      }
+    ]
+  }
+  assert.equal(evaluateWindowsIncidentRun(scenario, run).pass, false)
+  run.artifacts[0].packetTail = { pass: true, tailMismatchMs: 33 }
+  assert.equal(evaluateWindowsIncidentRun(scenario, run).pass, true)
+  run.artifacts[0].packetTail = { pass: true, tailMismatchMs: null }
+  assert.equal(evaluateWindowsIncidentRun(scenario, run).pass, false)
 })

@@ -557,7 +557,7 @@ pub fn run_cli(args: &[String]) -> Result<bool> {
             ensure!(args.len() == 1, "Unexpected capability arguments");
             println!(
                 "{}",
-                serde_json::json!({"schemaVersion": 1, "debugBuild": cfg!(debug_assertions), "workerFailureInjection": cfg!(all(target_os = "windows", debug_assertions)), "backendCrateVersion": env!("CARGO_PKG_VERSION")})
+                serde_json::json!({"schemaVersion": 1, "debugBuild": cfg!(debug_assertions), "workerFailureInjection": cfg!(all(target_os = "windows", debug_assertions)), "ffmpegToneControl": cfg!(debug_assertions), "backendCrateVersion": env!("CARGO_PKG_VERSION")})
             );
             Ok(true)
         }

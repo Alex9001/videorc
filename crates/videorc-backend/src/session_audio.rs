@@ -2600,6 +2600,39 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
+    fn debug_fixture_late_wakes_preserve_pcm_through_the_real_source_clock_and_timeline() {
+        let epoch = Instant::now();
+        let mut fixture =
+            crate::audio::fixture_clock::FixtureAudioClock::new(epoch + Duration::from_millis(20));
+        let mut source_clock = None;
+        let mut timeline = AudioTimeline::new();
+        for tick in 0..1_000_u64 {
+            let now = epoch + Duration::from_millis(tick * 10);
+            // Three missed scheduling slots every 200ms, within playout's
+            // existing 50ms allowance. No sleeps or hardware are involved.
+            if tick % 20 >= 3 || tick < 20 {
+                while fixture.deadline() <= now {
+                    let timing = fixture.next_packet(now);
+                    let mut packet = frame(0.25, 960);
+                    packet.timestamp_micros = timing.frame_cursor * 1_000_000 / 48_000;
+                    packet.captured_at = timing.captured_at;
+                    let clock =
+                        source_clock.get_or_insert_with(|| SourceClock::new(&packet, epoch));
+                    let (start, count) = clock.interval(&packet).unwrap();
+                    timeline.push(0, start, resample_frame(packet, count));
+                }
+            }
+            if tick >= 6 {
+                timeline.render_chunk();
+            }
+        }
+        assert_eq!(timeline.counters().generated_frames, 0);
+        assert_eq!(timeline.losses().discarded_overlap, 0);
+        assert_eq!(timeline.counters().captured_frames, 994 * 480);
+    }
+
+    #[test]
     fn device_clock_drift_is_gradually_resampled_with_callback_jitter() {
         for drift in [-100.0, -30.0, 30.0, 100.0] {
             let epoch = Instant::now();
