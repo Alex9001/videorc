@@ -9,8 +9,10 @@
 
 - Priority: P0. Effort: L overall; evidence and warning fixes M. Risk: HIGH
   for pipeline changes, MED for diagnostic ownership and toast lifecycle.
-- Status: IN PROGRESS for remaining reproduction tooling on
-  `fix/067-windows-incident-reproduction`. Steps 1–2 merged in PR #464.
+- Status: PARTIAL: remaining independent reproduction tooling is implemented on
+  `fix/067-windows-incident-reproduction`, PR [#472](https://github.com/TheOrcDev/videorc/pull/472).
+  Initial tooling checkpoint `446411a7`; final verification is tracked in the PR.
+  Steps 1–2 merged in PR #464.
   Full incident closure still needs affected Windows hardware, which the user
   confirmed is currently unavailable. Mac timing variability is documented below.
 - Planned: 2026-09-27, against cached main
@@ -334,7 +336,7 @@ waiver of physical gates.
   affected hardware, or is explicitly recorded as still BLOCKED/unresolved.
 - [ ] Applicable verification and Windows repeat gates pass. Missing physical
   evidence cannot be replaced with macOS tests or a fake receiver alone.
-- [ ] Only scoped files changed; plan index updated with actual status.
+- [x] Only scoped files changed; plan index updated with actual status.
 
 ## STOP conditions and maintenance
 
@@ -652,3 +654,39 @@ Review corrections include complete-line READY parsing, redacted launch errors,
 immutable incident output directories, exact process ownership, independent
 receiver cleanup, atomic partial MF reports, and bounded optional report loading.
 No causal encoder/profile/timeout change has been justified or made.
+
+
+### Reviewed implementation and acceptance record
+
+PR #472 contains the B0 MF tool, incident matrix, debug-only fallback injection,
+standalone Windows diagnostic backend artifact, and hosted control/repeat gates.
+The independent implementation is complete. The affected-machine reproduction
+and the dependent causal media fix remain BLOCKED because the user has no
+Windows PC available. No profile/codec policy or startup timeout was changed.
+
+Review follow-ups validate MF reports before atomic publication, normalize
+unknown/short source revisions, list optional evidence in support export results,
+keep optional adapter metadata failures nonfatal, and prevent natural microphone
+fallback from being counted as worker success. A generated moving file with an
+entirely silent audio track demonstrated a false pass in the shared analyzer's
+lead/tail exclusion; incident-only audible-interior validation now rejects it.
+Both receiver timings carry their actual observation origin. The 100 ms tail
+bound and physical audible-input requirements are explicit. Independent hosted
+incident runs continue after MF probe failure when their build prerequisites pass.
+
+Before the final-head CI restart, local verification passed: 1,613 Node tests;
+2,296 desktop tests (one skipped); native Rust 2,543 backend tests (10 ignored),
+80 helper tests and one wire test; strict clippy; Windows cross-check; TypeScript;
+lint; format; desktop build; actionlint and explicit new-file formatting. The
+report/export follow-up receives another native check. Shadscan baseline/floor
+was 37 and the initial pre-commit score was 37.
+
+The recording-studio run passed scene-switch CPU/Metal recording+stream pixel
+artifacts, pointer continuity (98 gestures), captions transport and live artifacts,
+noise-cleanup final artifacts and all-layout recording. Its latency gate passed
+five analyzed 1080p artifacts: cold start/stop 116/103 ms, warm start/stop p95
+78/92 ms. The latency process exited naturally after its existing timer drained;
+no app/backend leak or workaround occurred. Remaining native-smoke and hosted
+Windows results are recorded in the PR's verification section and checks, which
+are the live acceptance record for this implementation. This checkpoint is not
+a claim that affected Intel/DirectShow or real provider acceptance has passed.

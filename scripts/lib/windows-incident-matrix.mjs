@@ -292,3 +292,55 @@ export async function executeIncidentAttempt(scenario, operations) {
   }
   return run
 }
+
+// Clip silence to the measured interior before evaluating it. The shared
+// analyzer deliberately excludes any segment touching lead/tail; a completely
+// silent file therefore needs this diagnostic-specific audible-content gate.
+export function validateIncidentAudibleInterior(scenario, analysis) {
+  const duration = analysis.metrics?.durationSeconds
+  const silences = analysis.findings?.silences
+  if (!Number.isFinite(duration) || duration <= 0.8 || !Array.isArray(silences))
+    return { pass: false, reason: 'Audible interior evidence missing' }
+  const start = 0.5
+  const end = duration - 0.3
+  const clipped = silences
+    .map((silence) => ({
+      start: Math.max(start, silence.start),
+      end: Math.min(end, silence.end ?? duration)
+    }))
+    .filter((silence) => silence.end > silence.start)
+    .sort((a, b) => a.start - b.start)
+  let silentSeconds = 0
+  let cursor = start
+  for (const silence of clipped) {
+    silentSeconds += Math.max(0, silence.end - Math.max(cursor, silence.start))
+    cursor = Math.max(cursor, silence.end)
+  }
+  const pass =
+    scenario.audio === 'controlled' ? silentSeconds < 0.02 : silentSeconds < (end - start) * 0.9
+  return {
+    pass,
+    silentInteriorMs: silentSeconds * 1000,
+    reason: pass ? null : 'Expected audible content is silent across the measured interior'
+  }
+}
+
+export function incidentAudioPath(fallbackReason, firstPcm, requestedAudio) {
+  if (fallbackReason)
+    return fallbackReason.includes('Injected incident capture-worker')
+      ? 'direct-fallback'
+      : 'unexpected-direct-fallback'
+  if (firstPcm) return 'worker'
+  return requestedAudio === 'controlled' ? 'controlled' : 'unknown'
+}
+
+export function incidentAdapterInventory(result) {
+  try {
+    if (result.status !== 0 || !result.stdout?.trim()) throw new Error('unavailable')
+    const values = JSON.parse(result.stdout)
+    if (!values || typeof values !== 'object') throw new Error('invalid shape')
+    return { state: 'observed', provenance: 'Win32_VideoController', values }
+  } catch {
+    return { state: 'unknown', reason: 'Windows adapter inventory unavailable or invalid' }
+  }
+}

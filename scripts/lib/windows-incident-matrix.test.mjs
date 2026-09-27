@@ -197,3 +197,44 @@ test('unsafe startup cleanup cannot become safe when no receiver reached the own
   assert.equal(run.verdict.pass, false)
   assert.ok(run.verdict.failures.includes('owned output cleanup incomplete'))
 })
+
+test('incident audio evidence rejects silence spanning lead, measured interior and tail', async () => {
+  const { validateIncidentAudibleInterior } = await import('./windows-incident-matrix.mjs')
+  const analysis = {
+    verdict: { pass: true },
+    metrics: { durationSeconds: 3.008, digitalZeroRunCount: 0 },
+    findings: { silences: [{ start: 0, end: 3.008, duration: 3.008 }] }
+  }
+  for (const audio of ['controlled', 'worker', 'direct-fallback']) {
+    assert.equal(validateIncidentAudibleInterior({ audio }, analysis).pass, false)
+  }
+  analysis.findings.silences = [{ start: 0, end: 0.1, duration: 0.1 }]
+  assert.equal(validateIncidentAudibleInterior({ audio: 'controlled' }, analysis).pass, true)
+  analysis.findings.silences = [{ start: 1, end: 1.2, duration: 0.2 }]
+  assert.equal(validateIncidentAudibleInterior({ audio: 'controlled' }, analysis).pass, false)
+  analysis.findings.silences = []
+  assert.equal(validateIncidentAudibleInterior({ audio: 'controlled' }, analysis).pass, true)
+})
+
+test('optional adapter metadata failure cannot abort the incident matrix', async () => {
+  const { incidentAdapterInventory } = await import('./windows-incident-matrix.mjs')
+  assert.equal(incidentAdapterInventory({ status: 0, stdout: 'invalid JSON' }).state, 'unknown')
+  assert.equal(incidentAdapterInventory({ status: 0, stdout: 'null' }).state, 'unknown')
+  assert.equal(
+    incidentAdapterInventory({ status: 0, stdout: '[{"Name":"GPU"}]' }).state,
+    'observed'
+  )
+})
+
+test('worker PCM before fallback never proves the final worker audio path', async () => {
+  const { incidentAudioPath } = await import('./windows-incident-matrix.mjs')
+  assert.equal(
+    incidentAudioPath('Natural worker failure', { frames: 100 }, 'worker'),
+    'unexpected-direct-fallback'
+  )
+  assert.equal(
+    incidentAudioPath('Injected incident capture-worker failure', { frames: 100 }, 'worker'),
+    'direct-fallback'
+  )
+  assert.equal(incidentAudioPath(null, { frames: 100 }, 'worker'), 'worker')
+})

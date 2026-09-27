@@ -366,6 +366,16 @@ completed measurement, never a hardware support claim. Driver/version fields
 are null when DXGI cannot supply them; the backend crate version is not the
 Electron app version. The direct MF probe does not use FFmpeg.
 
+The Windows workflow also uploads `videorc-windows-diagnostic-backend`: the
+already-built debug `videorc-backend.exe` and an `identity.json` containing its
+SHA256, workflow run ID, and the checkout commit actually used to build it. This
+is a standalone diagnostic executable, not an installer, signed candidate, or
+hardware qualification. A tester can download it, check out that workflow's
+repository commit for the maintained scripts, fetch the pinned FFmpeg with
+`pnpm ffmpeg:fetch:windows`, and pass `--backend <downloaded-executable>` to either
+diagnostic command without compiling Rust. Physical worker cases additionally
+need the matching capture worker described below.
+
 The incident matrix crosses both profiles with local recording, one receiver,
 two receivers, and recording plus two receivers; controlled tone, real capture
 worker, and an injected worker-open failure into real DirectShow fallback;
@@ -378,14 +388,25 @@ pnpm smoke:windows-stream-performance -- --incident --audio worker --microphone 
 pnpm smoke:windows-stream-performance -- --incident --audio direct-fallback --microphone "<exact device ID>" --output "$env:TEMP/incident-fallback-new"
 ```
 
-Real microphone cases require a verified sibling `ffmpeg-capture.exe`, an
-available selected microphone, and actual worker/fallback evidence. Missing
+Real microphone cases require a present sibling `ffmpeg-capture.exe`, an
+available selected microphone, and actual worker/fallback evidence. The report
+records the worker file SHA256; presence is not protocol or signature verification,
+and injected fallback deliberately bypasses worker open. Missing
 prerequisites are BLOCKED, not replaced with tone. Injected open failure exists
 only in Windows debug builds with both smoke RPC and the runner-owned injection
-flag; release binaries cannot enable it. The standalone harness requires the
-private debug admin bootstrap and never uses real provider URLs or keys.
+flag; release binaries cannot enable it. The standalone harness verifies the
+backend debug-build capability, uses its private admin bootstrap, and never uses
+real provider URLs or keys.
 Receiver listening ownership is verified against each exact spawned PID on
 127.0.0.1 before publication. Both dual-destination artifacts must be analyzed.
+
+Keep speech or a steady test tone audible during real microphone runs. The
+incident gate requires more than 10% audible measured interior above the
+analyzer's -50 dB silence threshold; a quiet-room failure alone does not establish
+a capture-device fault. Controlled tone rejects 20 ms or more total interior
+silence. Both checks clip silence across the 500 ms lead-in and 300 ms tail, so
+a wholly silent artifact cannot pass by touching those boundaries. Every artifact
+also enforces the maintained recording-matrix 100 ms A/V stop-tail bound.
 
 Use a new empty output directory for every invocation. Every failed start and
 cleanup outcome is retained before the next attempt. Reports include OS/adapter

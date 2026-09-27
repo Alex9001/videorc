@@ -14,10 +14,13 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import {
   createIncidentReadyParser,
+  incidentAudioPath,
+  incidentAdapterInventory,
   executeIncidentAttempt,
   incidentProcessGroups,
   incidentSessionParams,
-  parseWindowsIncidentArgs
+  parseWindowsIncidentArgs,
+  validateIncidentAudibleInterior
 } from './windows-incident-matrix.mjs'
 import {
   assertWindowsStreamSelectionEnvironmentIsRunnerOwned,
@@ -132,14 +135,7 @@ export async function runWindowsIncident(argv) {
       ],
       { encoding: 'utf8', timeout: 10000, windowsHide: true, maxBuffer: 32000 }
     )
-    aggregate.adapters =
-      adapters.status === 0 && adapters.stdout.trim()
-        ? {
-            state: 'observed',
-            provenance: 'Win32_VideoController',
-            values: JSON.parse(adapters.stdout)
-          }
-        : { state: 'unknown', reason: 'Windows adapter inventory unavailable' }
+    aggregate.adapters = incidentAdapterInventory(adapters)
     aggregate.backendIdentity = {
       sha256: hash(backendPath),
       sourceCommit: null,
@@ -201,8 +197,14 @@ export async function runWindowsIncident(argv) {
             const worker = join(dirname(ffmpegPath), 'ffmpeg-capture.exe')
             if (!existsSync(worker))
               throw new Blocked(
-                'Verified capture-worker binary is required for worker/fallback cases'
+                'A sibling capture-worker binary is required for worker/fallback cases'
               )
+            group.captureWorkerIdentity = {
+              sha256: hash(worker),
+              provenance:
+                'present sibling binary; worker protocol is exercised only when the worker path actually opens',
+              injectionBypassesWorkerOpen: scenario.audio === 'direct-fallback'
+            }
           }
           for (const repetition of repetitions) {
             const runDirectory = join(caseRoot, `run-${repetition}`)
@@ -474,13 +476,7 @@ async function runAttempt({
         const diagnostic = session?.finalDiagnostics
         const log = (code) => logs.find((item) => item.code === code)?.message ?? null
         const fallbackReason = log('microphone-capture-worker-fallback')
-        const observedAudio = fallbackReason?.includes('Injected incident capture-worker')
-          ? 'direct-fallback'
-          : firstPcm
-            ? 'worker'
-            : scenario.audio === 'controlled'
-              ? 'controlled'
-              : 'unknown'
+        const observedAudio = incidentAudioPath(fallbackReason, firstPcm, scenario.audio)
         const bundle = await rpc('diagnostics.supportBundle.export', {
           ffmpegPath,
           outputDirectory: runDirectory
@@ -513,7 +509,12 @@ async function runAttempt({
           supportBundle: bundle.path,
           inputOpenedAtMs: null,
           encoderInitializedAtMs: null,
-          outputOpenedAtMs: receivers.map((receiver) => receiver.firstMediaAtMs),
+          outputOpenedAtMs: null,
+          receiverFirstMedia: receivers.map((receiver, index) => ({
+            role: `receiver-${index + 1}`,
+            elapsedSinceReceiverSpawnMs: receiver.firstMediaAtMs,
+            provenance: 'positive receiver media clock observed; not exact output-open time'
+          })),
           requestedProfile: {
             width: scenario.width,
             height: scenario.height,
@@ -541,8 +542,14 @@ async function runAttempt({
               ffprobePath,
               intendedFps: scenario.fps,
               expectAudio: true,
-              gates: { requireNoDigitalZeroRuns: true }
+              gates: { requireNoDigitalZeroRuns: true, maxTailMismatchMs: 100 }
             })
+            const audibleInterior = validateIncidentAudibleInterior(scenario, analysis)
+            analysis.incidentAudibleInterior = audibleInterior
+            if (!audibleInterior.pass) {
+              analysis.verdict.pass = false
+              analysis.verdict.failures.push(audibleInterior.reason)
+            }
             save(join(runDirectory, `${artifact.role}.analysis.json`), analysis, secrets)
             reports.push({
               ...artifact,

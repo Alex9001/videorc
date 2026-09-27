@@ -170,9 +170,13 @@ pub fn export_support_bundle(input: SupportBundleExportInput) -> Result<SupportB
     std::fs::write(&path, json)
         .with_context(|| format!("Could not write support bundle {}", path.display()))?;
 
+    let mut sections = included_sections();
+    if bundle.windows_mf_probe.is_some() {
+        sections.push("windowsMfProbe".into());
+    }
     Ok(SupportBundleExportResult {
         path: path.display().to_string(),
-        included_sections: included_sections(),
+        included_sections: sections,
         redaction_summary: bundle.redaction_summary,
     })
 }
@@ -613,6 +617,12 @@ mod tests {
             serde_json::to_vec(&crate::windows_mf_probe::test_report()).unwrap(),
         )
         .unwrap();
+        let exported = export_support_bundle(input.clone()).unwrap();
+        assert!(
+            exported
+                .included_sections
+                .contains(&"windowsMfProbe".to_string())
+        );
         let valid = build_support_bundle(input.clone()).unwrap();
         assert_eq!(
             valid.windows_mf_probe.unwrap()["attempts"]
@@ -622,6 +632,12 @@ mod tests {
             36
         );
         std::fs::write(&path, b"{invalid json").unwrap();
+        let exported = export_support_bundle(input.clone()).unwrap();
+        assert!(
+            exported
+                .included_sections
+                .contains(&"windowsMfProbe".to_string())
+        );
         let invalid = build_support_bundle(input).unwrap();
         assert_eq!(invalid.windows_mf_probe.unwrap()["state"], "invalid");
         assert!(!invalid.health.is_null());

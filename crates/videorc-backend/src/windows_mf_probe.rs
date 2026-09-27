@@ -324,6 +324,7 @@ pub fn load_report(database_path: &Path) -> Result<Option<ProbeReport>> {
 }
 
 fn persist(path: &Path, report: &ProbeReport) -> Result<()> {
+    validate_report(report)?;
     let bytes = serde_json::to_vec_pretty(report)?;
     ensure!(
         bytes.len() as u64 <= MAX_REPORT_BYTES,
@@ -423,6 +424,12 @@ async fn child_output(
     }
 }
 
+fn normalized_source_commit(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned)
+}
+
 async fn run_matrix(cases: Vec<ProbeCase>) -> Result<()> {
     ensure!(
         cfg!(target_os = "windows"),
@@ -436,10 +443,11 @@ async fn run_matrix(cases: Vec<ProbeCase>) -> Result<()> {
         platform: std::env::consts::OS.into(),
         backend_version: env!("CARGO_PKG_VERSION").into(),
         backend_sha256: format!("{:x}", Sha256::digest(std::fs::read(&executable)?)),
-        source_commit: option_env!("VIDEORC_GIT_SHA")
-            .or(option_env!("GIT_SHA"))
-            .or(option_env!("VERGEN_GIT_SHA"))
-            .map(str::to_owned),
+        source_commit: normalized_source_commit(
+            option_env!("VIDEORC_GIT_SHA")
+                .or(option_env!("GIT_SHA"))
+                .or(option_env!("VERGEN_GIT_SHA")),
+        ),
         measurement_complete: false,
         inventory: vec![],
         cases: cases.clone(),
@@ -694,6 +702,19 @@ mod tests {
         report.attempts.truncate(1);
         persist(&path, &report).unwrap();
         let before = std::fs::read(&path).unwrap();
+        let mut invalid = report.clone();
+        invalid.source_commit = Some("shortsha".into());
+        assert!(persist(&path, &invalid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        invalid = report.clone();
+        invalid.attempts[0].state = "invented".into();
+        assert!(persist(&path, &invalid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(normalized_source_commit(Some("shortsha")).is_none());
+        assert_eq!(
+            normalized_source_commit(Some(&"a".repeat(40))),
+            Some("a".repeat(40))
+        );
         let mut huge = report.clone();
         huge.inventory_error = Some("x".repeat(MAX_REPORT_BYTES as usize));
         assert!(persist(&path, &huge).is_err());

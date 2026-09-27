@@ -182,8 +182,34 @@ jobs:
           node-version: '24.6.0'
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: cargo build -p videorc-backend
-      - run: pnpm ffmpeg:fetch:windows
+      - id: backend-build
+        run: cargo build -p videorc-backend
+      - name: Prepare standalone diagnostic backend artifact
+        shell: pwsh
+        run: |
+          $diagnosticDirectory = Join-Path $env:RUNNER_TEMP 'windows-diagnostic-backend'
+          New-Item -ItemType Directory -Path $diagnosticDirectory -Force | Out-Null
+          $binary = Join-Path $diagnosticDirectory 'videorc-backend.exe'
+          Copy-Item 'target/debug/videorc-backend.exe' $binary
+          @{
+            schemaVersion = 1
+            kind = 'videorc.windows-diagnostic-backend'
+            qualification = 'debug diagnostic binary; not an installer or release candidate'
+            sourceCommit = $env:GITHUB_SHA
+            sourceCommitProvenance = 'workflow checkout used for this cargo build; not inferred from a tester checkout'
+            workflowRunId = $env:GITHUB_RUN_ID
+            backendSha256 = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
+          } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $diagnosticDirectory 'identity.json')
+      - name: Upload standalone diagnostic backend
+        if: ${{ !cancelled() && steps.backend-build.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: videorc-windows-diagnostic-backend
+          path: ${{ runner.temp }}/windows-diagnostic-backend
+          if-no-files-found: error
+          retention-days: 14
+      - id: ffmpeg-fetch
+        run: pnpm ffmpeg:fetch:windows
       - name: Bounded Media Foundation diagnostic matrix
         shell: pwsh
         run: |
@@ -202,6 +228,7 @@ jobs:
           retention-days: 14
 
       - name: Controlled-audio incident matrix (three repetitions per case)
+        if: ${{ !cancelled() && steps.backend-build.outcome == 'success' && steps.ffmpeg-fetch.outcome == 'success' }}
         shell: pwsh
         run: pnpm smoke:windows-stream-performance -- --incident --audio controlled --output "$env:RUNNER_TEMP/incident"
       - name: Retain every incident attempt including failures
