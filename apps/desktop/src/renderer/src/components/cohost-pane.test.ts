@@ -484,7 +484,10 @@ describe('the one-time listening card (plan 068 D3)', () => {
     const markup = renderPrompt(true, false)
     expect(markup).toContain('data-slot="cohost-listen-prompt"')
     expect(markup).toContain('Orcle can hear you while you&#x27;re live')
-    expect(markup).toContain('never stored as audio')
+    // The consent names the cloud step and what is (not) kept (plan 068 D3).
+    expect(markup).toContain('goes to Videorc&#x27;s cloud speech-to-text to be turned into text')
+    expect(markup).toContain('Videorc servers don&#x27;t keep it.')
+    expect(markup).toContain('The transcript is saved with your recording on')
     expect(markup).toContain('>Turn on<')
     expect(markup).toContain('>Not now<')
   })

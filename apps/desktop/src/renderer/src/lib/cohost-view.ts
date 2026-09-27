@@ -46,11 +46,11 @@ export const COHOST_CHAT_CONSENT_SENTENCE = 'Orcle reads live chat with Videorc 
  * shows the chat half beside Enable Orcle and the listening half beside its
  * own switch.
  */
-export const COHOST_CONSENT_SENTENCE = `${COHOST_CHAT_CONSENT_SENTENCE} If you turn on listening, it also hears your microphone while you're live, as text (never stored as audio); a transcript is saved with your recording on this computer and nothing is kept on Videorc servers.`
+export const COHOST_CONSENT_SENTENCE = `${COHOST_CHAT_CONSENT_SENTENCE} If you turn on listening, your microphone audio also goes to Videorc's cloud speech-to-text while you're live, to be turned into text. Videorc servers don't keep it. The transcript is saved with your recording on this computer.`
 
 /** The listening half, as the description of Settings' listening switch. */
 export const COHOST_LISTEN_CONSENT_SENTENCE =
-  "Orcle hears your microphone while you're live, as text (never stored as audio), even with live captions off. A transcript is saved with your recording on this computer; nothing is kept on Videorc servers."
+  "While you're live, your microphone audio goes to Videorc's cloud speech-to-text to be turned into text, even with live captions off. Videorc servers don't keep it. The transcript is saved with your recording on this computer."
 
 export const EMPTY_COHOST_STATE: CohostState = {
   sessionId: null,

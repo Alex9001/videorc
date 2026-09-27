@@ -2021,6 +2021,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   // Plan 068 D10: sessions whose transcript SRT landed (`captions-srt-written`
   // precedes their `finalized` event), and the lazy post-stream pack trigger.
   const transcriptWrittenSessionIdsRef = useRef(new Set<string>())
+  // Sessions whose Orcle listening reached `on`: only those make the pack.
+  const orcleListenedSessionIdsRef = useRef(new Set<string>())
   const autoRunPostStreamPackRef = useRef<((event: RecordingFinalizationEvent) => void) | null>(
     null
   )
@@ -3743,6 +3745,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     if (merged === previous) return
     cohostStateRef.current = merged
     setCohostState(merged)
+    if (merged.sessionId && merged.listening?.state === 'on') {
+      orcleListenedSessionIdsRef.current.add(merged.sessionId)
+    }
     // Toast discipline: the pane and the destination chip already show every
     // co-host state. Only a NEW failure (reason + server error code) is news;
     // backoff retries of the same failure stay silent.
@@ -13036,6 +13041,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   autoRunPostStreamPackRef.current = (event) => {
     const activeClient = clientRef.current
     const transcriptWritten = transcriptWrittenSessionIdsRef.current.delete(event.sessionId)
+    const orcleListened = orcleListenedSessionIdsRef.current.delete(event.sessionId)
     if (!activeClient) return
     void import('@/lib/post-stream-pack')
       .then((pack) =>
@@ -13043,6 +13049,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           request: activeClient.request.bind(activeClient),
           sessions: sessionsRef.current,
           transcriptWritten,
+          orcleListened,
+          listenOn: cohostListen,
           consent: aiConsent,
           runningSessionId: aiRunningSessionId,
           readiness: {

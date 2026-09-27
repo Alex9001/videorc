@@ -141,7 +141,7 @@ describe('Show on stream automatically', () => {
     await render(settings())
     expect(document.body.textContent).toContain('Orcle reads live chat with Videorc cloud AI.')
     expect(document.body.textContent).toContain(
-      "Orcle hears your microphone while you're live, as text (never stored as audio), even with live captions off. A transcript is saved with your recording on this computer; nothing is kept on Videorc servers."
+      "While you're live, your microphone audio goes to Videorc's cloud speech-to-text to be turned into text, even with live captions off. Videorc servers don't keep it. The transcript is saved with your recording on this computer."
     )
   })
 })

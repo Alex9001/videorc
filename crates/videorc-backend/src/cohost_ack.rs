@@ -235,6 +235,57 @@ fn is_stop_word(word: &str) -> bool {
     STOP_WORDS.binary_search(&word).is_ok()
 }
 
+/// Everyday words people also use as a whole handle ("Pizza", "Python",
+/// "Rust"). Said on their own they are usually just the word: a name that is
+/// only one of them needs a greeting close by. Sorted (a test keeps it that
+/// way) for the binary search; never a stop word.
+const COMMON_NAME_WORDS: &[&str] = &[
+    "angel", "apple", "arrow", "ash", "baby", "bacon", "banana", "bear", "beast", "bird", "blade",
+    "blaze", "blue", "boss", "bread", "bug", "bunny", "butter", "byte", "cake", "candy", "captain",
+    "cat", "chaos", "cheese", "chef", "cherry", "chicken", "chill", "chip", "cloud", "clown",
+    "code", "coder", "coffee", "cookie", "crazy", "crow", "crystal", "cyber", "daddy", "dark",
+    "data", "demon", "dev", "doc", "doctor", "dog", "dragon", "dream", "duck", "eagle", "echo",
+    "fan", "fire", "fish", "flash", "fox", "frog", "frost", "fury", "gamer", "ghost", "gold",
+    "golden", "green", "happy", "hawk", "hero", "honey", "hunter", "ice", "iron", "java", "jelly",
+    "joker", "king", "knight", "lady", "lazy", "legend", "lemon", "light", "linux", "lion", "lord",
+    "lover", "lucky", "magic", "mango", "master", "max", "metal", "mint", "monkey", "moon",
+    "ninja", "noob", "nova", "ocean", "orange", "owl", "panda", "peach", "pepper", "phoenix",
+    "pickle", "pilot", "pixel", "pizza", "player", "potato", "prince", "pro", "python", "queen",
+    "quiet", "rabbit", "rain", "raven", "rebel", "red", "robot", "rock", "rocket", "rogue", "ruby",
+    "rust", "salt", "shadow", "shark", "silver", "sky", "snake", "sniper", "snow", "soul", "space",
+    "spark", "spider", "star", "steel", "storm", "sugar", "sun", "swift", "taco", "tiger", "toast",
+    "turtle", "vibes", "viper", "wizard", "wolf", "zero",
+];
+
+fn is_common_word(word: &str) -> bool {
+    COMMON_NAME_WORDS.binary_search(&word).is_ok()
+}
+
+/// Greetings that make a common-word name a greeting ("hey pizza"), as name
+/// tokens: "what's up" is `what s up`.
+const GREETING_CUES: &[&[&str]] = &[
+    &["hi"],
+    &["hey"],
+    &["hello"],
+    &["hiya"],
+    &["howdy"],
+    &["welcome"],
+    &["thanks"],
+    &["thank", "you"],
+    &["thx"],
+    &["yo"],
+    &["sup"],
+    &["wassup"],
+    &["whats", "up"],
+    &["what", "s", "up"],
+    &["shout", "out"],
+    &["shoutout"],
+    &["good", "to", "see"],
+];
+
+/// How many words away a greeting may be from a common-word name.
+const GREETING_CUE_WINDOW: usize = 3;
+
 /// Lowercased word tokens: split on anything that is not a letter or digit,
 /// on camelCase ("DarkKnight", "XMLParser"), and between letters and digits;
 /// digit runs are dropped ("Gamer99" is "gamer"). Names and spoken text use
@@ -269,34 +320,81 @@ pub(crate) fn name_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
-/// The forms of a display name a spoken or typed word may match (plan 068
-/// D9). A one-token name keeps that token (two chars or more, never a stop
-/// word), so "bo" matches only as the whole name. A longer name keeps its
-/// distinctive tokens (four chars or more, not stop words) and the tokens
-/// joined ("darkknight"), unless every token is a stop word.
-pub(crate) fn name_match_forms(display_name: &str) -> Vec<String> {
+/// How a display name is recognised in what the streamer said or typed
+/// (plan 068 D9).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NameForms {
+    /// Forms that name the viewer by themselves: a distinctive one-word name,
+    /// and a longer name joined whole ("rustlover") or as two neighbouring
+    /// words in order (speech splits "rust lover"; the candidates glue it).
+    pub(crate) plain: Vec<String>,
+    /// A one-word name that is also an everyday word ("pizza"): it names the
+    /// viewer only with a greeting within three words.
+    pub(crate) cued: Vec<String>,
+}
+
+impl NameForms {
+    fn push_plain(&mut self, form: String) {
+        if !self.plain.contains(&form) {
+            self.plain.push(form);
+        }
+    }
+
+    /// A name that comes down to one word: plain, or cued when everyday.
+    fn push_word(&mut self, word: &str) {
+        if word.chars().count() < 2 || is_stop_word(word) {
+            return;
+        }
+        if is_common_word(word) {
+            if !self.cued.iter().any(|form| form == word) {
+                self.cued.push(word.to_string());
+            }
+        } else {
+            self.push_plain(word.to_string());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.plain.is_empty() && self.cued.is_empty()
+    }
+}
+
+/// The forms of a display name (plan 068 D9). A one-token name is that token
+/// (two chars or more, never a stop word; an everyday word needs a greeting
+/// cue), so "bo" matches only as the whole name. A longer name drops its
+/// decorations (stop words, one- and two-char tokens like the "x" in
+/// "x_Dark_Knight_x"): what is left of one word follows the one-token rule;
+/// two or more words match only as neighbours in order ("rust lover" for
+/// "RustLover", never "rust" alone). The whole name joined is a form too
+/// ("iceman"), unless every token is a stop word.
+pub(crate) fn name_match_forms(display_name: &str) -> NameForms {
     let tokens = name_tokens(display_name);
-    let mut forms: Vec<String> = Vec::new();
+    let mut forms = NameForms::default();
     match tokens.as_slice() {
         [] => {}
-        [only] => {
-            if only.chars().count() >= 2 && !is_stop_word(only) {
-                forms.push(only.clone());
-            }
-        }
+        [only] => forms.push_word(only),
         many => {
-            for token in many {
-                if token.chars().count() >= 4 && !is_stop_word(token) && !forms.contains(token) {
-                    forms.push(token.clone());
+            let significant: Vec<&String> = many
+                .iter()
+                .filter(|token| token.chars().count() >= 3 && !is_stop_word(token))
+                .collect();
+            match significant.as_slice() {
+                [] => {}
+                [one] => forms.push_word(one),
+                several => {
+                    for pair in several.windows(2) {
+                        forms.push_plain(format!("{}{}", pair[0], pair[1]));
+                    }
                 }
             }
             let joined: String = many.concat();
             if joined.chars().count() >= 4
                 && many.iter().any(|token| !is_stop_word(token))
                 && !is_stop_word(&joined)
-                && !forms.contains(&joined)
+                && !is_common_word(&joined)
             {
-                forms.push(joined);
+                forms.push_plain(joined);
             }
         }
     }
@@ -329,6 +427,38 @@ fn forms_match(candidates: &[String], forms: &[String]) -> bool {
             .iter()
             .any(|candidate| candidate == form || (fuzzy && within_one_edit(form, candidate)))
     })
+}
+
+/// Whether a greeting ends within `GREETING_CUE_WINDOW` words before `at`,
+/// or starts within that many words after it.
+fn greeting_cue_near(words: &[String], at: usize) -> bool {
+    GREETING_CUES.iter().any(|cue| {
+        if words.len() < cue.len() {
+            return false;
+        }
+        (0..=words.len() - cue.len()).any(|start| {
+            let end = start + cue.len() - 1;
+            let near = (end < at && at - end <= GREETING_CUE_WINDOW)
+                || (start > at && start - at <= GREETING_CUE_WINDOW);
+            near && words[start..=end]
+                .iter()
+                .zip(cue.iter())
+                .all(|(word, expected)| word == expected)
+        })
+    })
+}
+
+/// Whether `words` (the name tokens of what was said or typed) name a viewer
+/// with `forms`; `candidates` is `match_candidates(words)`, computed once per
+/// text.
+fn name_forms_match(words: &[String], candidates: &[String], forms: &NameForms) -> bool {
+    forms_match(candidates, &forms.plain)
+        || forms.cued.iter().any(|form| {
+            words
+                .iter()
+                .enumerate()
+                .any(|(at, word)| word == form && greeting_cue_near(words, at))
+        })
 }
 
 /// Levenshtein distance <= 1 (one insert, delete or substitution). No
@@ -365,11 +495,13 @@ fn within_one_edit(left: &str, right: &str) -> bool {
 
 /// Whether words the streamer said (or typed) name this viewer (plan 068 D9):
 /// case, `@`, underscores, camelCase and trailing digits normalised; exact for
-/// short forms, one edit for long ones; never on a stop word. The ledger runs
-/// the same two halves with each author's forms computed once.
+/// short forms, one edit for long ones; never on a stop word; a long name only
+/// as neighbouring words; an everyday-word name only with a greeting. The
+/// ledger runs the same halves with each author's forms computed once.
 #[cfg(test)]
 pub(crate) fn transcript_mentions_name(transcript_words: &[String], display_name: &str) -> bool {
-    forms_match(
+    name_forms_match(
+        transcript_words,
         &match_candidates(transcript_words),
         &name_match_forms(display_name),
     )
@@ -442,7 +574,7 @@ pub(crate) struct LedgerAuthor {
     pub(crate) message_count: u64,
     pub(crate) greeted: Option<Greeting>,
     /// `name_match_forms(name)`, computed once.
-    name_forms: Vec<String>,
+    name_forms: NameForms,
 }
 
 /// Every chatter of one Orcle session, keyed like alert corroboration
@@ -595,7 +727,7 @@ impl AuthorLedger {
                 author.greeted.is_none()
                     && at >= author.first_seen_at
                     && at.saturating_duration_since(author.last_seen_at) < SAY_HI_WINDOW
-                    && forms_match(&candidates, &author.name_forms)
+                    && name_forms_match(&words, &candidates, &author.name_forms)
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -614,7 +746,7 @@ impl AuthorLedger {
             .iter()
             .filter(|(_, author)| {
                 author.greeted.is_none()
-                    && (forms_match(&candidates, &author.name_forms)
+                    && (name_forms_match(&words, &candidates, &author.name_forms)
                         || mentions.contains(&handle_form(&author.name)))
             })
             .map(|(key, _)| key.clone())
@@ -927,23 +1059,63 @@ mod tests {
         assert_eq!(name_tokens("ZOË-Río"), ["zoë", "río"]);
     }
 
+    fn forms(plain: &[&str], cued: &[&str]) -> NameForms {
+        NameForms {
+            plain: plain.iter().map(|form| form.to_string()).collect(),
+            cued: cued.iter().map(|form| form.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn name_forms_follow_the_short_name_and_stop_word_rules() {
-        assert_eq!(name_match_forms("Bo"), ["bo"]);
-        assert_eq!(name_match_forms("Bo99"), ["bo"]);
+        assert_eq!(name_match_forms("Bo"), forms(&["bo"], &[]));
+        assert_eq!(name_match_forms("Bo99"), forms(&["bo"], &[]));
         // A short token counts only as the whole name.
-        assert_eq!(name_match_forms("Bo_Jangles"), ["jangles", "bojangles"]);
+        assert_eq!(
+            name_match_forms("Bo_Jangles"),
+            forms(&["jangles", "bojangles"], &[])
+        );
+        // Two real words: only as neighbours in order, never one alone.
         assert_eq!(
             name_match_forms("x_Dark_Knight_x"),
-            ["dark", "knight", "xdarkknightx"]
+            forms(&["darkknight", "xdarkknightx"], &[])
         );
+        assert_eq!(name_match_forms("RustLover"), forms(&["rustlover"], &[]));
+        assert_eq!(
+            name_match_forms("xXShadowHunterXx"),
+            forms(&["shadowhunter", "xxshadowhunterxx"], &[])
+        );
+        // An everyday word as the name (alone, or all that is left of it)
+        // needs a greeting.
+        assert_eq!(name_match_forms("Pizza"), forms(&[], &["pizza"]));
+        assert_eq!(
+            name_match_forms("TheLegend27"),
+            forms(&["thelegend"], &["legend"])
+        );
+        assert_eq!(name_match_forms("IceMan"), forms(&["iceman"], &["ice"]));
         // Stop words never make a form, alone or glued.
         assert!(name_match_forms("Chat").is_empty());
         assert!(name_match_forms("Everyone").is_empty());
         assert!(name_match_forms("TheGame").is_empty());
-        assert_eq!(name_match_forms("StreamerFan"), ["streamerfan"]);
+        assert_eq!(
+            name_match_forms("StreamerFan"),
+            forms(&["streamerfan"], &["fan"])
+        );
         assert!(name_match_forms("J").is_empty());
         assert!(name_match_forms("@").is_empty());
+    }
+
+    #[test]
+    fn common_name_words_are_sorted_lowercase_unique_and_never_stop_words() {
+        let mut sorted = COMMON_NAME_WORDS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, COMMON_NAME_WORDS);
+        assert!(
+            COMMON_NAME_WORDS
+                .iter()
+                .all(|word| word.to_lowercase() == *word && !is_stop_word(word))
+        );
     }
 
     /// The matcher's table (plan 068 D9): mangled speech, short names, the
@@ -987,6 +1159,22 @@ mod tests {
             ("nothing about you", "Jonathan", false),
             ("", "Sam", false),
             ("sam", "", false),
+            // A long name is never one of its words alone.
+            ("rust", "RustLover", false),
+            ("I love rust, it is so fast", "RustLover", false),
+            ("rust lover", "RustLover", true),
+            ("hey rust lover, welcome", "RustLover", true),
+            ("that knight was dark", "x_Dark_Knight_x", false),
+            // An everyday word names someone only with a greeting close by.
+            ("I love pizza", "Pizza", false),
+            ("pizza is ready", "Pizza", false),
+            ("hey pizza", "Pizza", true),
+            ("pizza, thanks for the follow", "Pizza", true),
+            ("good to see you pizza", "Pizza", true),
+            ("we write python all day", "Python", false),
+            ("welcome in python", "Python", true),
+            ("you're a legend", "TheLegend27", false),
+            ("the legend is here", "TheLegend27", true),
         ];
         for (said, name, expected) in cases {
             assert_eq!(

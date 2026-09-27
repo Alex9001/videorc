@@ -7,17 +7,21 @@ import {
 } from '@/lib/post-stream-pack'
 
 // "Make my post-stream pack automatically" is a renderer-local preference
-// (one localStorage flag, default on), like the co-host sensitivity. The
+// (one localStorage flag), like the co-host sensitivity. Without an explicit
+// choice it follows Orcle listening (on exactly when listening is on). The
 // Publish tab writes it; the auto-run reads the same key when a session
 // finalizes (lib/post-stream-pack.ts), so there is no second copy to sync.
 
 const listeners = new Set<() => void>()
 
-function readPostStreamPackAuto(): boolean {
+function readPostStreamPackAuto(listenOn: boolean): boolean {
   try {
-    return postStreamPackAutoFromStorage(localStorage.getItem(POST_STREAM_PACK_AUTO_STORAGE_KEY))
+    return postStreamPackAutoFromStorage(
+      localStorage.getItem(POST_STREAM_PACK_AUTO_STORAGE_KEY),
+      listenOn
+    )
   } catch {
-    return true
+    return listenOn
   }
 }
 
@@ -42,6 +46,11 @@ export function setPostStreamPackAuto(enabled: boolean): void {
   for (const listener of listeners) listener()
 }
 
-export function usePostStreamPackAuto(): boolean {
-  return useSyncExternalStore(subscribe, readPostStreamPackAuto, () => true)
+/** The effective preference; `listenOn` is `cohost.settings.listen`. */
+export function usePostStreamPackAuto(listenOn: boolean): boolean {
+  return useSyncExternalStore(
+    subscribe,
+    () => readPostStreamPackAuto(listenOn),
+    () => listenOn
+  )
 }

@@ -954,12 +954,15 @@ describe('listening (plan 068)', () => {
     expect(readCohostListenPromptDismissed(null)).toBe(false)
   })
 
-  it('names listening, the transcript and what is kept in the consent copy', () => {
+  it('names the cloud step, the transcript and what is kept in the consent copy', () => {
     expect(COHOST_CONSENT_SENTENCE.startsWith(COHOST_CHAT_CONSENT_SENTENCE)).toBe(true)
     for (const sentence of [COHOST_CONSENT_SENTENCE, COHOST_LISTEN_CONSENT_SENTENCE]) {
-      expect(sentence).toContain("microphone while you're live, as text (never stored as audio)")
-      expect(sentence).toContain('saved with your recording on this computer')
-      expect(sentence).toContain('nothing is kept on Videorc servers')
+      expect(sentence).toContain('microphone audio')
+      expect(sentence).toContain("goes to Videorc's cloud speech-to-text")
+      expect(sentence).toContain('turned into text')
+      expect(sentence).toContain("Videorc servers don't keep it.")
+      expect(sentence).toContain('The transcript is saved with your recording on this computer.')
+      expect(sentence).not.toContain('never stored as audio')
     }
     expect(cohostPaneMode({ gate: { allowed: true }, consented: false, enabled: true })).toEqual({
       kind: 'consent',

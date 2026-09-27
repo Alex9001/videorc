@@ -80,7 +80,8 @@ export function AiTab({
     aiCapabilities,
     aiQuota,
     aiReadinessError,
-    aiReadinessLoading
+    aiReadinessLoading,
+    cohostSettings
   } = useStudioCore()
   const cloudAi = cloudAiReadiness({
     account,
@@ -89,7 +90,7 @@ export function AiTab({
     loading: aiReadinessLoading,
     quota: aiQuota
   })
-  const postStreamPackAuto = usePostStreamPackAuto()
+  const postStreamPackAuto = usePostStreamPackAuto(cohostSettings?.listen === true)
 
   useEffect(() => {
     if (!selectedSessionId && sessions.length > 0) {
@@ -269,7 +270,7 @@ export function AiTab({
                     Make my post-stream pack automatically
                   </FieldLabel>
                   <FieldDescription>
-                    Runs once when a recorded stream with captions or Orcle listening ends.
+                    Runs once when a recorded stream Orcle listened to ends.
                     {aiConsent && cloudAi.ready ? null : ' Needs cloud upload.'}
                   </FieldDescription>
                 </FieldContent>

@@ -1,8 +1,9 @@
 // Plan 068 D10: the post-stream pack runs itself. When a streamed session
-// that also recorded locally finishes its MP4, and a transcript sidecar
-// (<recording>.srt, from live captions or Orcle listening) was written for
-// it, the renderer runs the existing post-recording workflow once
-// (publish_pack + social_posts) and says so with a toast that opens Publish.
+// that Orcle listened to and that also recorded locally finishes its MP4, and
+// its transcript sidecar (<recording>.srt) was written, the renderer runs the
+// existing post-recording workflow once (publish_pack + social_posts) and
+// says so with a toast that opens Publish. A captions-only stream never runs
+// it by itself.
 // Cloud consent lives only in the renderer (`videorc.aiConsent`), which is why
 // the renderer, not the backend, starts the run.
 //
@@ -48,9 +49,15 @@ export function postStreamPackOutputs(supportsSocialPosts: boolean | undefined):
   return supportsSocialPosts ? ['publish_pack', 'social_posts'] : ['publish_pack']
 }
 
-/** Default ON: anything but an explicit '0' means on. */
-export function postStreamPackAutoFromStorage(raw: string | null | undefined): boolean {
-  return raw !== '0'
+/**
+ * An explicit choice in Publish wins ('1' / '0'); without one the pack makes
+ * itself exactly when Orcle listening is on (`listenOn`).
+ */
+export function postStreamPackAutoFromStorage(
+  raw: string | null | undefined,
+  listenOn: boolean
+): boolean {
+  return raw === '1' || (raw !== '0' && listenOn)
 }
 
 export function postStreamPackAutoToStorage(enabled: boolean): string {
@@ -88,6 +95,8 @@ export interface PostStreamPackInput {
   session: PostStreamPackSession | null
   /** `captions-srt-written` arrived for this session before it finalized. */
   transcriptWritten: boolean
+  /** Orcle's listening reached `on` in this session (seen in `cohost.state`). */
+  orcleListened: boolean
   /** `videorc.aiConsent`: cloud upload allowed. */
   consent: boolean
   /** The "Make my post-stream pack automatically" preference. */
@@ -107,6 +116,7 @@ export type PostStreamPackSkipReason =
   | 'unknown-session'
   | 'not-streamed'
   | 'no-recording'
+  | 'orcle-not-listening'
   | 'no-transcript'
   | 'already-has-artifacts'
   | 'cloud-unavailable'
@@ -142,6 +152,8 @@ export function decidePostStreamPackAutoRun(input: PostStreamPackInput): PostStr
   if (!(event.mp4Path || event.outputPath || session.mp4Path || session.outputPath)) {
     return skip('no-recording')
   }
+  // Captions alone never make the pack by itself: Orcle must have listened.
+  if (!input.orcleListened) return skip('orcle-not-listening')
   if (!input.transcriptWritten) return skip('no-transcript')
   // Any AI artifact means a Publish run already happened for this session.
   if (input.running || session.aiArtifactCount > 0) return skip('already-has-artifacts')
@@ -203,7 +215,10 @@ export interface PostStreamPackRunDeps {
   onFailed: (sessionId: string, reason: string) => void
 }
 
-export type PostStreamPackRunInput = Omit<PostStreamPackInput, 'attempted' | 'autoEnabled'>
+export type PostStreamPackRunInput = Omit<PostStreamPackInput, 'attempted' | 'autoEnabled'> & {
+  /** `cohost.settings.listen`: the preference's default. */
+  listenOn: boolean
+}
 
 // Backstop for the storage list: a second finalized event in this window
 // never starts a second run, even when localStorage throws.
@@ -218,14 +233,16 @@ export async function runPostStreamPackOnce(
   input: PostStreamPackRunInput,
   deps: PostStreamPackRunDeps
 ): Promise<PostStreamPackDecision> {
+  const { listenOn, ...decisionInput } = input
   const sessionId = input.event.sessionId
   const attemptedIds = parseAttemptedSessionIds(
     readStorage(deps.storage, POST_STREAM_PACK_ATTEMPTED_STORAGE_KEY)
   )
   const decision = decidePostStreamPackAutoRun({
-    ...input,
+    ...decisionInput,
     autoEnabled: postStreamPackAutoFromStorage(
-      readStorage(deps.storage, POST_STREAM_PACK_AUTO_STORAGE_KEY)
+      readStorage(deps.storage, POST_STREAM_PACK_AUTO_STORAGE_KEY),
+      listenOn
     ),
     attempted: claimedSessionIds.has(sessionId) || attemptedIds.includes(sessionId)
   })
@@ -305,6 +322,8 @@ export interface StudioPostStreamPackContext {
   request: <T>(method: string, params?: unknown) => Promise<T>
   sessions: readonly SessionSummary[]
   transcriptWritten: boolean
+  orcleListened: boolean
+  listenOn: boolean
   consent: boolean
   runningSessionId: string | null
   readiness: {
@@ -332,6 +351,8 @@ export async function autoRunPostStreamPack(
       event,
       session,
       transcriptWritten: studio.transcriptWritten,
+      orcleListened: studio.orcleListened,
+      listenOn: studio.listenOn,
       consent: studio.consent,
       running: studio.runningSessionId === event.sessionId,
       readiness: cloudAiReadiness(studio.readiness)

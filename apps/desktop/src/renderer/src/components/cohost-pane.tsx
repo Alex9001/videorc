@@ -650,8 +650,8 @@ export function CohostListenPrompt({
         <MicrophoneIcon aria-hidden weight="duotone" />
         <AlertTitle className="text-xs">Orcle can hear you while you&apos;re live</AlertTitle>
         <AlertDescription className="text-xs">
-          It hears your mic as text (never stored as audio) and saves a transcript with your
-          recording on this computer.
+          Your mic audio goes to Videorc&apos;s cloud speech-to-text to be turned into text. Videorc
+          servers don&apos;t keep it. The transcript is saved with your recording on this computer.
         </AlertDescription>
         <div className="col-start-2 mt-1.5 flex flex-wrap gap-1">
           <Button

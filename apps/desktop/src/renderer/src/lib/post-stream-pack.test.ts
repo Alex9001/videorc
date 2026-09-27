@@ -25,6 +25,7 @@ function input(overrides: Partial<PostStreamPackInput> = {}): PostStreamPackInpu
     event: { sessionId: 'session-1', state: 'finalized', mp4Path: '/rec/session-1.mp4' },
     session: { mode: 'record+stream', aiArtifactCount: 0 },
     transcriptWritten: true,
+    orcleListened: true,
     consent: true,
     autoEnabled: true,
     attempted: false,
@@ -88,6 +89,8 @@ describe('decidePostStreamPackAutoRun', () => {
         session: { mode: 'record+stream', aiArtifactCount: 0 }
       }
     ],
+    // A captions-only stream: an SRT exists, but Orcle never listened.
+    ['orcle-not-listening', { orcleListened: false }],
     ['no-transcript', { transcriptWritten: false }],
     ['already-has-artifacts', { session: { mode: 'record+stream', aiArtifactCount: 3 } }],
     ['already-has-artifacts', { running: true }],
@@ -121,11 +124,13 @@ describe('decidePostStreamPackAutoRun', () => {
 })
 
 describe('post-stream pack storage', () => {
-  it('defaults the preference on and only an explicit 0 turns it off', () => {
-    expect(postStreamPackAutoFromStorage(null)).toBe(true)
-    expect(postStreamPackAutoFromStorage('1')).toBe(true)
-    expect(postStreamPackAutoFromStorage('garbage')).toBe(true)
-    expect(postStreamPackAutoFromStorage('0')).toBe(false)
+  it('follows Orcle listening by default and an explicit choice wins', () => {
+    expect(postStreamPackAutoFromStorage(null, true)).toBe(true)
+    expect(postStreamPackAutoFromStorage(null, false)).toBe(false)
+    expect(postStreamPackAutoFromStorage('garbage', true)).toBe(true)
+    expect(postStreamPackAutoFromStorage('garbage', false)).toBe(false)
+    expect(postStreamPackAutoFromStorage('1', false)).toBe(true)
+    expect(postStreamPackAutoFromStorage('0', true)).toBe(false)
   })
 
   it('parses the attempted list defensively and keeps it bounded', () => {
@@ -212,6 +217,8 @@ function runInput(sessionId: string): PostStreamPackRunInput {
     event: base.event,
     session: base.session,
     transcriptWritten: base.transcriptWritten,
+    orcleListened: base.orcleListened,
+    listenOn: true,
     consent: base.consent,
     running: base.running,
     readiness: base.readiness
@@ -308,6 +315,34 @@ describe('runPostStreamPackOnce', () => {
       kind: 'skip',
       reason: 'setting-off'
     })
+    expect(deps.runWorkflow).not.toHaveBeenCalled()
+    expect(storage.getItem(POST_STREAM_PACK_ATTEMPTED_STORAGE_KEY)).toBeNull()
+  })
+
+  it('without a choice in Publish, runs only while Orcle listening is on', async () => {
+    const storage = new MemoryStorage()
+    const deps = fakeDeps(storage, async () => result([artifact({})]))
+
+    expect(
+      await runPostStreamPackOnce({ ...runInput('listen-off'), listenOn: false }, deps)
+    ).toEqual({ kind: 'skip', reason: 'setting-off' })
+    expect(deps.runWorkflow).not.toHaveBeenCalled()
+
+    // An explicit on in Publish wins over listening being off.
+    storage.setItem(POST_STREAM_PACK_AUTO_STORAGE_KEY, '1')
+    expect(
+      await runPostStreamPackOnce({ ...runInput('listen-off'), listenOn: false }, deps)
+    ).toEqual({ kind: 'run' })
+    expect(deps.runWorkflow).toHaveBeenCalledTimes(1)
+  })
+
+  it('never runs for a stream Orcle did not listen to, even with captions', async () => {
+    const storage = new MemoryStorage()
+    const deps = fakeDeps(storage, async () => result([artifact({})]))
+
+    expect(
+      await runPostStreamPackOnce({ ...runInput('captions-only'), orcleListened: false }, deps)
+    ).toEqual({ kind: 'skip', reason: 'orcle-not-listening' })
     expect(deps.runWorkflow).not.toHaveBeenCalled()
     expect(storage.getItem(POST_STREAM_PACK_ATTEMPTED_STORAGE_KEY)).toBeNull()
   })
