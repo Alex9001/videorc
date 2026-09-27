@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import {
   ownedPcmEofVerdict,
   ownedPcmEofAggregate,
+  ownedPcmReaderClosed,
   runOwnedPcmEof
 } from './windows-owned-pcm-eof.mjs'
 
@@ -28,6 +29,31 @@ const valid = {
   startSkewMs: 21,
   packetTail: { pass: true, videoEndSeconds: 4.021, tailMismatchMs: 11 }
 }
+
+test('destroyed keepalive writer is expected only after its observed reader closes past video EOF', () => {
+  assert.equal(ownedPcmReaderClosed(valid, 'audio', 'ERR_STREAM_DESTROYED'), true)
+  for (const delta of [
+    { keepAudioAlive: false },
+    { cancelled: true },
+    { videoEofMs: null },
+    { audioPipeClosedAtMs: null },
+    { audioPipeClosedAtMs: 3999 }
+  ])
+    assert.equal(
+      ownedPcmReaderClosed({ ...valid, ...delta }, 'audio', 'ERR_STREAM_DESTROYED'),
+      false
+    )
+  assert.equal(ownedPcmReaderClosed(valid, 'video', 'ERR_STREAM_DESTROYED'), false)
+  assert.equal(ownedPcmReaderClosed(valid, 'audio', 'EACCES'), false)
+  assert.equal(
+    ownedPcmEofVerdict({
+      ...valid,
+      audioProducerError: 'Cannot call write after a stream was destroyed'
+    }).pass,
+    false,
+    'an unclassified producer error must remain a failed attempt'
+  )
+})
 
 test('owned PCM EOF acceptance requires measured lifecycle, complete frame accounting and actual continued video', () => {
   assert.equal(ownedPcmEofVerdict(valid).pass, true)

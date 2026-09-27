@@ -3100,7 +3100,20 @@ mod tests {
                             Some(Arc::new(move |_| {
                                 handle.request_silent_drain();
                             }));
-                        let coordinator = source_coordinator(&source_request("setup-drain", None));
+                        let mut coordinator =
+                            crate::live_source_switch::SourceSwitchCoordinator::default();
+                        coordinator.start(
+                            "test-session".into(),
+                            crate::protocol::SourceSelection {
+                                microphone_id: Some("microphone:coreaudio:7".into()),
+                                screen_id: None,
+                                window_id: None,
+                                camera_id: None,
+                                test_pattern: false,
+                            },
+                        );
+                        coordinator.enable_microphone();
+                        let coordinator = Arc::new(std::sync::Mutex::new(coordinator));
                         let result = send_test_switch(
                             &session,
                             &coordinator,

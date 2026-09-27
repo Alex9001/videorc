@@ -6,6 +6,17 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { RECORD_LATENCY_BUDGETS, percentileNearestRank } from './record-latency-gate.mjs'
 import { incidentPacketTail } from './windows-incident-packet-tail.mjs'
 
+export function ownedPcmReaderClosed(row, kind, code) {
+  if (!row.keepAudioAlive || kind !== 'audio' || row.cancelled) return false
+  if (['EPIPE', 'ECONNRESET'].includes(code)) return true
+  return (
+    code === 'ERR_STREAM_DESTROYED' &&
+    Number.isFinite(row.videoEofMs) &&
+    Number.isFinite(row.audioPipeClosedAtMs) &&
+    row.audioPipeClosedAtMs >= row.videoEofMs
+  )
+}
+
 export function ownedPcmEofVerdict(row) {
   const failures = []
   if (
@@ -214,8 +225,7 @@ export async function runOwnedPcmEof({
         if (kind === 'audio') row.captureStoppedMs = row.audioEofMs
         socket.end()
       })().catch((error) => {
-        if (keepAudioAlive && kind === 'audio' && ['EPIPE', 'ECONNRESET'].includes(error.code))
-          row.audioSinkClosed = error.code
+        if (ownedPcmReaderClosed(row, kind, error.code)) row.audioSinkClosed = error.code
         else if (!(keepAudioAlive && kind === 'audio' && abort.signal.aborted))
           row[`${kind}ProducerError`] = error.message
       })
