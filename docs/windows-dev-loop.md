@@ -332,3 +332,68 @@ deletes old autobuild releases, so the pin 404s over time. Re-pin by picking a
 current `ffmpeg-n8.x-*-win64-lgpl-8.x.zip` from
 https://github.com/BtbN/FFmpeg-Builds/releases, downloading it, and recording
 its sha256 in the pin (LGPL-only assets — repo policy).
+
+## Startup incident diagnostics (Plan 067)
+
+These commands collect diagnostic evidence. They do not qualify an installed
+candidate, prove sustained hardware support, or replace physical/provider acceptance.
+The protected stream performance command without `--incident` retains its existing
+installed-candidate requirements and budgets.
+
+Build a debug backend, fetch the pinned Windows output FFmpeg, and run from PowerShell 7:
+
+```powershell
+cargo build -p videorc-backend
+pnpm ffmpeg:fetch:windows
+pnpm smoke:windows-mf-probe -- --output "$env:TEMP/mf-probe-evidence"
+pnpm smoke:windows-stream-performance -- --incident --list
+pnpm smoke:windows-stream-performance -- --incident --audio controlled --output "$env:TEMP/incident-controlled-new"
+```
+
+The MF command invokes `videorc-backend --windows-mf-probe-matrix` and defaults
+to 1920×1080 and 1280×720 at 30 fps and 6000/5500/5000 kbps. Custom arguments
+are pairs, for example `1280x720@30 5200` (which also probes 5000). Each hardware
+activation is identified separately. Six exact variants cover system-memory
+I420/NV12 and NV12 D3D11 uploads with both VIDEO_SUPPORT and multithread flags
+independently on/off. Diagnostic overrides do not change shipping selection.
+Each owned child announces readiness and has a 20-second deadline plus a
+five-second kill/reap deadline. A Windows kill-on-close Job Object also contains
+children if the supervisor exits. Completed rows are atomically persisted next
+to the selected database as `windows-mf-probe.json`; support bundles include
+this bounded, validated, redacted report. Invalid optional probe evidence is
+explicitly marked without dropping other bundle sections. No encoder is a
+completed measurement, never a hardware support claim. Driver/version fields
+are null when DXGI cannot supply them; the backend crate version is not the
+Electron app version. The direct MF probe does not use FFmpeg.
+
+The incident matrix crosses both profiles with local recording, one receiver,
+two receivers, and recording plus two receivers; controlled tone, real capture
+worker, and an injected worker-open failure into real DirectShow fallback;
+three same-process attempts versus three backend restarts. Its fixed preview
+state is the backend compositor without a presenter. A named case can be run:
+
+```powershell
+pnpm smoke:windows-stream-performance -- --incident --scenario 1080p30-record-dual-controlled-same-process --output "$env:TEMP/incident-one-new"
+pnpm smoke:windows-stream-performance -- --incident --audio worker --microphone "<exact device ID>" --output "$env:TEMP/incident-worker-new"
+pnpm smoke:windows-stream-performance -- --incident --audio direct-fallback --microphone "<exact device ID>" --output "$env:TEMP/incident-fallback-new"
+```
+
+Real microphone cases require a verified sibling `ffmpeg-capture.exe`, an
+available selected microphone, and actual worker/fallback evidence. Missing
+prerequisites are BLOCKED, not replaced with tone. Injected open failure exists
+only in Windows debug builds with both smoke RPC and the runner-owned injection
+flag; release binaries cannot enable it. The standalone harness requires the
+private debug admin bootstrap and never uses real provider URLs or keys.
+Receiver listening ownership is verified against each exact spawned PID on
+127.0.0.1 before publication. Both dual-destination artifacts must be analyzed.
+
+Use a new empty output directory for every invocation. Every failed start and
+cleanup outcome is retained before the next attempt. Reports include OS/adapter
+identity, actual executable hashes, process-instance identity, session-owned
+logs/diagnostics, observed or explicitly unknown startup milestones, encoder
+path, and final artifact cadence, motion, audio gaps/digital zeroes, and A/V
+stream timestamp skew. Perceptual microphone offset remains unmeasured without
+a physical flash/click reference. A nonzero runner exit means a failed or
+blocked diagnostic case, not a reason to relax the existing analyzer limits.
+The hosted Windows diagnostic job runs controlled audio only; it cannot close
+the affected Intel/DirectShow incident or physical/provider acceptance.

@@ -123,6 +123,7 @@ mod windows_d3d11_test_pattern;
 mod windows_graphics_capture;
 #[cfg(target_os = "windows")]
 mod windows_media_foundation_encoder;
+mod windows_mf_probe;
 mod x_chat;
 mod x_live;
 mod x_oauth1;
@@ -273,6 +274,9 @@ const BACKEND_PROCESS_OWNERSHIP_ENV: &str = "VIDEORC_BACKEND_OWNERSHIP_TOKEN";
 const BACKEND_PROCESS_OWNERSHIP_PREFIX: &str = "OWNERSHIP ";
 
 fn main() -> Result<()> {
+    if windows_mf_probe::run_cli(&std::env::args().skip(1).collect::<Vec<_>>())? {
+        return Ok(());
+    }
     publish_backend_process_ownership()?;
     // Live-control handlers are third-party/platform integration boundaries.
     // Keep at least one runtime worker available for the process-owned shutdown

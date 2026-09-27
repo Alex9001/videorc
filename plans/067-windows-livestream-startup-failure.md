@@ -9,9 +9,10 @@
 
 - Priority: P0. Effort: L overall; evidence and warning fixes M. Risk: HIGH
   for pipeline changes, MED for diagnostic ownership and toast lifecycle.
-- Status: BLOCKED for full incident closure. Steps 1–2 are implemented on
-  `fix/067-windows-startup-evidence`; steps 3–4 need native Windows reproduction.
-  Mac timing variability is documented below; isolated repeats passed.
+- Status: IN PROGRESS for remaining reproduction tooling on
+  `fix/067-windows-incident-reproduction`. Steps 1–2 merged in PR #464.
+  Full incident closure still needs affected Windows hardware, which the user
+  confirmed is currently unavailable. Mac timing variability is documented below.
 - Planned: 2026-09-27, against cached main
   `b772cb59b2dc7c675ce7f34b3bd1f3356151d67e`.
 - Local checkout: `15206746`, desktop 0.9.98, dated 2026-09-21. It is older
@@ -322,10 +323,10 @@ waiver of physical gates.
 
 ## Done criteria
 
-- [ ] Failed/cancelled startup persists a redacted bounded FFmpeg tail and
+- [x] Failed/cancelled startup persists a redacted bounded FFmpeg tail and
   session-owned diagnostics; reload/export tests prove it.
-- [ ] Both MF topology failure summaries retain stage/HRESULT under the cap.
-- [ ] Event-order regression suppresses post-failure active notices and keeps
+- [x] Both MF topology failure summaries retain stage/HRESULT under the cap.
+- [x] Event-order regression suppresses post-failure active notices and keeps
   valid warnings for the new/running session.
 - [ ] The precise Windows stall has a failing reproduction and a passing
   regression; hardware/configuration assumptions are recorded, not guessed.
@@ -563,3 +564,91 @@ failures. Rapid-scene stall was 24 ms; floating, resize and docked phases delive
 Final latency also exited 0 after its harness timers drained. The temporary
 `vendor/ffmpeg/current` symlink created for local smokes was removed; its original
 FFmpeg target was untouched. Final Rust format and diff whitespace checks passed.
+
+
+## Follow-on execution: remaining plan (2026-09-27)
+
+The user explicitly requested execution of the entire remaining plan and a new
+PR after steps 1–2 merged as PR #464 (`6ecca383`). Execute from `cfda7e6f`,
+branch `fix/067-windows-incident-reproduction`, preserving the earlier fixes.
+Drift review: subsequent changes add Orcle capture-listen resumption, caption
+artifact accounting, and Linux-only VAAPI B-frame suppression in recording.rs.
+Keep those changes. The Linux eight-second stall has a measured VAAPI-specific
+fix; it is a lead, not proof of the Windows OpenH264/DirectShow incident cause.
+PR #464's hosted Windows source gate and installer, Linux, Rust and JS gates
+all passed. Its Windows workflow runs three full suites; the new startup
+ownership filters were not included in its dedicated 25-repeat list.
+
+Proceed with all independent remaining work: Plan 065 B0's bounded MF probe
+and support-bundle inclusion, Plan 067's maintained incident matrix/reporting,
+and hosted Windows verification. The hardware-dependent media fix must follow
+a reproduced cause; unavailable affected hardware must not prevent building
+these maintained reproduction tools. Request access or a tester-run report
+while implementation continues.
+
+Necessary supporting scope beyond the original allowlist: backend CLI entry
+and a dedicated portable probe-contract module plus tests; support_bundle.rs;
+a maintained MF probe wrapper/test; docs/windows-dev-loop.md; the existing
+Windows source-gates workflow for probe execution and affected startup filters.
+Use a bounded child-process attempt for driver probes that may hang, with
+explicit readiness and owned cleanup. Do not alter shipping encoder choices
+merely to expose diagnostic variants. Do not publish or broadcast to real
+providers. Local RTMP endpoints must be runner-owned and verified loopback.
+
+Keep existing protected performance scenarios and acceptance thresholds intact;
+add a separate selectable incident matrix in the maintained runner. Cover
+record-only, one and two local receivers, record plus two receivers; 1080p30
+and 720p30; controlled audio and the real/injected worker-fallback path;
+same-process retry and backend restart, at least three repetitions. Retain
+failed-start evidence, exact candidate/driver/config identity, observable media
+milestones, analyzed final artifacts, and explicit unknown/blocked evidence.
+A probe completing without an encoder on hosted Windows is a successful
+measurement, not a claim of hardware encoding support.
+
+The existing STOP condition continues to govern dependent media-policy fixes.
+If affected hardware remains unavailable, finish and open a reviewable PR for
+all independently executable work, with unfinished acceptance explicit rather
+than declaring the entire incident solved. This user request authorizes commits,
+push and PR creation for this branch, not merge or release.
+
+
+Follow-on scope clarification: `session_audio.rs` may add a diagnostic-only
+worker-open failure hook, compiled only for Windows debug builds and requiring
+both `VIDEORC_ENABLE_SMOKE_RPC=1` and a dedicated incident flag. It must enter the
+existing fallback path, retain explicit injection evidence, and have gate tests.
+Release builds ignore it. The runner must verify observed fallback and refuse to
+claim coverage when the hook or real microphone is unavailable. This is
+reproduction instrumentation, not a shipping media-policy change.
+
+The user confirmed no Windows PC is currently available. Hosted Windows can
+exercise the controlled-audio diagnostic cases and no-encoder probe behavior;
+physical worker/DirectShow and affected Intel acceptance must remain BLOCKED.
+
+
+### Follow-on review checkpoint before hosted execution
+
+Implemented diagnostic commands (verification still in progress):
+
+```powershell
+pnpm smoke:windows-mf-probe -- --output "$env:TEMP/mf-probe-evidence"
+pnpm smoke:windows-stream-performance -- --incident --list
+pnpm smoke:windows-stream-performance -- --incident --audio controlled --output "$env:TEMP/incident-controlled-new"
+```
+
+The selectable incident matrix contains 48 cases / 144 attempts. The existing
+protected matrix remains 19 scenarios / 55 measured runs. The new mode labels
+its backend-only, synthetic-source evidence separately from installed-candidate
+qualification. Physical worker/DirectShow cases require a real selected mic;
+controlled tone is not a substitute for their acceptance.
+
+Independent review checks so far: Node logic suite 1,603 passed; desktop unit
+suite 2,296 passed / one skipped; TypeScript, lint, desktop build and both
+modified Windows workflows' actionlint pass. The non-Windows incident invocation
+exits 2 and persists BLOCKED with zero spawned groups. These are checkpoint
+results, not the final native or hosted Windows result. Newly added runner
+regressions will be rerun after the implementation freezes.
+
+Review corrections include complete-line READY parsing, redacted launch errors,
+immutable incident output directories, exact process ownership, independent
+receiver cleanup, atomic partial MF reports, and bounded optional report loading.
+No causal encoder/profile/timeout change has been justified or made.

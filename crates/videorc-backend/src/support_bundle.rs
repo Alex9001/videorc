@@ -80,6 +80,8 @@ pub struct SupportBundle {
     pub sessions: Vec<SupportBundleSessionSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub performance_check: Option<crate::protocol::PerformanceCheckResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub windows_mf_probe: Option<Value>,
     pub redaction_summary: SupportBundleRedactionSummary,
 }
 
@@ -200,6 +202,15 @@ pub fn build_support_bundle(input: SupportBundleExportInput) -> Result<SupportBu
     let mut diagnostics = serde_json::to_value(input.diagnostics)?;
     let mut renderer_diagnostics = input.renderer_diagnostics;
     let mut logs = serde_json::to_value(input.logs)?;
+    let mut windows_mf_probe = match crate::windows_mf_probe::load_report(&input.database_path) {
+        Ok(report) => report.map(serde_json::to_value).transpose()?,
+        Err(_) => Some(
+            serde_json::json!({ "state": "invalid", "reason": "Stored Media Foundation probe report failed bounded schema validation; other support evidence is retained." }),
+        ),
+    };
+    if let Some(report) = windows_mf_probe.as_mut() {
+        redact_value(report, &mut redaction_summary);
+    }
 
     redact_value(&mut health, &mut redaction_summary);
     redact_value(&mut entitlements, &mut redaction_summary);
@@ -232,6 +243,7 @@ pub fn build_support_bundle(input: SupportBundleExportInput) -> Result<SupportBu
         logs,
         sessions,
         performance_check: input.performance_check,
+        windows_mf_probe,
         redaction_summary,
     })
 }
@@ -588,6 +600,33 @@ mod tests {
         AiArtifact, AiArtifactStatus, BackendHealth, RecordingState, ToolStatus,
     };
     use crate::recording::idle_status;
+
+    #[test]
+    fn support_bundle_includes_valid_probe_and_retains_other_evidence_when_invalid() {
+        let root = std::env::temp_dir().join(format!("videorc-mf-bundle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut input = minimal_input(None);
+        input.database_path = root.join("db");
+        let path = crate::windows_mf_probe::report_path(&input.database_path);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&crate::windows_mf_probe::test_report()).unwrap(),
+        )
+        .unwrap();
+        let valid = build_support_bundle(input.clone()).unwrap();
+        assert_eq!(
+            valid.windows_mf_probe.unwrap()["attempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            36
+        );
+        std::fs::write(&path, b"{invalid json").unwrap();
+        let invalid = build_support_bundle(input).unwrap();
+        assert_eq!(invalid.windows_mf_probe.unwrap()["state"], "invalid");
+        assert!(!invalid.health.is_null());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn support_bundle_redacts_secret_shaped_fields_and_urls() {

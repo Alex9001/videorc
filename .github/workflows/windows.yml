@@ -164,3 +164,51 @@ jobs:
             apps/desktop/release/latest.yml
           if-no-files-found: error
           retention-days: 30
+
+  incident:
+    name: Windows startup incident diagnostics
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.0.9
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.6.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: cargo build -p videorc-backend
+      - run: pnpm ffmpeg:fetch:windows
+      - name: Bounded Media Foundation diagnostic matrix
+        shell: pwsh
+        run: |
+          pnpm smoke:windows-mf-probe -- --output "$env:RUNNER_TEMP/mf-probe"
+          exit $LASTEXITCODE
+        env:
+          VIDEORC_DATABASE_PATH: ${{ runner.temp }}/mf-probe-state/videorc.sqlite3
+
+      - name: Retain Media Foundation measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mf-probe
+          path: ${{ runner.temp }}/mf-probe
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Controlled-audio incident matrix (three repetitions per case)
+        shell: pwsh
+        run: pnpm smoke:windows-stream-performance -- --incident --audio controlled --output "$env:RUNNER_TEMP/incident"
+      - name: Retain every incident attempt including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-startup-incident
+          path: ${{ runner.temp }}/incident
+          if-no-files-found: warn
+          retention-days: 14

@@ -64,6 +64,14 @@ import {
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
+// Incident diagnostics have their own authority, identity and verdict contract.
+// The protected installed-candidate path below retains all existing gates.
+if (process.argv.includes('--incident')) {
+  const { runWindowsIncident } = await import('./lib/windows-incident-runner.mjs')
+  process.exitCode = await runWindowsIncident(process.argv.slice(2))
+  process.exit(process.exitCode)
+}
+
 const options = parseWindowsStreamPerformanceArgs(process.argv.slice(2))
 
 // `--list` is intentionally an import-light, zero-launch operation. In

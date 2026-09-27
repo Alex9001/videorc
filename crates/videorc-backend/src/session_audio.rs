@@ -923,10 +923,32 @@ async fn prepare_adapter(
     .await
 }
 
+#[cfg(any(all(target_os = "windows", debug_assertions), test))]
+fn incident_worker_open_failure_enabled(
+    debug_build: bool,
+    smoke_rpc: Option<&str>,
+    injection: Option<&str>,
+) -> bool {
+    debug_build && smoke_rpc == Some("1") && injection == Some("1")
+}
+
 pub async fn prepare_initial_adapter(
     device_id: String,
     ffmpeg_path: String,
 ) -> anyhow::Result<InitialAudioSource> {
+    // Incident reproduction only: a shipping release cannot enable this hook.
+    // Returning through the real acquisition boundary preserves the production
+    // DirectShow fallback and its diagnostics instead of simulating success.
+    #[cfg(all(target_os = "windows", debug_assertions))]
+    if incident_worker_open_failure_enabled(
+        cfg!(debug_assertions),
+        std::env::var("VIDEORC_ENABLE_SMOKE_RPC").as_deref().ok(),
+        std::env::var("VIDEORC_INCIDENT_WORKER_OPEN_FAILURE")
+            .as_deref()
+            .ok(),
+    ) {
+        anyhow::bail!("Injected incident capture-worker open failure (diagnostic-only)");
+    }
     let count = Arc::new(AtomicU64::new(0));
     let producer = prepare_adapter(
         device_id,
@@ -2352,6 +2374,30 @@ fn write_chunk_with_clock(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn incident_worker_failure_requires_debug_build_and_both_opt_ins() {
+        assert!(!super::incident_worker_open_failure_enabled(
+            false,
+            Some("1"),
+            Some("1")
+        ));
+        assert!(!super::incident_worker_open_failure_enabled(
+            true,
+            None,
+            Some("1")
+        ));
+        assert!(!super::incident_worker_open_failure_enabled(
+            true,
+            Some("1"),
+            None
+        ));
+        assert!(super::incident_worker_open_failure_enabled(
+            true,
+            Some("1"),
+            Some("1")
+        ));
+    }
+
     use super::*;
     use std::time::Instant;
 

@@ -23,8 +23,11 @@
   identity plus profile. B4: each rung's `start_error` is already in the
   backend log (support bundle); showing it in Settings needs a contract
   change and moves to the second PR.
-- Second PR, NOT started: B0 (probe matrix tool), then B3 (stream
-  step-down) and the B4 renderer surface. B3 is larger than written below:
+- Follow-on 2026-09-27: B0 is being implemented and verified under Plan 067,
+  branch `fix/067-windows-incident-reproduction`, including exact isolated MF
+  attempts and support-bundle capture. Affected Windows hardware is currently
+  unavailable. B3 (stream step-down) and the B4 renderer surface remain pending
+  the causal reproduction checkpoint in Plan 067. B3 is larger than written below:
   per-target stream profiles come from named presets
   (`stream_target_output_video`) validated per provider, so a step-down
   needs a per-target override threaded through
