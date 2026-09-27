@@ -75,6 +75,12 @@ const TICK_OPEN_PROMISES_CAP: usize = 20;
 const PROMISE_TEXT_MAX_CHARS: usize = 160;
 const TOPIC_MAX_CHARS: usize = 60;
 pub(crate) const RECAP_MAX_CHARS: usize = 140;
+/// Renderer contract bounds (`cohostQuestionSchema`), in UTF-16 units.
+const QUESTION_TEXT_MAX_UNITS: usize = 2000;
+const QUESTION_ASKER_MAX_UNITS: usize = 512;
+/// Renderer contract bounds (`cohostListeningSchema`), in UTF-16 units.
+const LISTENING_REASON_CODE_MAX_UNITS: usize = 128;
+const LISTENING_MESSAGE_MAX_UNITS: usize = 2000;
 /// A recap (server or drafted) leaves the state after this long.
 pub(crate) const RECAP_TTL: Duration = Duration::from_secs(5 * 60);
 /// A promise with no trigger reminds the streamer after this long.
@@ -426,11 +432,19 @@ impl CohostListening {
         }
     }
 
+    /// The server's code and message ride as-is, bounded like the renderer
+    /// contract (a non-empty code, UTF-16 lengths).
     pub fn blocked(reason_code: impl Into<String>, message: impl Into<String>) -> Self {
+        let reason_code =
+            truncate_utf16(reason_code.into().trim(), LISTENING_REASON_CODE_MAX_UNITS);
         Self {
             state: CohostListeningState::Blocked,
-            reason_code: Some(reason_code.into()),
-            message: Some(message.into()),
+            reason_code: Some(if reason_code.is_empty() {
+                "unknown".to_string()
+            } else {
+                reason_code
+            }),
+            message: Some(truncate_utf16(&message.into(), LISTENING_MESSAGE_MAX_UNITS)),
             remaining_seconds: None,
         }
     }
@@ -478,7 +492,7 @@ impl Default for CohostSettings {
 
 impl CohostSettings {
     fn normalized(mut self) -> Self {
-        self.notes = truncate_chars(&self.notes, COHOST_NOTES_MAX_CHARS);
+        self.notes = truncate_utf16(&self.notes, COHOST_NOTES_MAX_CHARS);
         self.rules = normalize_rules(self.rules);
         self
     }
@@ -491,7 +505,7 @@ impl CohostSettings {
             self.tone = tone;
         }
         if let Some(notes) = patch.notes {
-            self.notes = truncate_chars(&notes, COHOST_NOTES_MAX_CHARS);
+            self.notes = truncate_utf16(&notes, COHOST_NOTES_MAX_CHARS);
         }
         if let Some(auto_highlight) = patch.auto_highlight {
             self.auto_highlight = auto_highlight;
@@ -513,7 +527,7 @@ impl CohostSettings {
 fn normalize_rules(rules: Vec<String>) -> Vec<String> {
     rules
         .iter()
-        .map(|rule| truncate_chars(rule.trim(), COHOST_RULE_MAX_CHARS))
+        .map(|rule| truncate_utf16(rule.trim(), COHOST_RULE_MAX_CHARS))
         .map(|rule| rule.trim_end().to_string())
         .filter(|rule| !rule.is_empty())
         .take(COHOST_RULES_MAX)
@@ -531,11 +545,19 @@ pub fn load_cohost_settings(database: &Database) -> CohostSettings {
     }
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
+/// The longest prefix of `value` within `max_units` UTF-16 code units, cut
+/// on a char boundary. Every text bound this engine meets counts UTF-16: the
+/// renderer contract (`string.length`) and the web's zod limits alike, so an
+/// emoji is two units, never one char.
+pub(crate) fn truncate_utf16(value: &str, max_units: usize) -> String {
+    let mut units = 0;
+    for (index, ch) in value.char_indices() {
+        units += ch.len_utf16();
+        if units > max_units {
+            return value[..index].to_string();
+        }
     }
-    value.chars().take(max_chars).collect()
+    value.to_string()
 }
 
 // --- Renderer-facing state -----------------------------------------------------
@@ -695,7 +717,7 @@ impl CohostErrorDetail {
         let message: String = message.into();
         Self {
             code: code.into(),
-            message: truncate_chars(message.trim(), ERROR_DETAIL_MESSAGE_MAX_CHARS),
+            message: truncate_utf16(message.trim(), ERROR_DETAIL_MESSAGE_MAX_CHARS),
             status,
         }
     }
@@ -1295,6 +1317,11 @@ struct CohostSession {
     transcript_pending: String,
     /// What the outstanding tick sent, restored on a version fallback.
     in_flight_transcript: String,
+    /// A v3 tick succeeded this session: the server speaks v3, so a tick
+    /// with speech and no chat is safe to send. A rolled-back server would
+    /// answer a chat-less tick `invalid-request`, not
+    /// `prompt-version-unsupported`, so speech alone waits for this.
+    v3_confirmed: bool,
     /// Sign-out forgot the speech the in-flight tick carried: drop its answer.
     discard_in_flight: bool,
     /// Chat you haven't acknowledged (plan 068 D9): who chatted this session
@@ -1457,6 +1484,7 @@ impl CohostSession {
             speech_cursor: None,
             transcript_pending: String::new(),
             in_flight_transcript: String::new(),
+            v3_confirmed: false,
             discard_in_flight: false,
             ledger: AuthorLedger::default(),
             dead_air: DeadAirLane::default(),
@@ -1546,9 +1574,12 @@ impl CohostSession {
     }
 
     /// Transcript chars waiting for the next tick, as the cadence sees them:
-    /// nothing below v3, where the transcript never goes out.
+    /// nothing below v3, where the transcript never goes out, and nothing
+    /// until a v3 tick succeeded this session (a speech-only tick to a server
+    /// without v3 fails validation instead of falling back). Until then the
+    /// transcript rides the next chat tick.
     fn transcript_pending_chars(&self) -> usize {
-        if self.speaks_v3() {
+        if self.speaks_v3() && self.v3_confirmed {
             self.transcript_pending.chars().count()
         } else {
             0
@@ -1579,7 +1610,7 @@ impl CohostSession {
             added += text.chars().count();
         }
         self.transcript_pending =
-            keep_newest_chars(&self.transcript_pending, TRANSCRIPT_PENDING_CAP_CHARS);
+            keep_newest_utf16(&self.transcript_pending, TRANSCRIPT_PENDING_CAP_CHARS);
         added
     }
 
@@ -1761,7 +1792,7 @@ impl CohostSession {
         self.in_flight_rules = rules.clone().unwrap_or_default();
         let transcript_pending = std::mem::take(&mut self.transcript_pending);
         let transcript = if speaks_v3 && !transcript_pending.trim().is_empty() {
-            let newest = keep_newest_chars(transcript_pending.trim(), TICK_TRANSCRIPT_MAX_CHARS);
+            let newest = keep_newest_utf16(transcript_pending.trim(), TICK_TRANSCRIPT_MAX_CHARS);
             self.in_flight_transcript = newest.clone();
             Some(newest)
         } else {
@@ -1775,7 +1806,7 @@ impl CohostSession {
                 .take(TICK_OPEN_PROMISES_CAP)
                 .map(|promise| CohostTickOpenPromise {
                     id: promise.id.clone(),
-                    text: truncate_chars(&promise.text, PROMISE_TEXT_MAX_CHARS),
+                    text: truncate_utf16(&promise.text, PROMISE_TEXT_MAX_CHARS),
                 })
                 .collect()
         });
@@ -1833,15 +1864,22 @@ impl CohostSession {
         self.detail = None;
         self.last_tick_iso = Some(now_iso.to_string());
         self.partial = dropped > 0;
-        self.mood = response.mood.map(|mood| match mood {
-            CohostMood::Unknown => CohostMood::Mixed,
-            known => known,
-        });
-        self.mood_scores = response.mood_scores.map(|scores| CohostMoodScores {
-            hype: unit_interval(scores.hype).unwrap_or(0.0),
-            tension: unit_interval(scores.tension).unwrap_or(0.0),
-            confusion: unit_interval(scores.confusion).unwrap_or(0.0),
-        });
+        if self.speaks_v3() {
+            self.v3_confirmed = true;
+        }
+        // Mood reads chat. A speech-only tick (v3, no chat in the batch) had
+        // no chat to read: the last mood stays, like the suggestions below.
+        if sent_messages > 0 {
+            self.mood = response.mood.map(|mood| match mood {
+                CohostMood::Unknown => CohostMood::Mixed,
+                known => known,
+            });
+            self.mood_scores = response.mood_scores.map(|scores| CohostMoodScores {
+                hype: unit_interval(scores.hype).unwrap_or(0.0),
+                tension: unit_interval(scores.tension).unwrap_or(0.0),
+                confusion: unit_interval(scores.confusion).unwrap_or(0.0),
+            });
+        }
 
         let resolved: HashSet<String> = response.resolved.into_iter().collect();
         if response.keep_questions {
@@ -1854,10 +1892,10 @@ impl CohostSession {
         // v3 (plan 068 D7/D8): the latest response's summary and topic win
         // when present; a response without them (v2 fallback) keeps the last.
         if let Some(summary) = response.summary {
-            self.summary = truncate_chars(summary.trim(), TICK_SUMMARY_MAX_CHARS);
+            self.summary = truncate_utf16(summary.trim(), TICK_SUMMARY_MAX_CHARS);
         }
         if let Some(topic) = response.topic {
-            let topic = truncate_chars(topic.trim(), TOPIC_MAX_CHARS);
+            let topic = truncate_utf16(topic.trim(), TOPIC_MAX_CHARS);
             self.topic = (!topic.is_empty()).then_some(topic);
         }
         let fulfilled: HashSet<String> = response.fulfilled_promise_ids.into_iter().collect();
@@ -1879,7 +1917,7 @@ impl CohostSession {
         }
         if let Some(recap) = response
             .recap
-            .map(|recap| truncate_chars(recap.trim(), RECAP_MAX_CHARS))
+            .map(|recap| truncate_utf16(recap.trim(), RECAP_MAX_CHARS))
             .filter(|recap| !recap.is_empty())
         {
             self.set_recap(recap, now, now_iso);
@@ -2036,15 +2074,21 @@ impl CohostSession {
             }
             next_questions.push(CohostQuestion {
                 id: incoming.id,
-                text: incoming.text,
+                // Bounded like the renderer contract (UTF-16), whatever the
+                // server sent: one oversized string would drop every state.
+                text: truncate_utf16(&incoming.text, QUESTION_TEXT_MAX_UNITS),
                 message_ids,
-                askers: incoming.askers,
+                askers: incoming
+                    .askers
+                    .iter()
+                    .map(|asker| truncate_utf16(asker, QUESTION_ASKER_MAX_UNITS))
+                    .collect(),
                 platforms: incoming.platforms,
                 priority: match incoming.priority {
                     CohostPriority::Unknown => CohostPriority::Normal,
                     known => known,
                 },
-                suggested_reply: incoming.suggested_reply,
+                suggested_reply: truncate_utf16(&incoming.suggested_reply, QUESTION_TEXT_MAX_UNITS),
                 from_notes: incoming.from_notes,
                 first_seen_at: existing
                     .map(|question| question.first_seen_at.clone())
@@ -2066,7 +2110,7 @@ impl CohostSession {
     fn replace_promises(&mut self, incoming: Vec<CohostTickPromise>, now: Instant, now_iso: &str) {
         let mut next: Vec<CohostPromise> = Vec::with_capacity(incoming.len());
         for promise in incoming {
-            let text = truncate_chars(promise.text.trim(), PROMISE_TEXT_MAX_CHARS);
+            let text = truncate_utf16(promise.text.trim(), PROMISE_TEXT_MAX_CHARS);
             if text.is_empty() {
                 continue;
             }
@@ -2287,7 +2331,7 @@ impl CohostSession {
                     restored.push_str(&self.transcript_pending);
                 }
                 self.transcript_pending =
-                    keep_newest_chars(&restored, TRANSCRIPT_PENDING_CAP_CHARS);
+                    keep_newest_utf16(&restored, TRANSCRIPT_PENDING_CAP_CHARS);
             }
             return;
         }
@@ -2480,7 +2524,7 @@ impl CohostSession {
             return None;
         }
         let known = self.spotlight_eligible(message_id)?;
-        let author = truncate_chars(known.author_name.trim(), SPOTLIGHT_AUTHOR_MAX_CHARS);
+        let author = truncate_utf16(known.author_name.trim(), SPOTLIGHT_AUTHOR_MAX_CHARS);
         // A question id the server would reject makes the row a plain
         // candidate: still "about", no "answered".
         let question = question
@@ -2497,7 +2541,7 @@ impl CohostSession {
             at: known.at.clone(),
             question_id: question.map(|question| question.id.clone()),
             question_text: question
-                .map(|question| truncate_chars(question.text.trim(), TICK_MESSAGE_TEXT_MAX_CHARS))
+                .map(|question| truncate_utf16(question.text.trim(), TICK_MESSAGE_TEXT_MAX_CHARS))
                 .filter(|text| !text.is_empty()),
         })
     }
@@ -3206,30 +3250,30 @@ pub(crate) fn promise_trigger_met(
     }
 }
 
-/// The newest `max_chars` of `value` (whole chars, never a split code point).
-fn keep_newest_chars(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
-        return value.to_string();
+/// The newest `max_units` UTF-16 code units of `value`, cut on a char
+/// boundary (never a split code point or surrogate pair).
+fn keep_newest_utf16(value: &str, max_units: usize) -> String {
+    let mut units = 0;
+    for (index, ch) in value.char_indices().rev() {
+        units += ch.len_utf16();
+        if units > max_units {
+            return value[index + ch.len_utf8()..].to_string();
+        }
     }
-    value.chars().skip(count - max_chars).collect()
+    value.to_string()
 }
 
-/// A recap draft from the summary: the first `max_chars`, cut at a word
-/// boundary (the last whitespace inside the cap), trimmed; empty when the
-/// summary is.
-pub(crate) fn recap_draft(summary: &str, max_chars: usize) -> String {
+/// A recap draft from the summary: the first `max_units` UTF-16 code units,
+/// cut at a word boundary (the last whitespace inside the cap), trimmed;
+/// empty when the summary is.
+pub(crate) fn recap_draft(summary: &str, max_units: usize) -> String {
     let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
-    if summary.chars().count() <= max_chars {
+    let head = truncate_utf16(&summary, max_units);
+    if head.len() == summary.len() {
         return summary;
     }
-    let head: String = summary.chars().take(max_chars).collect();
     // A word that ends exactly at the cap is whole: keep it.
-    if summary
-        .chars()
-        .nth(max_chars)
-        .is_some_and(char::is_whitespace)
-    {
+    if summary[head.len()..].starts_with(char::is_whitespace) {
         return head.trim_end().to_string();
     }
     match head.rfind(char::is_whitespace) {
@@ -3353,7 +3397,7 @@ pub(crate) fn tick_message_from_chat(message: &LiveChatMessage) -> Option<Cohost
     if message.platform == StreamPlatform::Custom {
         return None;
     }
-    let text = truncate_chars(message.message_text.trim(), TICK_MESSAGE_TEXT_MAX_CHARS);
+    let text = truncate_utf16(message.message_text.trim(), TICK_MESSAGE_TEXT_MAX_CHARS);
     if text.is_empty() {
         return None;
     }
@@ -7184,6 +7228,9 @@ mod tests {
     fn speech_alone_ticks_on_v3_after_200_chars_and_20_seconds_but_never_below_v3() {
         let start = Instant::now();
         let (mut engine, generation) = running_engine(start);
+        // The server already answered a v3 tick (the rule before that has
+        // its own test).
+        engine.session.as_mut().unwrap().v3_confirmed = true;
         let long = "w".repeat(199);
         engine.note_speech(generation, &speech(&[(start + secs(1), &long)]));
         // 199 chars: not enough, even after the idle interval.
@@ -9783,6 +9830,181 @@ mod tests {
     }
 
     // --- Plan 068 review fixes ------------------------------------------------
+
+    /// Finding 7 and 8: speech alone never ticks until a v3 tick succeeded
+    /// this session (a rolled-back server answers a chat-less tick
+    /// `invalid-request`); until then the transcript rides chat ticks. And a
+    /// speech-only tick, which read no chat, keeps the chat mood.
+    #[test]
+    fn speech_alone_waits_for_a_v3_answer_and_keeps_the_chat_mood() {
+        let start = Instant::now();
+        let (mut engine, generation) = running_engine(start);
+        let long = "w".repeat(250);
+        engine.note_speech(generation, &speech(&[(start + secs(1), &long)]));
+        assert_eq!(
+            engine.prepare_tick(generation, true, true, start + secs(30)),
+            Err(TickGate::Idle),
+            "no speech-only tick before a v3 answer"
+        );
+        engine.note_messages(&messages("session-1", 0..5));
+        let chat = engine
+            .prepare_tick(generation, true, true, start + secs(31))
+            .unwrap();
+        assert_eq!(chat.request.prompt_version, 3);
+        assert_eq!(chat.request.transcript.as_deref(), Some(long.as_str()));
+        let mut answer = response(Vec::new());
+        answer.mood_scores = Some(crate::videorc_api::CohostTickMoodScores {
+            hype: 0.9,
+            tension: 0.1,
+            confusion: 0.2,
+        });
+        assert!(engine.apply_tick_result(generation, 0, Ok(answer), start + secs(32), "t1"));
+        let chat_mood = engine.snapshot();
+        assert_eq!(chat_mood.mood, Some(CohostMood::Hype));
+        assert!(chat_mood.mood_scores.is_some());
+
+        // Confirmed: speech alone ticks now.
+        engine.note_speech(
+            generation,
+            &speech(&[(start + secs(1), &long), (start + secs(40), &long)]),
+        );
+        let quiet = engine
+            .prepare_tick(generation, true, true, start + secs(60))
+            .unwrap();
+        assert!(quiet.request.messages.is_empty());
+        let mut calm = response(Vec::new());
+        calm.mood = Some(CohostMood::Calm);
+        calm.mood_scores = None;
+        assert!(engine.apply_tick_result(generation, 0, Ok(calm), start + secs(61), "t2"));
+        let after = engine.snapshot();
+        assert_eq!(
+            after.mood, chat_mood.mood,
+            "a speech-only tick keeps the mood"
+        );
+        assert_eq!(after.mood_scores, chat_mood.mood_scores);
+
+        // A chat tick replaces it as always.
+        engine.note_messages(&messages("session-1", 5..10));
+        engine
+            .prepare_tick(generation, true, true, start + secs(80))
+            .unwrap();
+        let mut tense = response(Vec::new());
+        tense.mood = Some(CohostMood::Tense);
+        assert!(engine.apply_tick_result(generation, 0, Ok(tense), start + secs(81), "t3"));
+        assert_eq!(engine.snapshot().mood, Some(CohostMood::Tense));
+        assert_eq!(engine.snapshot().mood_scores, None);
+
+        // A server without v3: the chat tick carrying speech falls back to
+        // v2, and speech alone never ticks for the rest of the session.
+        let (mut engine, generation) = running_engine(start);
+        engine.note_speech(generation, &speech(&[(start + secs(1), &long)]));
+        engine.note_messages(&messages("session-1", 0..5));
+        engine
+            .prepare_tick(generation, true, true, start + secs(20))
+            .unwrap();
+        assert!(engine.apply_tick_result(
+            generation,
+            0,
+            Err(server_error(400, "prompt-version-unsupported", "no v3")),
+            start + secs(21),
+            "t"
+        ));
+        let retry = engine
+            .prepare_tick(generation, true, true, start + secs(30))
+            .unwrap();
+        assert_eq!(retry.request.prompt_version, 2);
+        assert!(retry.request.transcript.is_none());
+        assert!(engine.apply_tick_result(
+            generation,
+            0,
+            Ok(response(Vec::new())),
+            start + secs(31),
+            "t2"
+        ));
+        engine.note_speech(
+            generation,
+            &speech(&[(start + secs(1), &long), (start + secs(32), &long)]),
+        );
+        assert_eq!(
+            engine.prepare_tick(generation, true, true, start + secs(90)),
+            Err(TickGate::Idle)
+        );
+    }
+
+    fn utf16(value: &str) -> usize {
+        value.encode_utf16().count()
+    }
+
+    /// Finding 9: every text the engine emits and the renderer contract (or
+    /// the web's zod) bounds is capped in UTF-16 units, cut on a char: an
+    /// emoji at the boundary never overflows and never splits.
+    #[test]
+    fn every_bounded_text_counts_utf16_units_with_emoji_at_the_boundary() {
+        assert_eq!(truncate_utf16("ab😀", 3), "ab");
+        assert_eq!(truncate_utf16("ab😀", 4), "ab😀");
+        assert_eq!(truncate_utf16("ab😀c", 5), "ab😀c");
+        assert_eq!(keep_newest_utf16("😀ab", 3), "ab");
+        assert_eq!(keep_newest_utf16("😀ab", 4), "😀ab");
+        // A recap draft: 137 letters, a space, then an emoji word that would
+        // end at 142 units. It is cut at the word, never mid-emoji.
+        let summary = format!("{} 😀😀", "a".repeat(137));
+        let draft = recap_draft(&summary, RECAP_MAX_CHARS);
+        assert_eq!(draft, "a".repeat(137));
+        let exact = format!("{} 😀", "a".repeat(137));
+        assert_eq!(recap_draft(&exact, RECAP_MAX_CHARS), exact);
+        assert_eq!(utf16(&recap_draft(&"😀".repeat(100), RECAP_MAX_CHARS)), 140);
+
+        let start = Instant::now();
+        let (mut engine, generation) = running_engine(start);
+        let mut row = chat_message("session-1", 1, "2026-08-22T10:01:01Z");
+        row.author_name = "😀".repeat(300);
+        row.first_message = true;
+        engine.note_messages(&[row.clone()]);
+        engine
+            .prepare_tick(generation, true, true, start + secs(20))
+            .unwrap();
+        let mut answer = response(vec![question("q_1", &[row.id.as_str()])]);
+        answer.questions[0].text = "😀".repeat(1_500);
+        answer.questions[0].suggested_reply = "😀".repeat(1_500);
+        answer.questions[0].askers = vec!["😀".repeat(400)];
+        answer.recap = Some(format!("{}😀", "r".repeat(139)));
+        answer.topic = Some("😀".repeat(40));
+        answer.summary = Some("😀".repeat(400));
+        answer.promises = Some(vec![tick_promise(
+            None,
+            &"😀".repeat(100),
+            CohostPromiseTriggerKind::Minutes,
+            Some(1.0),
+        )]);
+        assert!(engine.apply_tick_result(generation, 0, Ok(answer), start + secs(21), "t1"));
+        assert!(engine.check_promises(generation, None, start + secs(90), "t2"));
+        let state = engine.snapshot();
+        assert_eq!(
+            state.recap.as_ref().map(|r| r.text.clone()),
+            Some("r".repeat(139))
+        );
+        assert_eq!(state.topic.as_deref().map(utf16), Some(60));
+        assert!(utf16(&state.promises[0].text) <= 160);
+        assert!(utf16(&state.promise_reminder.as_ref().unwrap().text) <= 160);
+        assert!(utf16(&state.questions[0].text) <= 2_000);
+        assert!(utf16(&state.questions[0].suggested_reply) <= 2_000);
+        assert!(utf16(&state.questions[0].askers[0]) <= 512);
+        assert!(utf16(&state.say_hi[0].name) <= 512);
+        assert!(!state.say_hi[0].name.is_empty());
+        assert!(utf16(&engine.session.as_ref().unwrap().summary) <= TICK_SUMMARY_MAX_CHARS);
+        // The echoes the web's zod bounds hard stay inside them too.
+        engine.note_messages(&messages("session-1", 2..7));
+        let next = engine
+            .prepare_tick(generation, true, true, start + secs(40))
+            .unwrap();
+        assert!(utf16(&next.request.open_promises.as_ref().unwrap()[0].text) <= 160);
+        assert!(utf16(next.request.summary.as_deref().unwrap()) <= TICK_SUMMARY_MAX_CHARS);
+
+        // Listening carries the server's words, bounded, never an empty code.
+        let blocked = CohostListening::blocked("", "😀".repeat(1_500));
+        assert_eq!(blocked.reason_code.as_deref(), Some("unknown"));
+        assert!(utf16(blocked.message.as_deref().unwrap()) <= 2_000);
+    }
 
     /// Finding 4: sign-out purges everything Orcle heard under the account,
     /// blocks listening, and drops the answer of a tick in flight.

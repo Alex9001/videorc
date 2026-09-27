@@ -29,8 +29,11 @@ const OWN_SEND_ECHO_WINDOW: Duration = Duration::from_secs(120);
 const OWN_SEND_ECHO_MIN_CHARS: usize = 6;
 const OWN_SENDS_CAP: usize = 20;
 const GREETED_LOG_CAP: usize = 20;
-/// Display names on the wire (the renderer contract caps them at 512).
+/// Display names on the wire, in UTF-16 units (the renderer contract caps
+/// them at 512).
 const AUTHOR_NAME_MAX_CHARS: usize = 120;
+/// The nudge text on the wire, in UTF-16 units (`cohostDeadAirNudgeSchema`).
+const DEAD_AIR_TEXT_MAX_UNITS: usize = 1024;
 
 /// The streamer has been quiet this long (plan 068 D9).
 pub(crate) const DEAD_AIR_SILENCE: Duration = Duration::from_secs(20);
@@ -622,12 +625,7 @@ impl AuthorLedger {
             self.forget(key);
             return;
         }
-        let name: String = message
-            .author_name
-            .trim()
-            .chars()
-            .take(AUTHOR_NAME_MAX_CHARS)
-            .collect();
+        let name = crate::cohost::truncate_utf16(message.author_name.trim(), AUTHOR_NAME_MAX_CHARS);
         if name.is_empty() {
             return;
         }
@@ -942,16 +940,20 @@ pub(crate) fn dead_air_text(
                     ))
             })
     };
-    if let Some(question) = best(false) {
-        return Some(question_nudge(question));
-    }
-    if let Some(entry) = say_hi.first() {
-        return Some(format!(
+    let text = if let Some(question) = best(false) {
+        question_nudge(question)
+    } else if let Some(entry) = say_hi.first() {
+        format!(
             "Dead air: say hi to {}, it's their first chat.",
             entry.name.trim()
-        ));
-    }
-    best(true).map(question_nudge)
+        )
+    } else {
+        question_nudge(best(true)?)
+    };
+    Some(crate::cohost::truncate_utf16(
+        &text,
+        DEAD_AIR_TEXT_MAX_UNITS,
+    ))
 }
 
 fn question_nudge(question: &CohostQuestion) -> String {
@@ -960,8 +962,8 @@ fn question_nudge(question: &CohostQuestion) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let quote = if text.chars().count() > DEAD_AIR_QUOTE_MAX_CHARS {
-        let head: String = text.chars().take(DEAD_AIR_QUOTE_MAX_CHARS - 1).collect();
+    let quote = if text.encode_utf16().count() > DEAD_AIR_QUOTE_MAX_CHARS {
+        let head = crate::cohost::truncate_utf16(&text, DEAD_AIR_QUOTE_MAX_CHARS - 1);
         format!("{}…", head.trim_end())
     } else {
         text
@@ -969,8 +971,8 @@ fn question_nudge(question: &CohostQuestion) -> String {
     let askers: Vec<String> = question
         .askers
         .iter()
-        .map(|asker| asker.trim().chars().take(AUTHOR_NAME_MAX_CHARS).collect())
-        .filter(|asker: &String| !asker.is_empty())
+        .map(|asker| crate::cohost::truncate_utf16(asker.trim(), AUTHOR_NAME_MAX_CHARS))
+        .filter(|asker| !asker.is_empty())
         .collect();
     match askers.as_slice() {
         [] => format!("Dead air: answer this question: “{quote}”"),
@@ -1651,5 +1653,25 @@ mod tests {
         assert!(ledger.author("k:cy").unwrap().greeted.is_some());
         assert!(ledger.take_log().is_empty());
         assert!(!ledger.author_greeted_by_voice_for_test());
+    }
+
+    /// Finding 9: names and the nudge stay inside the renderer contract in
+    /// UTF-16 units, cut on a char, whatever the emoji.
+    #[test]
+    fn names_and_nudges_are_bounded_in_utf16_units() {
+        let start = Instant::now();
+        let mut ledger = AuthorLedger::default();
+        ledger.note_message("k:e", &row(1, &"😀".repeat(300), "hi", true), false, start);
+        let name = &ledger.say_hi(start)[0].name;
+        assert_eq!(name.encode_utf16().count(), AUTHOR_NAME_MAX_CHARS);
+        let long = question(
+            "q1",
+            &"😀".repeat(200),
+            &["😀".repeat(300).as_str()],
+            CohostPriority::High,
+        );
+        let text = dead_air_text(&[long], &[]).unwrap();
+        assert!(text.encode_utf16().count() <= DEAD_AIR_TEXT_MAX_UNITS);
+        assert!(text.ends_with("…”"), "{text}");
     }
 }
