@@ -3748,6 +3748,8 @@ export interface GlobalShortcutsConfig {
   recordToggle?: string
   streamToggle?: string
   micToggle?: string
+  /** Turn system audio on/off (plan 069 S6). Unbound by default. */
+  systemAudioToggle?: string
   /** Mark a clip at the current moment (plan 068 D6). Unbound by default. */
   clipMark?: string
 }

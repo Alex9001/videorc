@@ -18,6 +18,9 @@ export interface RemoteState {
   recordEnabled?: boolean
   streamEnabled?: boolean
   micMuted?: boolean
+  /** Plan 069; absent from apps that predate system audio. */
+  systemAudioOn?: boolean
+  systemAudioAvailable?: boolean
   layoutPreset?: string
   activeTakeoverId?: string | null
   windows?: { notes?: boolean; comments?: boolean; preview?: boolean }

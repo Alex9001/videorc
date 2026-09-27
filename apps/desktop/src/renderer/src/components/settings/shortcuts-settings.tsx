@@ -1,8 +1,8 @@
 import { findAcceleratorOwner } from '../../../../shared/accelerator'
+import { withGlobalShortcut } from '../../../../shared/global-shortcut-bindings'
 import {
   globalShortcutEntries,
   globalShortcutLayout,
-  withGlobalShortcut,
   type GlobalShortcutAction
 } from '../../../../shared/global-shortcuts'
 import { KeyboardIcon, SettingsIcon } from '@/components/icons'
@@ -22,6 +22,7 @@ const GLOBAL_ACTION_ROWS = [
   'record-toggle',
   'stream-toggle',
   'mic-toggle',
+  'system-audio-toggle',
   'clip-mark',
   'layout-next',
   'layout-previous'
@@ -31,6 +32,7 @@ const GLOBAL_ACTION_LABELS: Record<(typeof GLOBAL_ACTION_ROWS)[number], string> 
   'record-toggle': 'Start / stop recording',
   'stream-toggle': 'Go live / end stream',
   'mic-toggle': 'Mute / unmute mic',
+  'system-audio-toggle': 'Turn system audio on/off',
   'clip-mark': 'Mark a clip',
   'layout-next': 'Next layout',
   'layout-previous': 'Previous layout'

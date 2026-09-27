@@ -60,6 +60,11 @@ pub enum RemoteIntent {
     MicMute,
     MicUnmute,
     MicToggle,
+    /// System audio on/off (plan 069). On/Off is the mute: there is no
+    /// separate system-audio mute.
+    SystemAudioOn,
+    SystemAudioOff,
+    SystemAudioToggle,
     #[serde(rename_all = "camelCase")]
     SceneApply {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,6 +113,7 @@ impl RemoteIntent {
             Self::RecordStart | Self::RecordStop | Self::RecordToggle => "record",
             Self::StreamStart | Self::StreamStop => "stream",
             Self::MicMute | Self::MicUnmute | Self::MicToggle => "mic",
+            Self::SystemAudioOn | Self::SystemAudioOff | Self::SystemAudioToggle => "system-audio",
             Self::SceneApply { .. } => "scene",
             Self::TakeoverShow { .. } | Self::TakeoverHide => "takeover",
             Self::WindowFront { .. } => "window",
@@ -315,6 +321,63 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&intent).unwrap(),
             serde_json::json!({ "kind": "clipMark" })
+        );
+    }
+
+    #[test]
+    fn system_audio_intents_use_their_wire_tags_and_one_bucket() {
+        for (wire, intent) in [
+            ("systemAudioOn", RemoteIntent::SystemAudioOn),
+            ("systemAudioOff", RemoteIntent::SystemAudioOff),
+            ("systemAudioToggle", RemoteIntent::SystemAudioToggle),
+        ] {
+            let parsed: RemoteIntent =
+                serde_json::from_str(&format!(r#"{{"kind":"{wire}"}}"#)).unwrap();
+            assert_eq!(parsed, intent);
+            assert!(parsed.validate().is_ok());
+            assert_eq!(parsed.debounce_kind(), "system-audio");
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                serde_json::json!({ "kind": wire })
+            );
+        }
+        // Not the mic bucket: a mic key and a system-audio key are two keys.
+        assert_ne!(
+            RemoteIntent::SystemAudioToggle.debounce_kind(),
+            RemoteIntent::MicToggle.debounce_kind()
+        );
+        assert!(serde_json::from_str::<RemoteIntent>(r#"{"kind":"systemAudioMute"}"#).is_err());
+    }
+
+    #[test]
+    fn system_audio_bounce_is_debounced_but_the_mic_passes() {
+        let mut runtime = RemoteControlRuntime::default();
+        let start = Instant::now();
+        assert!(
+            runtime
+                .admit_intent(&RemoteIntent::SystemAudioToggle, start)
+                .accepted
+        );
+        // A bouncing key cannot interleave the explicit forms with the toggle.
+        for bounce in [RemoteIntent::SystemAudioOn, RemoteIntent::SystemAudioOff] {
+            assert!(
+                !runtime
+                    .admit_intent(&bounce, start + Duration::from_millis(50))
+                    .accepted
+            );
+        }
+        assert!(
+            runtime
+                .admit_intent(&RemoteIntent::MicToggle, start + Duration::from_millis(50))
+                .accepted
+        );
+        assert!(
+            runtime
+                .admit_intent(
+                    &RemoteIntent::SystemAudioOff,
+                    start + REMOTE_INTENT_DEBOUNCE + Duration::from_millis(1),
+                )
+                .accepted
         );
     }
 

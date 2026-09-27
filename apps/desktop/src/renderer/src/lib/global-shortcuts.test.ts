@@ -1,13 +1,13 @@
 import { nextEligibleLayout } from '../../../shared/global-shortcuts'
 import { describe, expect, it, vi } from 'vitest'
-vi.mock('sonner', () => ({ toast: { error: vi.fn(), info: vi.fn() } }))
+vi.mock('sonner', () => ({ toast: { error: vi.fn(), info: vi.fn(), warning: vi.fn() } }))
 import { toast } from 'sonner'
 import { executeGlobalShortcut, GlobalShortcutsRegistrar } from './global-shortcuts'
+import { withGlobalShortcut } from '../../../shared/global-shortcut-bindings'
 import {
   GLOBAL_SHORTCUT_ACTIONS,
   globalShortcutEntries,
-  isGlobalShortcutAction,
-  withGlobalShortcut
+  isGlobalShortcutAction
 } from '../../../shared/global-shortcuts'
 import type { GlobalShortcutAction } from '../../../shared/global-shortcuts'
 
@@ -34,10 +34,17 @@ describe('global layout shortcuts', () => {
     expect(context.switchLayout).toHaveBeenCalledTimes(12)
   })
   it('keeps stable IDs, unassigned defaults and validates unknown actions', () => {
-    expect(globalShortcutEntries({})).toHaveLength(16)
+    expect(globalShortcutEntries({})).toHaveLength(17)
     // Plan 068 D6: Mark clip ships unbound.
     expect(globalShortcutEntries({}).find(([id]) => id === 'clip-mark')?.[1]).toBeUndefined()
     expect(withGlobalShortcut({}, 'clip-mark', 'Cmd+Shift+K').clipMark).toBe('Cmd+Shift+K')
+    // Plan 069 S6: System audio ships unbound too.
+    expect(
+      globalShortcutEntries({}).find(([id]) => id === 'system-audio-toggle')?.[1]
+    ).toBeUndefined()
+    expect(withGlobalShortcut({}, 'system-audio-toggle', 'Cmd+Shift+A').systemAudioToggle).toBe(
+      'Cmd+Shift+A'
+    )
     expect(
       globalShortcutEntries({ layouts: { 'camera-only': 'Control+Alt+C' } }).find(
         ([id]) => id === 'layout:camera-only'
@@ -45,6 +52,52 @@ describe('global layout shortcuts', () => {
     ).toBe('Control+Alt+C')
     expect(isGlobalShortcutAction('layout:made-up')).toBe(false)
     expect(isGlobalShortcutAction('layout-next')).toBe(true)
+  })
+})
+
+describe('system audio shortcut', () => {
+  const base = () => ({
+    sessionActive: false,
+    streamEnabled: false,
+    startSession: vi.fn(),
+    stopSession: vi.fn(),
+    toggleMicrophoneMute: vi.fn(),
+    setSystemAudioEnabled: vi.fn()
+  })
+
+  it('flips the state the Studio shows, idle or live, and never touches the mic', () => {
+    const off = { ...base(), systemAudio: ['available', false] as const }
+    executeGlobalShortcut('system-audio-toggle', off)
+    expect(off.setSystemAudioEnabled).toHaveBeenCalledExactlyOnceWith(true)
+    const on = { ...base(), sessionActive: true, systemAudio: ['available', true] as const }
+    executeGlobalShortcut('system-audio-toggle', on)
+    expect(on.setSystemAudioEnabled).toHaveBeenCalledExactlyOnceWith(false)
+    expect(off.toggleMicrophoneMute).not.toHaveBeenCalled()
+    expect(on.toggleMicrophoneMute).not.toHaveBeenCalled()
+    expect(off.startSession).not.toHaveBeenCalled()
+  })
+
+  it('is a no-op that says why when the device cannot run', () => {
+    vi.mocked(toast.warning).mockClear()
+    for (const systemAudio of [
+      ['permission-required', false] as const,
+      ['unavailable', true] as const,
+      [undefined, false] as const
+    ]) {
+      const context = { ...base(), systemAudio }
+      executeGlobalShortcut('system-audio-toggle', context)
+      expect(context.setSystemAudioEnabled).not.toHaveBeenCalled()
+    }
+    expect(toast.warning).toHaveBeenCalledTimes(3)
+    expect(vi.mocked(toast.warning).mock.calls[0][0]).toBe(
+      'System audio needs Screen Recording access'
+    )
+    expect(vi.mocked(toast.warning).mock.calls[0][1]).toMatchObject({
+      id: 'global-shortcut-system-audio'
+    })
+    expect(vi.mocked(toast.warning).mock.calls[1][0]).toBe(
+      'System audio is not available on this computer'
+    )
   })
 })
 

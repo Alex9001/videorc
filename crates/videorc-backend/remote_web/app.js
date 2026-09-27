@@ -292,13 +292,25 @@ function renderDeck() {
     accent: 'red',
     onTap: () => send({ kind: 'micToggle' })
   })
+  // Plan 069: only while the desktop can capture it, like the Studio row. The
+  // phone sees an on/off boolean and nothing else about system audio.
+  const systemAudio = state.systemAudioAvailable
+    ? key({
+        name: 'System audio',
+        hint: state.systemAudioOn ? 'On' : 'Off',
+        on: state.systemAudioOn,
+        onTap: () => send({ kind: 'systemAudioToggle' })
+      })
+    : null
   const comments = key({
     name: 'Clear comment',
     hint: highlight.phase === 'live' ? 'On stream now' : 'Nothing on stream',
     disabled: highlight.phase !== 'live',
     onTap: () => send({ kind: 'commentHighlightClear' })
   })
-  $('deck-main').replaceChildren(session, mic, comments)
+  $('deck-main').replaceChildren(
+    ...[session, mic, systemAudio, comments].filter((node) => node !== null)
+  )
 
   const presets = describe.layoutPresets ?? []
   $('scenes-label').hidden = presets.length === 0

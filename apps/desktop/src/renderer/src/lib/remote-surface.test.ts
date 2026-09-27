@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { executeRemoteIntent, type RemoteIntentContext } from './remote-surface'
+import {
+  executeRemoteIntent,
+  RemoteSurfacePublisher,
+  type RemoteIntentContext,
+  type RemoteSurfaceValues
+} from './remote-surface'
 
 function remoteIntentContext(overrides: Partial<RemoteIntentContext> = {}) {
   const requests: Array<{ method: string; params: unknown }> = []
@@ -16,6 +21,8 @@ function remoteIntentContext(overrides: Partial<RemoteIntentContext> = {}) {
     startSession: vi.fn(async () => true),
     stopSession: vi.fn(async () => true),
     setMicrophoneMuted: vi.fn(async () => true),
+    systemAudio: ['available', false],
+    setSystemAudioEnabled: vi.fn(),
     knownLayoutPresets: ['screen-camera'],
     applyLayoutPreset: vi.fn(async () => true),
     hasTakeover: vi.fn(() => true),
@@ -31,6 +38,45 @@ function remoteIntentContext(overrides: Partial<RemoteIntentContext> = {}) {
 }
 
 describe('executeRemoteIntent', () => {
+  it('turns system audio on, off or over from the state the remotes are shown (plan 069 S6)', async () => {
+    const off = remoteIntentContext({ systemAudio: ['available', false] })
+    await executeRemoteIntent(
+      { intentId: 'sa-1', intent: { kind: 'systemAudioToggle' } },
+      off.context
+    )
+    await executeRemoteIntent({ intentId: 'sa-2', intent: { kind: 'systemAudioOff' } }, off.context)
+    const live = remoteIntentContext({ sessionActive: true, systemAudio: ['available', true] })
+    await executeRemoteIntent(
+      { intentId: 'sa-3', intent: { kind: 'systemAudioToggle' } },
+      live.context
+    )
+    await executeRemoteIntent({ intentId: 'sa-4', intent: { kind: 'systemAudioOn' } }, live.context)
+
+    expect(vi.mocked(off.context.setSystemAudioEnabled).mock.calls).toEqual([[true], [false]])
+    expect(vi.mocked(live.context.setSystemAudioEnabled).mock.calls).toEqual([[false], [true]])
+    for (const { requests } of [off, live]) {
+      expect(requests.map(({ params }) => (params as { ok: boolean }).ok)).toEqual([true, true])
+    }
+    expect(off.context.setMicrophoneMuted).not.toHaveBeenCalled()
+  })
+
+  it('refuses every system-audio intent while the device cannot run', async () => {
+    for (const status of ['permission-required', 'unavailable', undefined] as const) {
+      const { context, requests } = remoteIntentContext({ systemAudio: [status, true] })
+      for (const kind of ['systemAudioOn', 'systemAudioOff', 'systemAudioToggle']) {
+        await executeRemoteIntent({ intentId: `sa-${kind}`, intent: { kind } }, context)
+      }
+      expect(context.setSystemAudioEnabled).not.toHaveBeenCalled()
+      expect(requests.map(({ params }) => params)).toEqual(
+        ['systemAudioOn', 'systemAudioOff', 'systemAudioToggle'].map((kind) => ({
+          intentId: `sa-${kind}`,
+          ok: false,
+          message: 'System audio is not available.'
+        }))
+      )
+    }
+  })
+
   it('marks a clip only while a session runs and relays the refusal reason (plan 068 D6)', async () => {
     const idle = remoteIntentContext()
     await executeRemoteIntent({ intentId: 'clip-idle', intent: { kind: 'clipMark' } }, idle.context)
@@ -337,5 +383,71 @@ describe('executeRemoteIntent', () => {
       method: 'remote.intent.ack',
       params: { intentId: 'intent-h4', ok: true }
     })
+  })
+})
+
+describe('RemoteSurfacePublisher', () => {
+  const values = (
+    systemAudioStatus: RemoteSurfaceValues[12],
+    systemAudioShown: boolean
+  ): RemoteSurfaceValues => [
+    'idle',
+    false,
+    true,
+    false,
+    false,
+    'screen-camera',
+    null,
+    false,
+    false,
+    false,
+    ['screen-camera'],
+    [],
+    systemAudioStatus,
+    systemAudioShown
+  ]
+
+  it('projects system audio as two booleans, masked while the device cannot run', async () => {
+    vi.useFakeTimers()
+    try {
+      const published: unknown[] = []
+      const publisher = new RemoteSurfacePublisher()
+      publisher.attach({
+        request: async (_method, params) => {
+          published.push(params)
+          return undefined as never
+        }
+      })
+      publisher.markConnected()
+      for (const [status, shown] of [
+        ['available', true],
+        ['permission-required', true],
+        ['available', false],
+        [undefined, false]
+      ] as const) {
+        publisher.syncValues(values(status, shown))
+        await vi.runAllTimersAsync()
+      }
+      const states = published.map(
+        (snapshot) => (snapshot as { state: Record<string, unknown> }).state
+      )
+      expect(
+        states.map(({ systemAudioOn, systemAudioAvailable }) => [
+          systemAudioOn,
+          systemAudioAvailable
+        ])
+      ).toEqual([
+        [true, true],
+        [false, false],
+        [false, true],
+        [false, false]
+      ])
+      // The phone learns an on/off and an available flag: never the status
+      // string, the device id or its name.
+      expect(JSON.stringify(published)).not.toMatch(/permission-required|system-audio:/)
+      publisher.detach()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

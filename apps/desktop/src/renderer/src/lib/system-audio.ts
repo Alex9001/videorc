@@ -1,4 +1,4 @@
-import type { Device, DeviceList } from '@/lib/backend'
+import type { Device, DeviceList, DeviceStatus } from '@/lib/backend'
 import type { SystemAudioIssue } from '@/lib/system-audio-session'
 
 export {
@@ -111,4 +111,19 @@ export function systemAudioIssueCopy(issue: SystemAudioIssue): string {
   return issue === 'lost'
     ? 'System audio stopped. The session keeps going.'
     : 'System audio could not start.'
+}
+
+/**
+ * What a shortcut or remote intent asks for (plan 069 S6), or null when the
+ * device cannot run: missing, unsupported, or waiting on the Screen Recording
+ * grant. A toggle flips the state the Studio and the remotes show (the
+ * session's confirmed mix, else the request), the same as clicking the switch.
+ */
+export function systemAudioTarget(
+  mode: 'on' | 'off' | 'toggle',
+  status: DeviceStatus | undefined,
+  shown: boolean
+): boolean | null {
+  if (status !== 'available') return null
+  return mode === 'toggle' ? !shown : mode === 'on'
 }

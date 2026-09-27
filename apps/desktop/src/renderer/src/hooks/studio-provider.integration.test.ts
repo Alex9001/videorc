@@ -7482,6 +7482,120 @@ describe('real StudioProvider lifecycle', () => {
     expect(toastSpies.success).not.toHaveBeenCalled()
   })
 
+  it('turns system audio on and off from remote intents and the shortcut, only while it can run', async () => {
+    const backend = new StudioBackend()
+    backend.deviceList = {
+      ...backend.deviceList,
+      devices: [
+        ...backend.deviceList.devices,
+        {
+          id: 'system-audio:default',
+          name: 'System audio',
+          kind: 'system-audio',
+          status: 'available'
+        }
+      ]
+    }
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+    let emit: (name: string, value: unknown) => void = () => {}
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => [],
+      registerEmitter: (next) => {
+        emit = next
+      }
+    })
+    const testDom = installProviderTestEnvironment(api)
+    restoreEnvironment = testDom.restore
+    const observations: StudioObservation[] = []
+    const latest = (): StudioCoreContextValue => observations.at(-1)!.core
+    root = await mountStudioProvider(testDom.container, (value) => {
+      observations.push(value)
+    })
+    type PublishedState = { systemAudioOn?: boolean; systemAudioAvailable?: boolean }
+    const published = (): PublishedState[] =>
+      backend.sentCommands
+        .filter((command) => command.method === 'remote.surface.publish')
+        .map((command) => (command.params as { state: PublishedState }).state)
+    const ack = (intentId: string): unknown =>
+      backend.sentCommands.find(
+        (command) =>
+          command.method === 'remote.intent.ack' &&
+          (command.params as { intentId?: string }).intentId === intentId
+      )?.params
+    const sendIntent = async (intentId: string, kind: string): Promise<void> => {
+      await act(async () => {
+        for (const socket of backend.sockets) {
+          socket.onmessage?.({
+            data: JSON.stringify({
+              event: 'remote.intent',
+              payload: { intentId, intent: { kind } }
+            })
+          })
+        }
+      })
+    }
+    await waitForObservation(() => latest().wsStatus === 'connected')
+    await act(async () => {
+      for (const socket of backend.sockets) {
+        socket.onmessage?.({ data: JSON.stringify({ event: 'backend.ready', payload: null }) })
+      }
+      await Promise.resolve()
+    })
+    await waitForObservation(() => published().some((state) => state.systemAudioAvailable === true))
+    expect(latest().captureConfig.audio.systemAudioEnabled).toBe(false)
+
+    await sendIntent('ri-sa-toggle', 'systemAudioToggle')
+    await waitForObservation(() => latest().captureConfig.audio.systemAudioEnabled === true)
+    await waitForObservation(() => ack('ri-sa-toggle') !== undefined)
+    expect(ack('ri-sa-toggle')).toEqual({ intentId: 'ri-sa-toggle', ok: true })
+    await waitForObservation(() => published().at(-1)?.systemAudioOn === true)
+
+    await act(async () => {
+      emit('onGlobalShortcut', 'system-audio-toggle')
+    })
+    await waitForObservation(() => latest().captureConfig.audio.systemAudioEnabled === false)
+    await waitForObservation(() => published().at(-1)?.systemAudioOn === false)
+    expect(latest().captureConfig.audio.microphoneMuted).toBe(false)
+    // The phone and the deck learn two booleans, never the device itself.
+    const remoteBodies = JSON.stringify(
+      backend.sentCommands.filter((command) => command.method === 'remote.surface.publish')
+    )
+    expect(remoteBodies).not.toContain('system-audio:default')
+
+    // Without the Screen Recording grant: both paths refuse, nothing flips.
+    backend.deviceList = {
+      ...backend.deviceList,
+      devices: backend.deviceList.devices.map((device) =>
+        device.kind === 'system-audio' ? { ...device, status: 'permission-required' } : device
+      )
+    }
+    await act(async () => {
+      await latest().refreshBackend()
+    })
+    await waitForObservation(() => published().at(-1)?.systemAudioAvailable === false)
+    await sendIntent('ri-sa-on', 'systemAudioOn')
+    await waitForObservation(() => ack('ri-sa-on') !== undefined)
+    expect(ack('ri-sa-on')).toEqual({
+      intentId: 'ri-sa-on',
+      ok: false,
+      message: 'System audio is not available.'
+    })
+    await act(async () => {
+      emit('onGlobalShortcut', 'system-audio-toggle')
+    })
+    await waitForObservation(() => toastSpies.warning.mock.calls.length > 0)
+    expect(toastSpies.warning).toHaveBeenCalledWith(
+      'System audio needs Screen Recording access',
+      expect.objectContaining({ id: 'global-shortcut-system-audio' })
+    )
+    expect(latest().captureConfig.audio.systemAudioEnabled).toBe(false)
+    expect(published().at(-1)).toMatchObject({ systemAudioOn: false, systemAudioAvailable: false })
+  })
+
   it('keeps an exact-session stopping event authoritative when start responds late', async () => {
     const backend = new StudioBackend()
     backend.authoritativeRecordingStatusBeforeStartResponse = 'stopping'

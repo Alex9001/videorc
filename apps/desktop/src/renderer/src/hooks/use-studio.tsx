@@ -9515,6 +9515,17 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     systemAudioIssueEvent.sessionId === recording.sessionId
       ? systemAudioIssueEvent.issue
       : null
+  // Plan 069 S6: what the shortcut and the remotes act on — the device status
+  // and the state the switch shows (the confirmed mix, else the request).
+  const systemAudioStatus = deviceList.devices.find(
+    (device) => device.kind === 'system-audio'
+  )?.status
+  const systemAudioShown = systemAudioConfirmed ?? captureConfig.audio.systemAudioEnabled
+  const setSystemAudioEnabled = (systemAudioEnabled: boolean): void =>
+    setCaptureConfig((current) => ({
+      ...current,
+      audio: { ...current.audio, systemAudioEnabled }
+    }))
 
   const currentStreamOutputTopologyRequest = useMemo(
     () =>
@@ -13888,6 +13899,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       startSession,
       stopSession,
       setMicrophoneMuted: requestRemoteMicrophoneMute,
+      systemAudio: [systemAudioStatus, systemAudioShown],
+      setSystemAudioEnabled,
       knownLayoutPresets,
       applyLayoutPreset: (layoutPreset) => requestCameraPresetTransaction({ layoutPreset }),
       hasTakeover: (assetId) => screens.some((screen) => screen.id === assetId),
@@ -13996,7 +14009,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     commentsWindow.open,
     previewWindow.open,
     [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS],
-    screens.map((screen) => ({ id: screen.id, name: screen.name }))
+    screens.map((screen) => ({ id: screen.id, name: screen.name })),
+    systemAudioStatus,
+    systemAudioShown
   ]
   // Latest-value hand-off (same render-body pattern as the ref mirrors
   // above): the publisher dedupes, debounces past the commit, republishes on
@@ -14165,7 +14180,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       },
       markClip: () => {
         void markClip()
-      }
+      },
+      systemAudio: [systemAudioStatus, systemAudioShown],
+      setSystemAudioEnabled
     }
     if (action.startsWith('layout')) return context.switchLayout?.(action)
     void import('@/lib/global-shortcuts')

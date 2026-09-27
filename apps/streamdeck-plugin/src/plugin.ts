@@ -114,6 +114,27 @@ class MicToggle extends VideorcAction<JsonObject> {
   }
 }
 
+// Plan 069: System audio On/Off. The key shows what the session mixes; an
+// app that cannot capture it (no grant, unsupported, or too old to say)
+// shows N/A and the key alerts instead of sending.
+@action({ UUID: 'com.videorc.streamdeck.system-audio-toggle' })
+class SystemAudioToggle extends VideorcAction<JsonObject> {
+  protected renderTitle: TitleRenderer = (state, connected) =>
+    !connected
+      ? 'Videorc\noffline'
+      : !state?.systemAudioAvailable
+        ? 'System\naudio N/A'
+        : state.systemAudioOn
+          ? 'System\naudio ON'
+          : 'System\naudio off'
+  protected intentFor(
+    _settings: JsonObject,
+    state: RemoteState | null
+  ): Record<string, unknown> | null {
+    return state?.systemAudioAvailable ? { kind: 'systemAudioToggle' } : null
+  }
+}
+
 type SceneSettings = { layoutPreset?: string }
 
 @action({ UUID: 'com.videorc.streamdeck.scene-apply' })
@@ -183,6 +204,7 @@ class WindowFront extends VideorcAction<WindowSettings> {
 streamDeck.actions.registerAction(new RecordToggle())
 streamDeck.actions.registerAction(new StreamToggle())
 streamDeck.actions.registerAction(new MicToggle())
+streamDeck.actions.registerAction(new SystemAudioToggle())
 streamDeck.actions.registerAction(new SceneApply())
 streamDeck.actions.registerAction(new TakeoverToggle())
 streamDeck.actions.registerAction(new WindowFront())

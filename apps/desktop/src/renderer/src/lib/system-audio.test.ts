@@ -7,6 +7,7 @@ import {
   systemAudioDevice,
   systemAudioIssueFromHealthEvent,
   systemAudioSwitchView,
+  systemAudioTarget,
   type SystemAudioSwitchInput
 } from './system-audio'
 
@@ -158,5 +159,19 @@ describe('backendMeterReading for the system audio row', () => {
     expect(backendMeterReading(0.5, -12)).toEqual({ level: 0.5, peakDb: -12 })
     expect(backendMeterReading(undefined, -30)).toEqual({ level: 0.5, peakDb: -30 })
     expect(backendMeterReading(2, null)).toEqual({ level: 1, peakDb: null })
+  })
+})
+
+describe('systemAudioTarget (plan 069 S6)', () => {
+  it('flips the shown state and sets the explicit forms, only while the device can run', () => {
+    expect(systemAudioTarget('toggle', 'available', false)).toBe(true)
+    expect(systemAudioTarget('toggle', 'available', true)).toBe(false)
+    expect(systemAudioTarget('on', 'available', true)).toBe(true)
+    expect(systemAudioTarget('off', 'available', false)).toBe(false)
+    for (const status of ['permission-required', 'unavailable', undefined] as const) {
+      for (const mode of ['on', 'off', 'toggle'] as const) {
+        expect(systemAudioTarget(mode, status, false)).toBeNull()
+      }
+    }
   })
 })

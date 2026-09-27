@@ -200,6 +200,25 @@ try {
   ])
   console.log('remote-lan smoke: signed intent + confirmed state OK')
 
+  // Plan 069 S6 leak argument: the phone learns two booleans about system
+  // audio and can send the toggle; the renderer refuses it without the device.
+  const { systemAudioOn, systemAudioAvailable } = described.state
+  if (typeof systemAudioOn !== 'boolean' || typeof systemAudioAvailable !== 'boolean') {
+    fail(`phone state lacks the system-audio booleans: ${JSON.stringify(described.state)}`)
+  }
+  const systemAudio = await device.intent({ kind: 'systemAudioToggle' })
+  if (systemAudioAvailable) {
+    if (!systemAudio.ok) fail(`systemAudioToggle was refused: ${systemAudio.message}`)
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 250))
+    const back = await device.intent({ kind: 'systemAudioToggle' })
+    if (!back.ok) fail(`systemAudioToggle back was refused: ${back.message}`)
+  } else if (systemAudio.ok || systemAudio.message !== 'System audio is not available.') {
+    fail(`systemAudioToggle without the device: ${JSON.stringify(systemAudio)}`)
+  }
+  console.log(
+    `remote-lan smoke: systemAudioToggle ${systemAudioAvailable ? 'applied' : 'refused without the device'} OK`
+  )
+
   const snapshot = await device.chatSnapshot()
   if (!Array.isArray(snapshot.messages) || snapshot.highlight?.phase !== 'idle') {
     fail(`unexpected chat snapshot: ${JSON.stringify(snapshot)}`)

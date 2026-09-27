@@ -2,8 +2,9 @@ import { isGlobalShortcutAction, type GlobalShortcutAction } from '../../../shar
 export type { GlobalShortcutAction } from '../../../shared/global-shortcuts'
 import { toast } from 'sonner'
 
-import type { GlobalShortcutsConfig, GlobalShortcutsResult } from '@/lib/backend'
+import type { DeviceStatus, GlobalShortcutsConfig, GlobalShortcutsResult } from '@/lib/backend'
 import { openSettingsTab } from '@/lib/settings-tabs'
+import { systemAudioTarget } from '@/lib/system-audio'
 
 type RegisterFn = (shortcuts: GlobalShortcutsConfig) => Promise<GlobalShortcutsResult>
 
@@ -15,6 +16,11 @@ export interface GlobalShortcutContext {
   toggleMicrophoneMute: () => void
   /** Plan 068 D6: mark a clip at the current moment. */
   markClip?: () => void
+  /** Plan 069 S6: the system-audio device status and the state the Studio
+   * shows (the session's confirmed mix, else the request). */
+  systemAudio?: readonly [status: DeviceStatus | undefined, shown: boolean]
+  /** Sets captureConfig.audio.systemAudioEnabled, exactly as the switch does. */
+  setSystemAudioEnabled?: (enabled: boolean) => void
   switchLayout?: (action: GlobalShortcutAction) => void
 }
 
@@ -45,7 +51,29 @@ export function executeGlobalShortcut(
     return
   }
   if (action === 'mic-toggle') context.toggleMicrophoneMute()
+  if (action === 'system-audio-toggle') toggleSystemAudio(context)
   if (action === 'clip-mark') context.markClip?.()
+}
+
+function toggleSystemAudio(context: GlobalShortcutContext): void {
+  const [status, shown] = context.systemAudio ?? [undefined, false]
+  const target = systemAudioTarget('toggle', status, shown)
+  if (target !== null) {
+    context.setSystemAudioEnabled?.(target)
+    return
+  }
+  // The key press did nothing, possibly with Videorc in the background: say
+  // why once (a fixed id), never flip a switch the device cannot honour.
+  if (status === 'permission-required') {
+    toast.warning('System audio needs Screen Recording access', {
+      id: 'global-shortcut-system-audio',
+      action: { label: 'Open Permissions', onClick: () => openSettingsTab('permissions') }
+    })
+  } else {
+    toast.warning('System audio is not available on this computer', {
+      id: 'global-shortcut-system-audio'
+    })
+  }
 }
 
 // Plan 062: the latest per-action registration outcome, so Settings can mark
