@@ -55,6 +55,8 @@ const captionTestMicrophoneId = 'microphone:coreaudio:4294967295'
 const rawTonePeak = 0.12
 const gainDb = 6
 const injectionMs = 3_000
+// Two 3 s transcription chunk windows plus margin (CAPTION_CHUNK_SECONDS).
+const mutedWindowSettleMs = 7_000
 
 mkdirSync(appDataDir, { recursive: true })
 const secretsPath = join(appDataDir, 'videorc-secrets.json')
@@ -178,9 +180,11 @@ try {
   await sleep(baselineMs)
 
   // The session starts muted. Raw tone packets enter the synthetic native
-  // source before controls; the fake service must receive a silent WAV and
-  // must not emit caption text. This is the privacy assertion the old direct
-  // caption-bus injector could not make.
+  // source before controls; the muted tap carries only silence, and silence
+  // is never uploaded (plan 068 D4), so the fake service must receive NO
+  // chunk for the muted window and no caption text may appear. This is the
+  // privacy assertion the old direct caption-bus injector could not make.
+  // The unmuted windows below prove the same task still uploads speech.
   const muteUpdate = await request(backend, timeoutMs, 'audio.processing.update', {
     sessionId: started.sessionId,
     microphoneGainDb: 0,
@@ -190,16 +194,25 @@ try {
     throw new Error(`Could not mute the active native source: ${JSON.stringify(muteUpdate)}`)
   }
   const mutedAudioStart = fake.state.chunkAudio.length
+  const mutedFramesBefore =
+    (await request(backend, timeoutMs, 'captions.status.get', {})).audioFramesSeen ?? 0
   const mutedInjection = await injectPreControlsPcm(smoke, started.sessionId)
-  await waitFor(
-    () => fake.state.chunkAudio.length > mutedAudioStart,
-    timeoutMs,
-    'muted caption WAV inspection'
-  )
-  const mutedAudio = fake.state.chunkAudio.slice(mutedAudioStart)
-  if (mutedAudio.some((audio) => audio.peak > 0.001)) {
+  // The injection resolves once its packets were generated in real time.
+  // Two more chunk windows guarantee every chunk holding muted audio was cut
+  // and reached the upload decision.
+  await sleep(mutedWindowSettleMs)
+  const mutedFramesAfter =
+    (await request(backend, timeoutMs, 'captions.status.get', {})).audioFramesSeen ?? 0
+  if (mutedFramesAfter <= mutedFramesBefore) {
     throw new Error(
-      `Muted pre-controls PCM reached captions audibly: ${JSON.stringify(mutedAudio)}`
+      `The caption tap saw no frames while muted (${mutedFramesBefore} -> ${mutedFramesAfter}); ` +
+        'an absent upload would prove nothing.'
+    )
+  }
+  const mutedAudio = fake.state.chunkAudio.slice(mutedAudioStart)
+  if (mutedAudio.length > 0) {
+    throw new Error(
+      `Muted pre-controls PCM was uploaded for transcription: ${JSON.stringify(mutedAudio)}`
     )
   }
   if (observed.updates.some((update) => update.kind === 'final' && update.text)) {
@@ -266,9 +279,11 @@ try {
       status.state === 'degraded' && status.transport === 'chunked' && status.providerReady === true
     )
   })
-  if (fake.state.chunkRequests < 3 || fake.state.audioAppends !== 0) {
+  // The muted window uploads nothing (above); the baseline and gain windows
+  // each upload at least one chunk.
+  if (fake.state.chunkRequests < 2 || fake.state.audioAppends !== 0) {
     throw new Error(
-      `Chunked caption service did not inspect the mute/gain windows: ${JSON.stringify(
+      `Chunked caption service did not inspect the baseline/gain windows: ${JSON.stringify(
         safeFakeCounters(fake.state)
       )}`
     )
