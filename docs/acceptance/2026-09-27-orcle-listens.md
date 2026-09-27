@@ -95,6 +95,46 @@ than before. The unmuted baseline and +6 dB windows still prove the same
 task uploads speech. The run then passed end to end, including the
 captioned-copy burn path that S3 gated behind presented records.
 
+## Review fixes (2026-09-27)
+
+The S10 review found one blocker and ten smaller issues. All are fixed on
+this branch in `2cd65f78`, `44189299` and `f5abaf54`, each with a
+regression test.
+
+| # | Finding | Fix | Regression test |
+| --- | --- | --- | --- |
+| 1a | A listen-only task asked the caption-gated realtime token route, so a caption quota or the captions switch ended listening | A task that starts without presentation goes straight to the metered chunk path and stays there | `a_listen_only_task_never_tries_realtime` |
+| 1b | With both intents on, a caption-scoped terminal failure ended the whole task | Scope by code and origin (`terminal_failure_scope`): the caption allowance, the captions switch (answered to a caption-metered request) and any realtime transport failure end captions only; the caption block is published as before, presentation turns off, and the chunk goes again as `purpose=listen`. Sign-in, Premium, the blocklist, server configuration and `ai-disabled` on a listen chunk end both | `terminal_failure_scope_table`, `caption_scoped_failures_never_stop_orcle_listening` |
+| 2 | Session end aborted a listen-only task before the capture drain; a voice mark in the drain was lost | `session.stop` and the recording monitor only clear the listen intent (`ListenStop::DrainIfCapturing` / `DrainWithCapture`); `finish_captions_for_capture` drains the task. Explicit stops still abort. The caption task carries its capture (`MarkTarget`: session id, records to file) to every final | `a_capture_end_drains_the_listen_task_and_an_explicit_stop_aborts_it`, `a_capture_end_stop_lets_the_listen_task_drain_and_an_explicit_stop_aborts`, `session_stop_lets_orcles_listen_task_drain_with_the_capture`, `a_voice_mark_heard_during_the_capture_end_drain_lands_on_its_session`, `the_caption_task_carries_its_capture_to_every_final` |
+| 3 | The pack ran for captions-only streams and defaulted on for everyone | The renderer records sessions whose Orcle listening reached `on`; the pack runs only for those. Without a choice in Publish the setting follows `listen`; an explicit choice wins | `post-stream-pack.test.ts`: `orcle-not-listening` skip, "follows Orcle listening by default", "runs only while Orcle listening is on", "never runs for a stream Orcle did not listen to" |
+| 4 | Sign-out left Orcle "listening" and kept what it heard | Sign-out publishes `blocked (signed-out)` and purges the transcript window, recent speech, the Clip that tail, voice activity, the pending transcript, summary, topic, promises, recap and voice greetings; a tick in flight is dropped. A listen epoch fences late publishes. Sign-in resumes listening | `sign_out_purges_what_orcle_heard_and_blocks_listening`, `sign_in_resumes_listening_for_a_running_session`, `sign_out_and_stops_fence_late_listening_publishes`, `forgetting_voice_keeps_chat_and_manual_greetings` |
+| 5 | The consent copy did not name the cloud step | Card, Settings, pane and popover: the microphone audio goes to Videorc's cloud speech-to-text to be turned into text; Videorc servers don't keep it; the transcript is saved with the recording on this computer | `cohost-view.test.ts`, `cohost-settings-section.test.ts`, `cohost-pane.test.ts` |
+| 6 | "Say hi" greeted RustLover when a Rust streamer said "rust" | Longer names match only whole or as neighbouring words in order; a name that is an everyday word (a small list) needs a greeting within three words | `transcript_mentions_name_table` (RustLover/rust, Pizza/hey pizza, Python, TheLegend27), `name_forms_follow_the_short_name_and_stop_word_rules`, `common_name_words_are_sorted_lowercase_unique_and_never_stop_words` |
+| 7 | A speech-only v3 tick to a rolled-back server fails `invalid-request` | No speech-only tick until one v3 tick succeeded this session | `speech_alone_waits_for_a_v3_answer_and_keeps_the_chat_mood` |
+| 8 | Speech-only ticks clobbered the chat mood | Mood and mood scores stay when the tick sent no chat | same test |
+| 9 | Rust capped by chars, the contract by UTF-16 units | Every emitted or echoed bounded text is cut by UTF-16 units on a char boundary (`truncate_utf16`); incoming v3 strings too | `every_bounded_text_counts_utf16_units_with_emoji_at_the_boundary`, `names_and_nudges_are_bounded_in_utf16_units` |
+| 10 | A final could show after captions turned off | Presentation is read, and `captions.update` emitted, under the coordinator lock `captions.stop` flips it under (chunked and realtime) | `a_final_after_captions_turned_off_never_shows` |
+| 11 | Quiet read as "starting" | A skipped silent chunk after real frames, or the first successful upload, makes the task ready (`on`, allowance unknown); the listen allowance refreshes from listen-metered answers at most every 30 s | `listen_readiness_reports_on_in_quiet_and_throttles_the_allowance`, `listen_joining_a_ready_task_is_on_at_once` |
+
+`smoke:captions-contract` now waits for the listen allowance, since
+listening may read `on` before the first upload.
+
+Gates after the fixes: `cargo fmt --check --all`, `cargo clippy -p
+videorc-backend -- -D warnings`, `cargo build --release -p videorc-backend`
+(no new warnings) all PASS. `env -u VIDEORC_PREMIUM_FEATURES cargo test -p
+videorc-backend` filters: `captions` 98, `cohost` 95, `clip` 26,
+`recording` 420 (+6 ignored), `ai::` 14, `protocol` 46, `live_chat` 71,
+`account` 62, `videorc_api` 18, `storage` 103, all PASS. `pnpm typecheck`,
+`pnpm lint`, `pnpm format:check` PASS; desktop tests 226 files, 2,296
+passed, 1 skipped; `pnpm test:scripts` 1,598 PASS; `pnpm build` PASS;
+renderer assets eager JS 1,995,044 raw / 385,079 gzip (entry 733,997 /
+146,421), 4,956 bytes of raw headroom. Smokes: `smoke:captions-contract`
+PASS (listen chunks=1), `smoke:cohost-fake` PASS (9 ticks over 44 messages;
+spotlight, Say hi by voice 1,001 ms after the final), `smoke:captions-live`
+PASS (SRT and captioned copy).
+
+Not changed here: the web privacy page copy (D3) lives in the web repo.
+
 ## Owner acceptance stream (S10, owed)
 
 One real stream on the packaged build, recorded, with the web branch
