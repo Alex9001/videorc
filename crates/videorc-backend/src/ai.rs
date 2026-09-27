@@ -69,7 +69,14 @@ pub async fn run_ai_workflow(
     // the Transcript card is Ready even before any cloud consent.
     let captions_transcript = captions_transcript_for(&input_path).await;
 
-    if let Some((srt_path, transcript_text)) = captions_transcript {
+    if let Some(CaptionsTranscript {
+        srt_path,
+        text: transcript_text,
+        timed_text,
+    }) = captions_transcript
+    {
+        // The card and the exported transcript.txt keep the plain prose; the
+        // job gets the timed text so chapters carry real times (plan 068 D10).
         let artifacts = vec![state.database.save_ai_artifact(
             &params.session_id,
             AiArtifactKind::Transcript,
@@ -101,7 +108,7 @@ pub async fn run_ai_workflow(
         let cloud_result = run_web_ai_job(
             &state,
             &params.session_id,
-            AiJobInput::Transcript(&transcript_text),
+            AiJobInput::Transcript(&timed_text),
             AiJobOptions {
                 outputs: params.outputs.clone(),
                 tone: params.tone.clone(),
@@ -275,12 +282,18 @@ async fn run_web_ai_job(
     } else {
         None
     };
+    // The server dedupes jobs by client request id alone, so the id carries
+    // the requested outputs/tone: a later full run must not get back the
+    // post-stream pack's publish_pack-only job (plan 068 D10).
+    let options_fingerprint = job_options_fingerprint(outputs.as_deref(), tone.as_deref());
     let client_request_id = match &input {
-        AiJobInput::Audio(audio_path) => ai_client_request_id(session_id, audio_path).await?,
-        AiJobInput::Transcript(transcript) => {
-            let hash = format!("{:x}", Sha256::digest(transcript.as_bytes()));
-            build_ai_client_request_id(session_id, &hash)
+        AiJobInput::Audio(audio_path) => {
+            ai_client_request_id(session_id, audio_path, &options_fingerprint).await?
         }
+        AiJobInput::Transcript(transcript) => build_ai_client_request_id(
+            session_id,
+            &ai_input_hash(transcript.as_bytes(), &options_fingerprint),
+        ),
     };
     let health_events = state.database.list_health_events(session_id)?;
     let health_events_json =
@@ -687,6 +700,13 @@ fn save_creator_intelligence_value_artifacts(
     creator_intelligence: &Value,
 ) -> Result<Vec<AiArtifact>> {
     let intelligence = object_or_empty(creator_intelligence);
+    // A per-kind job that did not ask for creator intelligence (the
+    // post-stream pack asks for publish_pack + social_posts only) returns
+    // null here. Saving five empty Ready artifacts would shadow real
+    // highlights and light the pipeline dot for a step that never ran.
+    if intelligence.is_empty() {
+        return Ok(Vec::new());
+    }
     Ok(vec![
         state.database.save_ai_artifact(
             session_id,
@@ -835,12 +855,46 @@ fn latest_local_transcript_text(state: &AppState, session_id: &str) -> Result<Op
         }))
 }
 
-async fn ai_client_request_id(session_id: &str, audio_path: &Path) -> Result<String> {
+async fn ai_client_request_id(
+    session_id: &str,
+    audio_path: &Path,
+    options_fingerprint: &str,
+) -> Result<String> {
     let audio = fs::read(audio_path)
         .await
         .with_context(|| format!("Could not read {}", audio_path.display()))?;
-    let hash = format!("{:x}", Sha256::digest(&audio));
-    Ok(build_ai_client_request_id(session_id, &hash))
+    Ok(build_ai_client_request_id(
+        session_id,
+        &ai_input_hash(&audio, options_fingerprint),
+    ))
+}
+
+/// The generation options that make one job differ from another over the
+/// same input. Empty for a default full run (no outputs filter, no tone).
+fn job_options_fingerprint(outputs: Option<&[String]>, tone: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(outputs) = outputs {
+        let mut outputs = outputs.to_vec();
+        outputs.sort();
+        outputs.dedup();
+        parts.push(format!("outputs={}", outputs.join(",")));
+    }
+    if let Some(tone) = tone {
+        parts.push(format!("tone={tone}"));
+    }
+    parts.join(";")
+}
+
+/// SHA-256 of the job input, plus the options fingerprint when there is one
+/// (so a default full run keeps the id it always had).
+fn ai_input_hash(input: &[u8], options_fingerprint: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    if !options_fingerprint.is_empty() {
+        hasher.update(b"\0");
+        hasher.update(options_fingerprint.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn build_ai_client_request_id(session_id: &str, audio_hash: &str) -> String {
@@ -1010,10 +1064,20 @@ pub struct CaptionCue {
     pub text: String,
 }
 
-/// Live captions write `<recording>.srt` next to the finished file
-/// (captions.rs). If it exists and parses to a non-empty transcript, the
-/// publish workflow can skip audio extraction and cloud transcription.
-async fn captions_transcript_for(input_path: &Path) -> Option<(PathBuf, String)> {
+/// The `<recording>.srt` transcript in the two shapes the workflow needs.
+struct CaptionsTranscript {
+    srt_path: PathBuf,
+    /// Plain prose, one cue per line: the Transcript card and transcript.txt.
+    text: String,
+    /// `[m:ss]` blocks (see `timed_transcript_text`): what the cloud job reads.
+    timed_text: String,
+}
+
+/// Live captions (or Orcle listening) write `<recording>.srt` next to the
+/// finished file (captions.rs). If it exists and parses to a non-empty
+/// transcript, the publish workflow can skip audio extraction and cloud
+/// transcription.
+async fn captions_transcript_for(input_path: &Path) -> Option<CaptionsTranscript> {
     let srt_path = input_path.with_extension("srt");
     let content = fs::read_to_string(&srt_path).await.ok()?;
     let cues = parse_srt(&content);
@@ -1021,7 +1085,127 @@ async fn captions_transcript_for(input_path: &Path) -> Option<(PathBuf, String)>
     if text.trim().is_empty() {
         return None;
     }
-    Some((srt_path, text))
+    Some(CaptionsTranscript {
+        srt_path,
+        text,
+        timed_text: timed_transcript_text(&cues),
+    })
+}
+
+/// A new timed-transcript block starts at the first cue this far past the
+/// current block's first cue.
+const TIMED_TRANSCRIPT_BLOCK_MS: u64 = 30_000;
+/// The web job route rejects transcripts over 120,000 characters
+/// (`transcript-too-large`); stay well under it.
+const TIMED_TRANSCRIPT_MAX_CHARS: usize = 110_000;
+
+/// The transcript the post-recording job reads: cues grouped into ~30 s
+/// blocks, one line per block, `[m:ss] words…` (`[h:mm:ss]` from an hour).
+/// That is the clock the web prompt already uses for its timestamped chat
+/// moments and YouTube uses for chapters, so the model reads one notation
+/// and its chapters carry real times instead of guesses (plan 068 D10).
+///
+/// Over `TIMED_TRANSCRIPT_MAX_CHARS` (counted in UTF-16 units, like the web's
+/// `string.length`), whole blocks are dropped from the START (the end of a
+/// stream is what the pack is about) and one note line says where the text
+/// now begins. An empty cue list gives an empty string.
+pub fn timed_transcript_text(cues: &[CaptionCue]) -> String {
+    timed_transcript_text_capped(cues, TIMED_TRANSCRIPT_MAX_CHARS)
+}
+
+fn timed_transcript_text_capped(cues: &[CaptionCue], max_chars: usize) -> String {
+    let blocks = timed_transcript_blocks(cues);
+    let lengths: Vec<usize> = blocks.iter().map(|(_, line)| utf16_len(line)).collect();
+    // Every kept line but the last is followed by one '\n'.
+    let mut kept_len = lengths.iter().sum::<usize>() + blocks.len().saturating_sub(1);
+    if kept_len <= max_chars {
+        return join_block_lines(&blocks);
+    }
+    for first in 1..blocks.len() {
+        kept_len -= lengths[first - 1] + 1;
+        let note = transcript_omitted_note(blocks[first].0);
+        if utf16_len(&note) + 1 + kept_len <= max_chars {
+            return format!("{note}\n{}", join_block_lines(&blocks[first..]));
+        }
+    }
+    // Only reachable when one block alone is over the cap: keep that block's
+    // newest words so the job still gets text inside the limit.
+    let Some((start_ms, line)) = blocks.last() else {
+        return String::new();
+    };
+    let note = transcript_omitted_note(*start_ms);
+    let budget = max_chars.saturating_sub(utf16_len(&note) + 1);
+    format!("{note}\n{}", utf16_tail(line, budget))
+}
+
+/// `(block start ms, "[m:ss] text text…")` for each ~30 s block, in cue order.
+fn timed_transcript_blocks(cues: &[CaptionCue]) -> Vec<(u64, String)> {
+    let mut blocks: Vec<(u64, String)> = Vec::new();
+    for cue in cues {
+        let text = cue.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match blocks.last_mut() {
+            Some((start_ms, line))
+                if cue.start_ms < start_ms.saturating_add(TIMED_TRANSCRIPT_BLOCK_MS) =>
+            {
+                line.push(' ');
+                line.push_str(text);
+            }
+            _ => blocks.push((
+                cue.start_ms,
+                format!("[{}] {text}", transcript_clock(cue.start_ms)),
+            )),
+        }
+    }
+    blocks
+}
+
+fn join_block_lines(blocks: &[(u64, String)]) -> String {
+    blocks
+        .iter()
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn transcript_omitted_note(start_ms: u64) -> String {
+    format!(
+        "[transcript starts at {}; earlier part omitted for length]",
+        transcript_clock(start_ms)
+    )
+}
+
+/// `m:ss` under an hour, `h:mm:ss` from an hour (seconds floored).
+fn transcript_clock(ms: u64) -> String {
+    let total_seconds = ms / 1000;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn utf16_len(text: &str) -> usize {
+    text.chars().map(char::len_utf16).sum()
+}
+
+/// The longest suffix of `text` that fits in `budget` UTF-16 units.
+fn utf16_tail(text: &str, budget: usize) -> &str {
+    let mut used = 0;
+    let mut start = text.len();
+    for (index, ch) in text.char_indices().rev() {
+        used += ch.len_utf16();
+        if used > budget {
+            break;
+        }
+        start = index;
+    }
+    &text[start..]
 }
 
 pub fn parse_srt(content: &str) -> Vec<CaptionCue> {
@@ -1302,6 +1486,218 @@ mod tests {
             caption_cues_text(&cues),
             "Welcome back everyone\ntoday we build the thing from scratch"
         );
+    }
+
+    fn cue_at(start_ms: u64, text: &str) -> CaptionCue {
+        CaptionCue {
+            start_ms,
+            end_ms: start_ms + 2_000,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn timed_transcript_groups_cues_into_thirty_second_blocks() {
+        let cues = vec![
+            cue_at(1_200, "Welcome back"),
+            cue_at(12_000, "today we build it"),
+            cue_at(31_199, "still the first block"),
+            cue_at(31_200, "a new block starts"),
+            cue_at(95_000, "after a pause"),
+        ];
+
+        assert_eq!(
+            timed_transcript_text(&cues),
+            "[0:01] Welcome back today we build it still the first block\n\
+             [0:31] a new block starts\n\
+             [1:35] after a pause"
+        );
+    }
+
+    #[test]
+    fn timed_transcript_uses_hours_from_the_first_hour() {
+        let cues = vec![
+            cue_at(3_599_999, "last words of the hour"),
+            cue_at(3_723_456, "into the second hour"),
+            cue_at(36_000_000, "ten hours in"),
+        ];
+
+        assert_eq!(
+            timed_transcript_text(&cues),
+            "[59:59] last words of the hour\n[1:02:03] into the second hour\n[10:00:00] ten hours in"
+        );
+    }
+
+    #[test]
+    fn timed_transcript_of_an_empty_srt_is_empty() {
+        assert_eq!(timed_transcript_text(&parse_srt("")), "");
+        assert_eq!(timed_transcript_text(&[]), "");
+    }
+
+    #[test]
+    fn timed_transcript_over_the_cap_drops_whole_blocks_from_the_start() {
+        // Ten blocks, 30 s apart, each "[m:ss] block N words…".
+        let cues: Vec<CaptionCue> = (0..10)
+            .map(|index| {
+                cue_at(
+                    index * 30_000,
+                    &format!("block {index} {}", "word ".repeat(20)),
+                )
+            })
+            .collect();
+        let full = timed_transcript_text_capped(&cues, usize::MAX);
+        let full_lines: Vec<&str> = full.lines().collect();
+        assert_eq!(full_lines.len(), 10);
+        assert_eq!(timed_transcript_text(&cues), full, "far under the real cap");
+
+        let cap = full.len() / 2;
+        let capped = timed_transcript_text_capped(&cues, cap);
+        assert!(utf16_len(&capped) <= cap, "{} > {cap}", utf16_len(&capped));
+        let mut lines = capped.lines();
+        let note = lines.next().unwrap();
+        let kept: Vec<&str> = lines.collect();
+        // The kept lines are the newest whole blocks, untouched.
+        assert!(!kept.is_empty() && kept.len() < 10);
+        assert_eq!(kept, full_lines[10 - kept.len()..].to_vec());
+        let first_kept = 10 - kept.len();
+        assert_eq!(
+            note,
+            format!(
+                "[transcript starts at {}; earlier part omitted for length]",
+                transcript_clock(first_kept as u64 * 30_000)
+            )
+        );
+        // As many blocks as fit: one more would break the cap.
+        let one_more = format!(
+            "{}\n{}",
+            transcript_omitted_note((first_kept as u64 - 1) * 30_000),
+            full_lines[first_kept - 1..].join("\n")
+        );
+        assert!(utf16_len(&one_more) > cap);
+    }
+
+    #[test]
+    fn timed_transcript_cap_counts_utf16_units_like_the_web() {
+        // "😀" is one char but two UTF-16 units; the web's `.length` counts two.
+        let cues = vec![cue_at(0, &"😀".repeat(100)), cue_at(30_000, "tail")];
+        let full = timed_transcript_text_capped(&cues, usize::MAX);
+        assert_eq!(full.chars().count(), 7 + 100 + 1 + 11);
+        assert_eq!(utf16_len(&full), 7 + 200 + 1 + 11);
+        // Fits by chars (119), not by UTF-16 units (219): it must be cut.
+        let capped = timed_transcript_text_capped(&cues, 150);
+        assert_eq!(
+            capped,
+            "[transcript starts at 0:30; earlier part omitted for length]\n[0:30] tail"
+        );
+    }
+
+    #[test]
+    fn timed_transcript_keeps_the_newest_words_when_one_block_is_over_the_cap() {
+        let cues = vec![cue_at(65_000, &"x".repeat(500))];
+        let capped = timed_transcript_text_capped(&cues, 200);
+        assert!(utf16_len(&capped) <= 200);
+        assert!(
+            capped.starts_with("[transcript starts at 1:05; earlier part omitted for length]\n")
+        );
+        assert!(capped.ends_with("xxx"));
+    }
+
+    #[test]
+    fn a_job_without_creator_intelligence_saves_no_empty_intelligence_artifacts() {
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let state = AppState::new(
+            "test-token".to_string(),
+            1234,
+            events,
+            crate::storage::Database::open_in_memory_for_tests(),
+        );
+        let job: AiJobSnapshot = serde_json::from_value(json!({
+            "artifacts": {
+                "creatorIntelligence": null,
+                "publishPack": {
+                    "title": "Shipping the thing",
+                    "titleVariants": ["Shipping the thing"],
+                    "description": "We ship it.",
+                    "summary": "Shipped.",
+                    "chapters": [{ "timestamp": "0:00", "title": "Intro" }]
+                },
+                "socialPosts": { "xPost": "Shipped", "xThread": [], "twitchTitle": "Shipping" },
+                "transcript": null,
+                "transcriptionMetadata": null
+            },
+            "clientRequestId": null,
+            "completedAt": null,
+            "costEstimateCents": null,
+            "createdAt": "2026-09-27T00:00:00Z",
+            "errorCode": null,
+            "errorMessage": null,
+            "id": "job-1",
+            "inputTokens": null,
+            "model": null,
+            "outputJson": null,
+            "outputTokens": null,
+            "provider": "videorc",
+            "runAttempts": 1,
+            "sessionClientId": "missing-session",
+            "startedAt": null,
+            "status": "completed",
+            "workflowKind": AI_WORKFLOW_KIND_POST_RECORDING
+        }))
+        .unwrap();
+
+        let owner = job.artifacts.as_ref().unwrap();
+        let saved = save_creator_intelligence_value_artifacts(
+            &state,
+            "missing-session",
+            &job,
+            &owner.creator_intelligence,
+        )
+        .unwrap();
+        assert!(saved.is_empty());
+    }
+
+    #[test]
+    fn a_partial_run_never_shares_a_request_id_with_the_full_run() {
+        let transcript = b"[0:00] hello";
+        // A default full run keeps the plain content hash it always had.
+        assert_eq!(
+            ai_input_hash(transcript, &job_options_fingerprint(None, None)),
+            format!("{:x}", Sha256::digest(transcript))
+        );
+        let pack = job_options_fingerprint(
+            Some(&["social_posts".to_string(), "publish_pack".to_string()]),
+            None,
+        );
+        assert_eq!(pack, "outputs=publish_pack,social_posts");
+        assert_eq!(
+            pack,
+            job_options_fingerprint(
+                Some(&["publish_pack".to_string(), "social_posts".to_string()]),
+                None
+            ),
+            "output order does not matter"
+        );
+        let full = ai_input_hash(transcript, "");
+        let partial = ai_input_hash(transcript, &pack);
+        let highlights = ai_input_hash(
+            transcript,
+            &job_options_fingerprint(Some(&["creator_intelligence".to_string()]), None),
+        );
+        let casual = ai_input_hash(
+            transcript,
+            &job_options_fingerprint(Some(&["publish_pack".to_string()]), Some("casual")),
+        );
+        assert_ne!(full, partial);
+        assert_ne!(partial, highlights);
+        assert_ne!(
+            casual,
+            ai_input_hash(
+                transcript,
+                &job_options_fingerprint(Some(&["publish_pack".to_string()]), None)
+            )
+        );
+        // Still a 64-hex digest, so the id stays inside the server's length cap.
+        assert_eq!(partial.len(), 64);
     }
 
     #[test]

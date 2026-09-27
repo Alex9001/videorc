@@ -221,11 +221,13 @@ export function AppShell(): ReactElement {
     setActive('ai')
   }, [])
 
-  // D6: the post-recording toast funnels here; clearing the selection lets
-  // Publish preselect the newest completed session (the one just saved).
+  // D6: the post-recording toasts funnel here. A `detail.sessionId` (the
+  // post-stream pack toast, plan 068 D10) selects that session; without one,
+  // clearing the selection lets Publish preselect the newest completed one.
   useEffect(() => {
-    const onOpenPublish = (): void => {
-      setSelectedSessionId(null)
+    const onOpenPublish = (event: Event): void => {
+      const sessionId = (event as CustomEvent<{ sessionId?: unknown } | null>).detail?.sessionId
+      setSelectedSessionId(typeof sessionId === 'string' ? sessionId : null)
       setActive('ai')
     }
     window.addEventListener('videorc:open-publish', onOpenPublish)

@@ -276,6 +276,7 @@ import type {
   OAuthCallbackEnvelope,
   OAuthStartResult,
   OAuthProviderCredentialStatus,
+  RecordingFinalizationEvent,
   RecordingStatus,
   RemoteControlStatus,
   RemoteLanPairing,
@@ -2017,6 +2018,12 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const sessionsRef = useRef<SessionSummary[]>([])
   sessionsRef.current = sessions
   const remuxSessionRef = useRef<((sessionId: string) => Promise<void>) | null>(null)
+  // Plan 068 D10: sessions whose transcript SRT landed (`captions-srt-written`
+  // precedes their `finalized` event), and the lazy post-stream pack trigger.
+  const transcriptWrittenSessionIdsRef = useRef(new Set<string>())
+  const autoRunPostStreamPackRef = useRef<((event: RecordingFinalizationEvent) => void) | null>(
+    null
+  )
   const [sessionsNextCursor, setSessionsNextCursor] = useState<string | null>(null)
   const [sessionsLoadingMore, setSessionsLoadingMore] = useState(false)
   const sessionListGenerationRef = useRef(0)
@@ -5898,6 +5905,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             }
           })
         }
+        if (event.state === 'finalized') {
+          autoRunPostStreamPackRef.current?.(event)
+        }
       }),
       nextClient.on('noiseCleanup.status', (payload) => {
         const job = payload
@@ -6079,6 +6089,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         }
         if (event.code.startsWith('recording-quality-')) {
           void refreshSessions(nextClient)
+        }
+        if (event.code === 'captions-srt-written' && event.sessionId) {
+          transcriptWrittenSessionIdsRef.current.add(event.sessionId)
         }
         if (event.code === 'microphone-input-lost') {
           void publishMicrophoneInputLost(event)
@@ -13018,6 +13031,33 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       reportError
     ]
   )
+  // Plan 068 D10: a finished streamed + recorded session with a transcript
+  // makes its own publish pack, once (lib/post-stream-pack.ts, lazy).
+  autoRunPostStreamPackRef.current = (event) => {
+    const activeClient = clientRef.current
+    const transcriptWritten = transcriptWrittenSessionIdsRef.current.delete(event.sessionId)
+    if (!activeClient) return
+    void import('@/lib/post-stream-pack')
+      .then((pack) =>
+        pack.autoRunPostStreamPack(event, {
+          request: activeClient.request.bind(activeClient),
+          sessions: sessionsRef.current,
+          transcriptWritten,
+          consent: aiConsent,
+          runningSessionId: aiRunningSessionId,
+          readiness: {
+            account,
+            capabilities: aiCapabilities,
+            error: aiReadinessError,
+            loading: aiReadinessLoading,
+            quota: aiQuota
+          },
+          setRunningSessionId: setAiRunningSessionId,
+          refreshSessions: () => refreshSessions(activeClient)
+        })
+      )
+      .catch(() => undefined)
+  }
 
   const exportPublishPack = useCallback(
     async (sessionId: string) => {

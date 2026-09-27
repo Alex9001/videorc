@@ -23,9 +23,10 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Empty, EmptyDescription, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
-import { Field, FieldContent, FieldLabel } from '@/components/ui/field'
+import { Field, FieldContent, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Switch } from '@/components/ui/switch'
 import { useVideorcAccount } from '@/hooks/use-account'
+import { setPostStreamPackAuto, usePostStreamPackAuto } from '@/hooks/use-post-stream-pack-auto'
 import { useStudioCore } from '@/hooks/use-studio'
 import { cloudAiReadiness } from '@/lib/ai-readiness'
 import {
@@ -88,6 +89,7 @@ export function AiTab({
     loading: aiReadinessLoading,
     quota: aiQuota
   })
+  const postStreamPackAuto = usePostStreamPackAuto()
 
   useEffect(() => {
     if (!selectedSessionId && sessions.length > 0) {
@@ -257,6 +259,24 @@ export function AiTab({
                   disabled={!cloudAi.ready}
                   id="ai-consent"
                   onCheckedChange={setAiConsent}
+                />
+              </Field>
+              {/* Plan 068 D10: the pack runs itself at stream end. A stored
+                  preference, so it stays flippable while cloud AI is off. */}
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldLabel htmlFor="post-stream-pack-auto">
+                    Make my post-stream pack automatically
+                  </FieldLabel>
+                  <FieldDescription>
+                    Runs once when a recorded stream with captions or Orcle listening ends.
+                    {aiConsent && cloudAi.ready ? null : ' Needs cloud upload.'}
+                  </FieldDescription>
+                </FieldContent>
+                <Switch
+                  checked={postStreamPackAuto}
+                  id="post-stream-pack-auto"
+                  onCheckedChange={setPostStreamPackAuto}
                 />
               </Field>
             </div>
