@@ -157,6 +157,25 @@ linux:
     - dir
     - AppImage
 
+# Install window, designed in Dmgly. The background already carries the
+# "Drag to Applications" text, the arrow and both label pills; Finder supplies
+# the real icons and filenames. Positions are icon centres in points and must
+# stay aligned with the baked-in pills. Finder shows only the GIF's first frame.
+dmg:
+  background: build-resources/dmgly/assets/dmg-background.gif
+  window:
+    width: 642
+    height: 406
+  iconSize: 128
+  contents:
+    - x: 152
+      y: 92
+      type: file
+    - x: 515
+      y: 258
+      type: link
+      path: /Applications
+
 nsis:
   oneClick: false
   perMachine: false
