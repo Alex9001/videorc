@@ -6,10 +6,13 @@
 
 ## Status and decisions
 
-- Status: **IN PROGRESS 2026-09-27**. Desktop branch `feat/orcle-listens`
-  (worktree `~/projects/videorc-wt-orcle-listens`), web branch
-  `feat/orcle-listens` (worktree `~/projects/videorcweb-wt-orcle-listens`).
-  Priority P1. Effort XL: about 8 agent-days over 10 slices in two repos.
+- Status: **IMPLEMENTED 2026-09-27** on `feat/orcle-listens` (desktop) and
+  web `feat/orcle-listens`; owner acceptance stream owed (S10). Desktop
+  worktree `~/projects/videorc-wt-orcle-listens`, rebased onto `origin/main`
+  `278ff17b` (0.9.116); web worktree `~/projects/videorcweb-wt-orcle-listens`.
+  Evidence and the owner checklist:
+  `docs/acceptance/2026-09-27-orcle-listens.md`. Priority P1. Effort XL:
+  about 8 agent-days over 10 slices in two repos.
   Risk MEDIUM-HIGH: touches the caption coordinator's lifecycle (not the
   audio thread), the co-host wire (v3, forward-tolerant), the Publish tab and
   clip export, and two web routes. No capture, preview, encoder or
@@ -321,6 +324,13 @@ Files: `ai.rs` (timed transcript), `hooks/use-studio.tsx`,
   transcript reaches Orcle, a "clip that" mark lands, no caption emits.
 - Docs: `docs/remote-control.md`, changelog entry draft,
   `docs/acceptance/2026-09-27-orcle-listens.md`.
+- As executed: the fake caption service records `purpose` (node test in
+  `test:scripts`); `smoke:captions-contract` gained the listen-only scenario
+  (purpose=listen, record kept, Orcle `listening: on`, zero `captions.*`
+  events). A "clip that" mark needs a recording, so it stays proved by the
+  `clip_marks` Rust tests, not a smoke. `smoke:captions-live` now asserts
+  that a muted window uploads nothing (D4). No changelog draft: entries are
+  written only at release time (`changelog/README.md`).
 
 ### S10. Review and owner acceptance (fable-5, Review route)
 
