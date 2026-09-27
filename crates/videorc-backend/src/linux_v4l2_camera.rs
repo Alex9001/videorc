@@ -10,6 +10,9 @@
 //!
 //! Access needs `video` group membership; a node the user cannot open is
 //! listed as permission-required with the fix named, never hidden.
+// The id parser is reachable on every platform (a stored id resolves
+// anywhere); discovery and capture are only called on Linux.
+#![cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 

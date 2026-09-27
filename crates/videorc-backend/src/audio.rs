@@ -1079,7 +1079,12 @@ fn timestamp_for_frame(frame_cursor: u64) -> u64 {
     frame_cursor.saturating_mul(1_000_000) / u64::from(NATIVE_AUDIO_SAMPLE_RATE)
 }
 
-#[cfg(any(test, target_os = "windows", target_os = "linux"))]
+// The Linux device ids (Pulse mics, V4L2 cameras) compile everywhere so a
+// stored id parses on any platform; only Windows and Linux build ids.
+#[cfg_attr(
+    not(any(test, target_os = "windows", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);

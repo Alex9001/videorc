@@ -10,6 +10,9 @@
 //! the backend row. Monitor sources (speaker loopback) are not microphones
 //! and stay unlisted. Parsing is pure and tested on every platform; the
 //! FFmpeg spawn is Linux-only.
+// The id parser and input args are reachable on every platform (a stored id
+// resolves anywhere); discovery is only called on Linux.
+#![cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 
 use crate::protocol::{Device, DeviceKind, DeviceStatus};
 
