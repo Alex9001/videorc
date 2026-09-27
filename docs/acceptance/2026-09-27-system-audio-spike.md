@@ -30,7 +30,14 @@ S4 must change (see "What S2 to S4 must do differently"):
 
 ## How it was run
 
-The spike is an ignored test:
+> S3 (2026-09-28) promoted the spike into the production producer
+> (`SystemAudioCapture`) and replaced it with the ignored live test
+> `system_audio_capture_live_tone` (`VIDEORC_SYSTEM_AUDIO_SPIKE=1 cargo test
+> -p videorc-backend system_audio_capture_live -- --ignored --nocapture`). The
+> knobs, WAV/JSON output and screen-sync analysis below no longer exist in the
+> tree; this section records how the S0 numbers were produced.
+
+The spike was an ignored test:
 
 ```sh
 VIDEORC_SYSTEM_AUDIO_SPIKE=1 VIDEORC_SYSTEM_AUDIO_SPIKE_DIR=<scratch> \

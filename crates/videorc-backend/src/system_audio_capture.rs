@@ -1,48 +1,85 @@
 //! macOS system audio capture through ScreenCaptureKit (plan 069).
 //!
-//! S0 (this file today) holds the pure helpers the spike proved, plus the
-//! debug-only spike itself: an `#[ignore]`d test gated on
-//! `VIDEORC_SYSTEM_AUDIO_SPIKE=1` that runs an audio-only SCStream and writes
-//! a WAV plus a JSON measurement summary. S3 grows this module into the real
-//! `ProducerSource::system` producer and promotes or deletes the spike.
+//! [`SystemAudioCapture`] owns one audio-only `SCStream` on its own dispatch
+//! queue and turns every audio `CMSampleBuffer` into a 48 kHz stereo
+//! interleaved f32 [`AudioFrame`] on a bounded channel. S4 wraps it as the
+//! session audio bus's System slot producer.
+//!
+//! Contract for the consumer:
+//! - [`SystemAudioCapture::start`] blocks for up to [`SYSTEM_AUDIO_START_BUDGET`]
+//!   (shareable-content discovery plus `startCapture`). Call it from a blocking
+//!   context, never from an async task directly.
+//! - Frames: `timestamp_micros` is the first sample's PTS on the host clock;
+//!   `captured_at` is the `Instant` at the END of the buffer (the convention
+//!   `SourceClock::new` and `trim_audio_frame_before_epoch` read).
+//! - Silence is not loss (decision 11). SCK may deliver zero buffers or no
+//!   buffers while nothing plays; this producer has no silence watchdog.
+//! - Loss is explicit: [`SystemAudioCapture::failure`] turns `Some` when the
+//!   stream stops with an error, and the frame channel then disconnects. A
+//!   disconnect with no failure means the capture was stopped on purpose.
+//! - [`SystemAudioCapture::stop`] and `Drop` are bounded by
+//!   [`SYSTEM_AUDIO_STOP_BUDGET`]; they never block forever.
+//!
+//! Own-app exclusion (decision 9 as amended by S0): the filter excludes the
+//! backend's parent process (the Electron main app) by pid, plus any app whose
+//! bundle id is the packaged Videorc id or one of its children. That only
+//! silences renderer audio because the Electron main process runs with
+//! `--disable-features=AudioServiceOutOfProcess` on macOS.
 //!
 //! Evidence and numbers: `docs/acceptance/2026-09-27-system-audio-spike.md`.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::audio::AudioFrame;
+use crate::protocol::DeviceStatus;
 
 /// SCK is asked for 48 kHz stereo (`setSampleRate`, `setChannelCount`) and
 /// delivered exactly that in S0; the bus consumes the same shape.
-#[allow(dead_code)] // wired in S3
 pub(crate) const SYSTEM_AUDIO_SAMPLE_RATE: u32 = 48_000;
-#[allow(dead_code)] // wired in S3
 pub(crate) const SYSTEM_AUDIO_CHANNELS: u16 = 2;
+
+/// Frames channel depth. SCK delivers 960-frame (20 ms) buffers, so 64 is
+/// 1.28 s of audio: enough to ride out S0's 665 ms startup burst.
+pub(crate) const SYSTEM_AUDIO_QUEUE_CAPACITY: usize = 64;
+
+/// How long `SCShareableContent` discovery may take before start gives up.
+const SHAREABLE_CONTENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `startCapture` may take. S0 measured 109 to 189 ms, once 737 ms.
+const START_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `stopCapture` may take before the owner stops waiting for it.
+const STOP_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The caller's bound on [`SystemAudioCapture::start`].
+pub(crate) const SYSTEM_AUDIO_START_BUDGET: Duration = Duration::from_secs(12);
+/// The caller's bound on [`SystemAudioCapture::stop`] and `Drop`.
+pub(crate) const SYSTEM_AUDIO_STOP_BUDGET: Duration = Duration::from_secs(3);
+
+/// `health.event` kind when system audio cannot start this session (the
+/// Screen Recording grant is missing, or the stream failed to start).
+pub(crate) const SYSTEM_AUDIO_UNAVAILABLE_HEALTH_KIND: &str = "system-audio-unavailable";
+/// `health.event` kind when a running system-audio stream stops. The session
+/// keeps running on the microphone.
+pub(crate) const SYSTEM_AUDIO_LOST_HEALTH_KIND: &str = "system-audio-lost";
 
 /// Bundle id of the packaged app (`apps/desktop/electron-builder.yml`
 /// `appId`). Its helpers are `dev.theorcdev.videorc.helper[.GPU|.Plugin|
 /// .Renderer]`.
-#[allow(dead_code)] // wired in S3
 pub(crate) const PACKAGED_VIDEORC_BUNDLE_ID: &str = "dev.theorcdev.videorc";
-/// Bundle id of the unpackaged Electron used by `pnpm dev`. Its helpers are
-/// all `com.github.Electron.helper`. Only exclude it when the backend's own
-/// parent is that dev Electron, or an unrelated Electron dev app goes mute.
-#[allow(dead_code)] // wired in S3
-pub(crate) const DEV_ELECTRON_BUNDLE_ID: &str = "com.github.Electron";
+
+/// `SCStreamErrorDomain` and the codes the classifier needs (`SCError.h`).
+/// Kept local so the mapping stays pure and testable.
+const SC_STREAM_ERROR_DOMAIN: &str = "com.apple.ScreenCaptureKit.SCStreamErrorDomain";
+const SC_STREAM_ERROR_USER_DECLINED: isize = -3801;
 
 // AudioStreamBasicDescription constants (CoreAudioBaseTypes.h). Kept local so
 // the conversion helpers stay pure and testable without CoreAudio.
-#[allow(dead_code)] // wired in S3
 const AUDIO_FORMAT_LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
-#[allow(dead_code)] // wired in S3
 const AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
-#[allow(dead_code)] // wired in S3
 const AUDIO_FORMAT_FLAG_IS_BIG_ENDIAN: u32 = 1 << 1;
-#[allow(dead_code)] // wired in S3
 const AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER: u32 = 1 << 2;
-#[allow(dead_code)] // wired in S3
 const AUDIO_FORMAT_FLAG_IS_NON_INTERLEAVED: u32 = 1 << 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // wired in S3
 pub(crate) enum PcmSampleKind {
     F32,
     I16,
@@ -50,7 +87,6 @@ pub(crate) enum PcmSampleKind {
 }
 
 impl PcmSampleKind {
-    #[allow(dead_code)] // wired in S3
     fn bytes(self) -> usize {
         match self {
             Self::F32 | Self::I32 => 4,
@@ -62,7 +98,6 @@ impl PcmSampleKind {
 /// The PCM shape of one ScreenCaptureKit audio sample buffer, taken from its
 /// `AudioStreamBasicDescription`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)] // wired in S3
 pub(crate) struct PcmLayout {
     pub(crate) sample_rate: f64,
     pub(crate) channels: u32,
@@ -74,7 +109,6 @@ pub(crate) struct PcmLayout {
 /// Classifies an `AudioStreamBasicDescription`. S0 measured SCK delivering
 /// `lpcm`, flags `0x29` (float | packed | non-interleaved), 32 bits, 2
 /// channels, 48000 Hz; other linear PCM shapes are accepted defensively.
-#[allow(dead_code)] // wired in S3
 pub(crate) fn pcm_layout_from_stream_description(
     format_id: u32,
     format_flags: u32,
@@ -121,8 +155,7 @@ pub(crate) fn pcm_layout_from_stream_description(
 /// planar, one interleaved buffer otherwise) into interleaved stereo f32 at
 /// the source rate. Mono is duplicated to both sides, channels past the
 /// second are dropped. A rate other than 48 kHz is rejected: S0 never saw
-/// one, so S3 resamples only if a real device ever proves it necessary.
-#[allow(dead_code)] // wired in S3
+/// one, so resampling is added only if a real device ever proves it necessary.
 pub(crate) fn interleaved_stereo_f32(
     layout: &PcmLayout,
     buffers: &[&[u8]],
@@ -179,7 +212,6 @@ pub(crate) fn interleaved_stereo_f32(
     Ok(output)
 }
 
-#[allow(dead_code)] // wired in S3
 fn decode_sample(kind: PcmSampleKind, bytes: &[u8]) -> f32 {
     match kind {
         PcmSampleKind::F32 => f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
@@ -190,7 +222,6 @@ fn decode_sample(kind: PcmSampleKind, bytes: &[u8]) -> f32 {
     }
 }
 
-#[allow(dead_code)] // wired in S3
 fn four_char_code(code: u32) -> String {
     let bytes = code.to_be_bytes();
     if bytes.iter().all(|byte| byte.is_ascii_graphic()) {
@@ -203,14 +234,12 @@ fn four_char_code(code: u32) -> String {
 /// `mach_timebase_info` ratio. Apple Silicon reports 125/3 (24 MHz ticks);
 /// Intel reports 1/1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // wired in S3
 pub(crate) struct MachTimebase {
     pub(crate) numer: u32,
     pub(crate) denom: u32,
 }
 
 impl MachTimebase {
-    #[allow(dead_code)] // wired in S3
     pub(crate) fn ticks_to_nanos(self, ticks: u64) -> u64 {
         if self.denom == 0 {
             return ticks;
@@ -225,7 +254,6 @@ impl MachTimebase {
 /// whose seconds are `mach_absolute_time` converted through the timebase. S0
 /// measured both audio and screen PTS at timescale 1_000_000_000.
 /// Returns `None` for an invalid or non-positive time.
-#[allow(dead_code)] // wired in S3
 pub(crate) fn cm_time_to_host_nanos(value: i64, timescale: i32, valid: bool) -> Option<u64> {
     if !valid || timescale <= 0 || value < 0 {
         return None;
@@ -239,7 +267,6 @@ pub(crate) fn cm_time_to_host_nanos(value: i64, timescale: i32, valid: bool) -> 
 /// so the offset between them is constant and one anchor per stream is
 /// enough; the anchor only has to be read with a small bracket.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // wired in S3
 pub(crate) struct HostClockAnchor {
     pub(crate) host_nanos: u64,
     pub(crate) instant: Instant,
@@ -247,7 +274,6 @@ pub(crate) struct HostClockAnchor {
 
 impl HostClockAnchor {
     /// The `Instant` at which the host clock read `host_nanos`.
-    #[allow(dead_code)] // wired in S3
     pub(crate) fn instant_for_host_nanos(&self, host_nanos: u64) -> Instant {
         if host_nanos >= self.host_nanos {
             self.instant + Duration::from_nanos(host_nanos - self.host_nanos)
@@ -260,7 +286,6 @@ impl HostClockAnchor {
     /// `AudioFrame::captured_at` for a buffer: the bus treats `captured_at`
     /// as the END of the frame (`trim_audio_frame_before_epoch`), so this is
     /// PTS (first sample) plus the buffer duration.
-    #[allow(dead_code)] // wired in S3
     pub(crate) fn buffer_end_instant(
         &self,
         pts_host_nanos: u64,
@@ -276,7 +301,25 @@ impl HostClockAnchor {
     }
 }
 
-#[cfg(target_os = "macos")]
+/// Builds the bus frame for one converted SCK buffer: `samples` is
+/// interleaved stereo at 48 kHz, `pts_host_nanos` is the first sample's PTS.
+/// `timestamp_micros` stays on the host clock (it advances by exact sample
+/// counts, S0 Q7), and `captured_at` is the buffer END, like the mic path.
+pub(crate) fn system_audio_frame(
+    samples: Vec<f32>,
+    pts_host_nanos: u64,
+    anchor: &HostClockAnchor,
+) -> AudioFrame {
+    let frames = samples.len() / usize::from(SYSTEM_AUDIO_CHANNELS);
+    AudioFrame {
+        timestamp_micros: pts_host_nanos / 1_000,
+        captured_at: anchor.buffer_end_instant(pts_host_nanos, frames, SYSTEM_AUDIO_SAMPLE_RATE),
+        sample_rate: SYSTEM_AUDIO_SAMPLE_RATE,
+        channels: SYSTEM_AUDIO_CHANNELS,
+        samples,
+    }
+}
+
 mod host_clock {
     use super::{HostClockAnchor, MachTimebase};
     use std::time::{Duration, Instant};
@@ -292,7 +335,6 @@ mod host_clock {
         fn mach_absolute_time() -> u64;
     }
 
-    #[allow(dead_code)] // wired in S3
     pub(crate) fn timebase() -> Option<MachTimebase> {
         let mut info = Timebase { numer: 0, denom: 0 };
         let status = unsafe { mach_timebase_info(&mut info) };
@@ -302,15 +344,13 @@ mod host_clock {
         })
     }
 
-    #[allow(dead_code)] // wired in S3
     pub(crate) fn host_nanos_now(timebase: MachTimebase) -> u64 {
         timebase.ticks_to_nanos(unsafe { mach_absolute_time() })
     }
 
     /// Reads an anchor with the host read bracketed by two `Instant`s,
     /// retrying until the bracket is under 50 µs.
-    #[allow(dead_code)] // wired in S3
-    pub(crate) fn sample_anchor(timebase: MachTimebase) -> (HostClockAnchor, Duration) {
+    pub(crate) fn sample_anchor(timebase: MachTimebase) -> HostClockAnchor {
         let mut best: Option<(HostClockAnchor, Duration)> = None;
         for _ in 0..5 {
             let before = Instant::now();
@@ -328,14 +368,13 @@ mod host_clock {
                 break;
             }
         }
-        best.expect("at least one anchor sample")
+        best.expect("at least one anchor sample").0
     }
 }
 
 /// True when `bundle_id` is `prefix` or one of its dotted children:
 /// `dev.theorcdev.videorc` matches itself and `dev.theorcdev.videorc.helper.GPU`
 /// but not `dev.theorcdev.videorcweb`.
-#[allow(dead_code)] // wired in S3
 pub(crate) fn bundle_id_matches_prefix(bundle_id: &str, prefix: &str) -> bool {
     if prefix.is_empty() {
         return false;
@@ -346,29 +385,43 @@ pub(crate) fn bundle_id_matches_prefix(bundle_id: &str, prefix: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
-/// Prefixes whose applications the system-audio filter must exclude: always
-/// the packaged id, plus the bundle id of the app that launched the backend
-/// (its Electron main process) when that is known and different. In `pnpm
-/// dev` that is `com.github.Electron`.
-#[allow(dead_code)] // wired in S3
-pub(crate) fn videorc_exclusion_prefixes(host_app_bundle_id: Option<&str>) -> Vec<String> {
-    let mut prefixes = vec![PACKAGED_VIDEORC_BUNDLE_ID.to_string()];
-    if let Some(host) = host_app_bundle_id
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        && !prefixes
-            .iter()
-            .any(|prefix| bundle_id_matches_prefix(host, prefix))
-    {
-        prefixes.push(host.to_string());
-    }
-    prefixes
+/// Which running applications the system-audio filter excludes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppExclusion {
+    pub(crate) bundle_prefixes: Vec<String>,
+    pub(crate) pids: Vec<i32>,
 }
 
-/// Indices of the running applications to pass to
-/// `initWithDisplay:excludingApplications:exceptingWindows:`: every app whose
-/// bundle id matches one of `prefixes`, or whose pid is in `pids` (the
-/// Electron main pid, for hosts without a bundle id).
+impl AppExclusion {
+    /// Videorc's own apps: the backend's parent (the Electron main process,
+    /// which spawns the backend directly; `com.github.Electron` in `pnpm
+    /// dev`) by pid, plus the packaged bundle id and its children as a
+    /// fallback. The dev Electron bundle id is deliberately NOT a prefix: it
+    /// would mute every unrelated Electron dev app. A parent pid of 1 or less
+    /// means the backend was orphaned or launched standalone; it names no app.
+    pub(crate) fn videorc(parent_pid: i32) -> Self {
+        Self {
+            bundle_prefixes: vec![PACKAGED_VIDEORC_BUNDLE_ID.to_string()],
+            pids: if parent_pid > 1 {
+                vec![parent_pid]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Indices into `applications` (bundle id, pid) to pass to
+    /// `initWithDisplay:excludingApplications:exceptingWindows:`.
+    pub(crate) fn matching_indices<'a>(
+        &self,
+        applications: impl IntoIterator<Item = (&'a str, i32)>,
+    ) -> Vec<usize> {
+        excluded_application_indices(applications, &self.bundle_prefixes, &self.pids)
+    }
+}
+
+/// Indices of the running applications whose bundle id matches one of
+/// `prefixes`, or whose pid is in `pids`.
 ///
 /// S0 proved app exclusion only silences audio the excluded app's OWN
 /// process plays. Chromium's default out-of-process audio service (a
@@ -376,7 +429,6 @@ pub(crate) fn videorc_exclusion_prefixes(host_app_bundle_id: Option<&str>) -> Ve
 /// list is only sufficient while Electron runs with
 /// `--disable-features=AudioServiceOutOfProcess` (renderer audio then plays
 /// from the main process).
-#[allow(dead_code)] // wired in S3
 pub(crate) fn excluded_application_indices<'a>(
     applications: impl IntoIterator<Item = (&'a str, i32)>,
     prefixes: &[String],
@@ -393,6 +445,791 @@ pub(crate) fn excluded_application_indices<'a>(
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Why system audio stopped or never started. Every failure is terminal: once
+/// one is recorded the producer delivers no more frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SystemAudioFailure {
+    /// The Screen Recording grant is missing (preflight false, or SCK
+    /// declined at start).
+    PermissionDenied(String),
+    /// Discovery or `startCapture` failed or timed out.
+    StartFailed(String),
+    /// A running stream stopped (`stream:didStopWithError:`), including a
+    /// grant revoked mid-session and "Stop sharing" from the menu bar.
+    StreamStopped(String),
+    /// SCK delivered audio this producer cannot convert (not 48 kHz linear
+    /// PCM). S0 never saw it; it is explicit rather than silent.
+    UnsupportedFormat(String),
+}
+
+/// When an error was reported, for [`classify_capture_error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemAudioPhase {
+    Starting,
+    Running,
+}
+
+#[allow(dead_code)] // wired in S4
+impl SystemAudioFailure {
+    /// The `health.event` kind S4 emits for this failure.
+    pub(crate) fn health_kind(&self) -> &'static str {
+        match self {
+            Self::PermissionDenied(_) | Self::StartFailed(_) => {
+                SYSTEM_AUDIO_UNAVAILABLE_HEALTH_KIND
+            }
+            Self::StreamStopped(_) | Self::UnsupportedFormat(_) => SYSTEM_AUDIO_LOST_HEALTH_KIND,
+        }
+    }
+
+    /// What this failure proves about the system-audio device row, if
+    /// anything. A stopped stream proves nothing about the device: the
+    /// platform probe (`devices.rs`) stays the authority.
+    pub(crate) fn device_status(&self) -> Option<DeviceStatus> {
+        match self {
+            Self::PermissionDenied(_) => Some(DeviceStatus::PermissionRequired),
+            Self::StartFailed(_) | Self::UnsupportedFormat(_) => Some(DeviceStatus::Unavailable),
+            Self::StreamStopped(_) => None,
+        }
+    }
+
+    /// The technical detail for logs and Diagnostics (not user copy).
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::PermissionDenied(message)
+            | Self::StartFailed(message)
+            | Self::StreamStopped(message)
+            | Self::UnsupportedFormat(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for SystemAudioFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+/// Maps an `NSError` from ScreenCaptureKit to a failure. At start, a declined
+/// grant (`SCStreamErrorUserDeclined`, or TCC wording from discovery) is a
+/// permission failure; anything else is a start failure. Once running, every
+/// error is a lost stream.
+pub(crate) fn classify_capture_error(
+    phase: SystemAudioPhase,
+    domain: &str,
+    code: isize,
+    description: &str,
+) -> SystemAudioFailure {
+    let message = format!("{description} ({domain} {code})");
+    match phase {
+        SystemAudioPhase::Running => SystemAudioFailure::StreamStopped(message),
+        SystemAudioPhase::Starting => {
+            let declined =
+                domain == SC_STREAM_ERROR_DOMAIN && code == SC_STREAM_ERROR_USER_DECLINED;
+            if declined || mentions_permission(description) {
+                SystemAudioFailure::PermissionDenied(message)
+            } else {
+                SystemAudioFailure::StartFailed(message)
+            }
+        }
+    }
+}
+
+fn mentions_permission(description: &str) -> bool {
+    let normalized = description.to_lowercase();
+    ["permission", "denied", "not authorized", "tcc", "declined"]
+        .iter()
+        .any(|needle| normalized.contains(needle))
+}
+
+/// Shared, first-wins failure record. The capture writes it from SCK
+/// callbacks; the consumer polls it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SystemAudioFailureSlot(Arc<Mutex<Option<SystemAudioFailure>>>);
+
+impl SystemAudioFailureSlot {
+    pub(crate) fn get(&self) -> Option<SystemAudioFailure> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Records `failure` unless one is already recorded. Returns whether it
+    /// was recorded.
+    pub(crate) fn record(&self, failure: SystemAudioFailure) -> bool {
+        let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(failure);
+        true
+    }
+}
+
+/// Snapshot of the producer counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SystemAudioCaptureStats {
+    /// Frames (per channel) converted from SCK buffers.
+    pub(crate) captured_frames: u64,
+    /// Frames dropped because the consumer's channel was full.
+    pub(crate) dropped_frames: u64,
+    /// SCK buffers that could not be converted.
+    pub(crate) rejected_buffers: u64,
+}
+
+/// The screen-capture preflight that also covers system audio ("Screen &
+/// System Audio Recording"). It neither prompts nor starts a stream.
+/// `devices.rs` (S1) makes the same call for the device row.
+pub(crate) fn screen_recording_permission_granted() -> bool {
+    objc2_core_graphics::CGPreflightScreenCaptureAccess()
+}
+
+/// The backend's parent pid: the Electron main process in the app.
+pub(crate) fn parent_pid() -> i32 {
+    // SAFETY: getppid has no preconditions and cannot fail.
+    unsafe { libc::getppid() }
+}
+
+#[allow(unused_imports)] // wired in S4
+pub(crate) use capture::{SystemAudioCapture, SystemAudioCaptureInfo, SystemAudioCaptureOptions};
+
+mod capture {
+    use std::ptr::{self, NonNull};
+    use std::slice;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use block2::RcBlock;
+    use dispatch2::{DispatchQueue, DispatchRetained};
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2::runtime::ProtocolObject;
+    use objc2::{AnyThread, DefinedClass, define_class, msg_send};
+    use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
+    use objc2_core_foundation::CFRetained;
+    use objc2_core_graphics::CGMainDisplayID;
+    use objc2_core_media::{
+        CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMSampleBuffer, CMTime,
+        CMTimeFlags, kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+    };
+    use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
+    use objc2_screen_capture_kit::{
+        SCContentFilter, SCRunningApplication, SCShareableContent, SCStream, SCStreamConfiguration,
+        SCStreamDelegate, SCStreamOutput, SCStreamOutputType, SCWindow,
+    };
+
+    use super::*;
+    use crate::audio::{AudioCaptureStats, AudioFrame};
+
+    /// Options for [`SystemAudioCapture::start`].
+    #[derive(Debug, Clone)]
+    pub(crate) struct SystemAudioCaptureOptions {
+        pub(crate) exclusion: AppExclusion,
+        pub(crate) queue_capacity: usize,
+    }
+
+    impl Default for SystemAudioCaptureOptions {
+        fn default() -> Self {
+            Self {
+                exclusion: AppExclusion::videorc(parent_pid()),
+                queue_capacity: SYSTEM_AUDIO_QUEUE_CAPACITY,
+            }
+        }
+    }
+
+    /// What the running stream excludes, for diagnostics.
+    #[derive(Debug, Clone, Default)]
+    pub(crate) struct SystemAudioCaptureInfo {
+        /// (bundle id, pid) of every excluded application.
+        pub(crate) excluded_apps: Vec<(String, i32)>,
+        /// Whether a pid named by the exclusion (the Electron main process)
+        /// was found and excluded. False means Videorc's own audio may leak.
+        pub(crate) pid_excluded: bool,
+        pub(crate) start_latency: Duration,
+    }
+
+    /// State shared by the SCK callbacks and the consumer handle.
+    struct CaptureShared {
+        sender: Mutex<Option<mpsc::SyncSender<AudioFrame>>>,
+        stats: Arc<AudioCaptureStats>,
+        rejected_buffers: AtomicU64,
+        failure: SystemAudioFailureSlot,
+        /// Set before a deliberate stop so late callbacks are ignored and a
+        /// stop error is not reported as loss.
+        stopping: AtomicBool,
+        anchor: HostClockAnchor,
+    }
+
+    impl CaptureShared {
+        fn push(&self, frame: AudioFrame) {
+            let frames = frame.frame_count() as u64;
+            self.stats.record_captured_frames(frames);
+            let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(sender) = sender.as_ref() else {
+                return;
+            };
+            if let Err(mpsc::TrySendError::Full(_)) = sender.try_send(frame) {
+                self.stats.record_dropped_frames(frames);
+            }
+        }
+
+        /// Records a terminal failure, stops accepting buffers, and
+        /// disconnects the frame channel. The failure is stored before the
+        /// disconnect, so a consumer that sees the disconnect can read it.
+        fn fail(&self, failure: SystemAudioFailure) {
+            if self.failure.record(failure.clone()) {
+                tracing::warn!(
+                    kind = failure.health_kind(),
+                    reason = %failure,
+                    "System audio capture failed"
+                );
+            }
+            self.stopping.store(true, Ordering::Release);
+            self.close();
+        }
+
+        fn close(&self) {
+            self.sender.lock().unwrap_or_else(|p| p.into_inner()).take();
+        }
+    }
+
+    struct DelegateIvars {
+        shared: Arc<CaptureShared>,
+    }
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[thread_kind = AnyThread]
+        #[name = "VideorcSystemAudioCaptureDelegate"]
+        #[ivars = DelegateIvars]
+        struct SystemAudioDelegate;
+
+        unsafe impl NSObjectProtocol for SystemAudioDelegate {}
+
+        #[allow(non_snake_case)]
+        unsafe impl SCStreamOutput for SystemAudioDelegate {
+            #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
+            unsafe fn stream_didOutputSampleBuffer_ofType(
+                &self,
+                _stream: &SCStream,
+                sample_buffer: &CMSampleBuffer,
+                output_type: SCStreamOutputType,
+            ) {
+                let shared = &self.ivars().shared;
+                if output_type != SCStreamOutputType::Audio
+                    || shared.stopping.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                match audio_frame_from_sample_buffer(sample_buffer, &shared.anchor) {
+                    Ok(Some(frame)) => shared.push(frame),
+                    Ok(None) => {}
+                    Err(error) => {
+                        shared.rejected_buffers.fetch_add(1, Ordering::Relaxed);
+                        shared.fail(SystemAudioFailure::UnsupportedFormat(error));
+                    }
+                }
+            }
+        }
+
+        #[allow(non_snake_case)]
+        unsafe impl SCStreamDelegate for SystemAudioDelegate {
+            #[unsafe(method(stream:didStopWithError:))]
+            unsafe fn stream_didStopWithError(&self, _stream: &SCStream, error: &NSError) {
+                let shared = &self.ivars().shared;
+                if shared.stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                shared.fail(failure_from_ns_error(SystemAudioPhase::Running, error));
+            }
+        }
+    );
+
+    impl SystemAudioDelegate {
+        fn new(shared: Arc<CaptureShared>) -> Retained<Self> {
+            let delegate = Self::alloc().set_ivars(DelegateIvars { shared });
+            unsafe { msg_send![super(delegate), init] }
+        }
+    }
+
+    fn failure_from_ns_error(phase: SystemAudioPhase, error: &NSError) -> SystemAudioFailure {
+        classify_capture_error(
+            phase,
+            &error.domain().to_string(),
+            error.code(),
+            &error.localizedDescription().to_string(),
+        )
+    }
+
+    /// Converts one SCK audio buffer. `Ok(None)` is an empty buffer.
+    fn audio_frame_from_sample_buffer(
+        sample_buffer: &CMSampleBuffer,
+        anchor: &HostClockAnchor,
+    ) -> Result<Option<AudioFrame>, String> {
+        let pts = unsafe { sample_buffer.presentation_time_stamp() };
+        let pts_host_nanos = cm_time_to_host_nanos(
+            pts.value,
+            pts.timescale,
+            pts.flags.contains(CMTimeFlags::Valid),
+        )
+        .ok_or("system audio buffer has no valid PTS")?;
+        let description = unsafe { sample_buffer.format_description() }
+            .ok_or("system audio buffer has no format description")?;
+        let asbd = unsafe { CMAudioFormatDescriptionGetStreamBasicDescription(&description) };
+        let asbd = unsafe { asbd.as_ref() }.ok_or("system audio format has no ASBD")?;
+        let layout = pcm_layout_from_stream_description(
+            asbd.mFormatID,
+            asbd.mFormatFlags,
+            asbd.mBitsPerChannel,
+            asbd.mChannelsPerFrame,
+            asbd.mSampleRate,
+        )?;
+
+        let mut size_needed = 0usize;
+        let status = unsafe {
+            sample_buffer.audio_buffer_list_with_retained_block_buffer(
+                &mut size_needed,
+                ptr::null_mut(),
+                0,
+                None,
+                None,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if status != 0 || size_needed == 0 {
+            return Err(format!(
+                "system audio buffer list size query failed: {status}"
+            ));
+        }
+        // u64 backing keeps the AudioBufferList pointer-aligned.
+        let mut storage = vec![0u64; size_needed.div_ceil(8)];
+        let list = storage.as_mut_ptr().cast::<AudioBufferList>();
+        let mut block: *mut CMBlockBuffer = ptr::null_mut();
+        let status = unsafe {
+            sample_buffer.audio_buffer_list_with_retained_block_buffer(
+                ptr::null_mut(),
+                list,
+                size_needed,
+                None,
+                None,
+                kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+                &mut block,
+            )
+        };
+        // Owns the retained block buffer (the sample memory) for this call.
+        let _block = NonNull::new(block).map(|raw| unsafe { CFRetained::from_raw(raw) });
+        if status != 0 {
+            return Err(format!("system audio buffer list read failed: {status}"));
+        }
+        let buffer_count = unsafe { (*list).mNumberBuffers } as usize;
+        let audio_buffers: &[AudioBuffer] = unsafe {
+            slice::from_raw_parts(
+                ptr::addr_of!((*list).mBuffers).cast::<AudioBuffer>(),
+                buffer_count,
+            )
+        };
+        let byte_slices: Vec<&[u8]> = audio_buffers
+            .iter()
+            .map(|buffer| {
+                if buffer.mData.is_null() {
+                    &[][..]
+                } else {
+                    unsafe {
+                        slice::from_raw_parts(
+                            buffer.mData.cast::<u8>(),
+                            buffer.mDataByteSize as usize,
+                        )
+                    }
+                }
+            })
+            .collect();
+        let samples = interleaved_stereo_f32(&layout, &byte_slices)?;
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(system_audio_frame(samples, pts_host_nanos, anchor)))
+    }
+
+    /// A running system-audio capture. Dropping it stops the stream (bounded).
+    ///
+    /// All ScreenCaptureKit objects live on a dedicated owner thread, so this
+    /// handle is `Send` and can be a session producer's owner.
+    pub(crate) struct SystemAudioCapture {
+        receiver: Option<mpsc::Receiver<AudioFrame>>,
+        shared: Arc<CaptureShared>,
+        info: SystemAudioCaptureInfo,
+        stop_tx: Option<mpsc::Sender<()>>,
+        done_rx: Option<mpsc::Receiver<()>>,
+        owner: Option<thread::JoinHandle<()>>,
+    }
+
+    #[allow(dead_code)] // wired in S4
+    impl SystemAudioCapture {
+        /// Starts an audio-only SCStream on the main display. Blocks for up to
+        /// [`SYSTEM_AUDIO_START_BUDGET`]; the first frame usually arrives 100
+        /// to 300 ms later (S0 saw up to ~840 ms, sometimes as a burst).
+        pub(crate) fn start(
+            options: SystemAudioCaptureOptions,
+        ) -> Result<Self, SystemAudioFailure> {
+            if !screen_recording_permission_granted() {
+                return Err(SystemAudioFailure::PermissionDenied(
+                    "Screen Recording (Screen & System Audio Recording) is not granted".into(),
+                ));
+            }
+            let timebase = host_clock::timebase().ok_or_else(|| {
+                SystemAudioFailure::StartFailed("mach_timebase_info is unavailable".into())
+            })?;
+            let (sender, receiver) = mpsc::sync_channel(options.queue_capacity.max(1));
+            let shared = Arc::new(CaptureShared {
+                sender: Mutex::new(Some(sender)),
+                stats: Arc::new(AudioCaptureStats::default()),
+                rejected_buffers: AtomicU64::new(0),
+                failure: SystemAudioFailureSlot::default(),
+                stopping: AtomicBool::new(false),
+                anchor: host_clock::sample_anchor(timebase),
+            });
+            let (startup_tx, startup_rx) = mpsc::channel();
+            let (stop_tx, stop_rx) = mpsc::channel::<()>();
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+            let owner_shared = Arc::clone(&shared);
+            let owner = thread::Builder::new()
+                .name("system-audio-owner".into())
+                .spawn(move || {
+                    run_owner(&options, &owner_shared, &startup_tx, &stop_rx);
+                    let _ = done_tx.send(());
+                })
+                .map_err(|error| {
+                    SystemAudioFailure::StartFailed(format!(
+                        "could not spawn the system audio owner: {error}"
+                    ))
+                })?;
+            let mut capture = Self {
+                receiver: Some(receiver),
+                shared,
+                info: SystemAudioCaptureInfo::default(),
+                stop_tx: Some(stop_tx),
+                done_rx: Some(done_rx),
+                owner: Some(owner),
+            };
+            match startup_rx.recv_timeout(SYSTEM_AUDIO_START_BUDGET) {
+                Ok(Ok(info)) => {
+                    tracing::info!(
+                        excluded_apps = ?info.excluded_apps,
+                        pid_excluded = info.pid_excluded,
+                        start_ms = info.start_latency.as_millis() as u64,
+                        "System audio capture started"
+                    );
+                    capture.info = info;
+                    Ok(capture)
+                }
+                Ok(Err(failure)) => Err(failure),
+                Err(_) => Err(SystemAudioFailure::StartFailed(format!(
+                    "system audio did not start within {} s",
+                    SYSTEM_AUDIO_START_BUDGET.as_secs()
+                ))),
+            }
+            // On every Err path `capture` drops here: the owner is told to
+            // stop and cleans up whatever it managed to start (bounded).
+        }
+
+        /// The frame channel. `None` after the first call.
+        pub(crate) fn take_receiver(&mut self) -> Option<mpsc::Receiver<AudioFrame>> {
+            self.receiver.take()
+        }
+
+        /// The counters as the bus's `AudioCaptureStats` (captured/dropped).
+        pub(crate) fn stats_handle(&self) -> Arc<AudioCaptureStats> {
+            Arc::clone(&self.shared.stats)
+        }
+
+        pub(crate) fn stats(&self) -> SystemAudioCaptureStats {
+            SystemAudioCaptureStats {
+                captured_frames: self.shared.stats.captured_frames(),
+                dropped_frames: self.shared.stats.dropped_frames(),
+                rejected_buffers: self.shared.rejected_buffers.load(Ordering::Relaxed),
+            }
+        }
+
+        /// The terminal failure, once one happened.
+        pub(crate) fn failure(&self) -> Option<SystemAudioFailure> {
+            self.shared.failure.get()
+        }
+
+        /// A clone of the failure slot, for a consumer that polls it after
+        /// this handle moved into a producer owner.
+        pub(crate) fn failure_slot(&self) -> SystemAudioFailureSlot {
+            self.shared.failure.clone()
+        }
+
+        pub(crate) fn info(&self) -> &SystemAudioCaptureInfo {
+            &self.info
+        }
+
+        /// Stops the stream and waits up to [`SYSTEM_AUDIO_STOP_BUDGET`].
+        /// Returns false if the owner did not finish in time (it is then
+        /// left to finish on its own).
+        pub(crate) fn stop(mut self) -> bool {
+            self.shutdown()
+        }
+
+        fn shutdown(&mut self) -> bool {
+            let Some(stop_tx) = self.stop_tx.take() else {
+                return true;
+            };
+            self.shared.stopping.store(true, Ordering::Release);
+            let _ = stop_tx.send(());
+            let finished = self
+                .done_rx
+                .take()
+                .is_some_and(|done| done.recv_timeout(SYSTEM_AUDIO_STOP_BUDGET).is_ok());
+            if finished {
+                if let Some(owner) = self.owner.take() {
+                    let _ = owner.join();
+                }
+            } else {
+                // Never block forever: detach the owner; it still stops the
+                // stream and releases it when SCK answers.
+                self.owner.take();
+                self.shared.close();
+                tracing::warn!(
+                    "System audio capture did not stop within {} s",
+                    SYSTEM_AUDIO_STOP_BUDGET.as_secs()
+                );
+            }
+            finished
+        }
+    }
+
+    impl Drop for SystemAudioCapture {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    struct Session {
+        stream: Retained<SCStream>,
+        delegate: Retained<SystemAudioDelegate>,
+        _filter: Retained<SCContentFilter>,
+        _configuration: Retained<SCStreamConfiguration>,
+        _queue: DispatchRetained<DispatchQueue>,
+    }
+
+    impl Session {
+        /// Stops capture (bounded) and removes the output. Runs on the owner.
+        fn shutdown(self, shared: &CaptureShared) {
+            shared.stopping.store(true, Ordering::Release);
+            autoreleasepool(|_| {
+                if let Err(error) = stop_capture(&self.stream) {
+                    tracing::warn!(reason = %error, "System audio stopCapture did not complete");
+                }
+                unsafe {
+                    let _ = self.stream.removeStreamOutput_type_error(
+                        ProtocolObject::from_ref(&*self.delegate),
+                        SCStreamOutputType::Audio,
+                    );
+                }
+            });
+            shared.close();
+        }
+    }
+
+    fn run_owner(
+        options: &SystemAudioCaptureOptions,
+        shared: &Arc<CaptureShared>,
+        startup_tx: &mpsc::Sender<Result<SystemAudioCaptureInfo, SystemAudioFailure>>,
+        stop_rx: &mpsc::Receiver<()>,
+    ) {
+        let opened = autoreleasepool(|_| open_session(options, shared));
+        match opened {
+            Ok((session, info)) => {
+                let _ = startup_tx.send(Ok(info));
+                // Returns on stop, or at once when the handle is gone (a
+                // start timeout or a dropped capture).
+                let _ = stop_rx.recv();
+                session.shutdown(shared);
+            }
+            Err(failure) => {
+                shared.failure.record(failure.clone());
+                shared.close();
+                let _ = startup_tx.send(Err(failure));
+            }
+        }
+    }
+
+    fn open_session(
+        options: &SystemAudioCaptureOptions,
+        shared: &Arc<CaptureShared>,
+    ) -> Result<(Session, SystemAudioCaptureInfo), SystemAudioFailure> {
+        let content = shareable_content()?;
+        let main_display_id = CGMainDisplayID();
+        let displays = unsafe { content.displays() };
+        let display = (0..displays.count())
+            .map(|index| displays.objectAtIndex(index))
+            .find(|display| unsafe { display.displayID() } == main_display_id)
+            .or_else(|| (displays.count() > 0).then(|| displays.objectAtIndex(0)))
+            .ok_or_else(|| {
+                SystemAudioFailure::StartFailed("ScreenCaptureKit lists no display".into())
+            })?;
+
+        let applications = unsafe { content.applications() };
+        let listed: Vec<(String, i32)> = (0..applications.count())
+            .map(|index| {
+                let app = applications.objectAtIndex(index);
+                unsafe { (app.bundleIdentifier().to_string(), app.processID()) }
+            })
+            .collect();
+        let indices = options
+            .exclusion
+            .matching_indices(listed.iter().map(|(id, pid)| (id.as_str(), *pid)));
+        let excluded: Vec<Retained<SCRunningApplication>> = indices
+            .iter()
+            .map(|&index| applications.objectAtIndex(index))
+            .collect();
+        let excluded_apps: Vec<(String, i32)> =
+            indices.iter().map(|&index| listed[index].clone()).collect();
+        let pid_excluded = options
+            .exclusion
+            .pids
+            .iter()
+            .any(|pid| excluded_apps.iter().any(|(_, excluded)| excluded == pid));
+        if !options.exclusion.pids.is_empty() && !pid_excluded {
+            tracing::warn!(
+                pids = ?options.exclusion.pids,
+                "System audio could not find the Videorc app to exclude; its own audio may be captured"
+            );
+        }
+
+        let filter = unsafe {
+            SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                SCContentFilter::alloc(),
+                &display,
+                &NSArray::from_retained_slice(&excluded),
+                &NSArray::<SCWindow>::new(),
+            )
+        };
+        // Audio only: a 2x2 px, 1 fps video config and no Screen output.
+        // `setCaptureMicrophone` is deliberately not called (macOS 15+ only).
+        let configuration = unsafe { SCStreamConfiguration::new() };
+        unsafe {
+            configuration.setWidth(2);
+            configuration.setHeight(2);
+            configuration.setMinimumFrameInterval(CMTime::new(1, 1));
+            configuration.setQueueDepth(3);
+            configuration.setShowsCursor(false);
+            configuration.setCapturesAudio(true);
+            configuration.setExcludesCurrentProcessAudio(true);
+            configuration.setSampleRate(SYSTEM_AUDIO_SAMPLE_RATE as isize);
+            configuration.setChannelCount(SYSTEM_AUDIO_CHANNELS as isize);
+        }
+        let delegate = SystemAudioDelegate::new(Arc::clone(shared));
+        let stream = unsafe {
+            SCStream::initWithFilter_configuration_delegate(
+                SCStream::alloc(),
+                &filter,
+                &configuration,
+                Some(ProtocolObject::from_ref(&*delegate)),
+            )
+        };
+        let queue = DispatchQueue::new("dev.theorcdev.videorc.system-audio", None);
+        unsafe {
+            stream.addStreamOutput_type_sampleHandlerQueue_error(
+                ProtocolObject::from_ref(&*delegate),
+                SCStreamOutputType::Audio,
+                Some(&queue),
+            )
+        }
+        .map_err(|error| failure_from_ns_error(SystemAudioPhase::Starting, &error))?;
+        let session = Session {
+            stream,
+            delegate,
+            _filter: filter,
+            _configuration: configuration,
+            _queue: queue,
+        };
+
+        let started = Instant::now();
+        if let Err(failure) = start_capture(&session.stream) {
+            // A timed-out start may still complete later; stop it anyway.
+            session.shutdown(shared);
+            return Err(failure);
+        }
+        Ok((
+            session,
+            SystemAudioCaptureInfo {
+                excluded_apps,
+                pid_excluded,
+                start_latency: started.elapsed(),
+            },
+        ))
+    }
+
+    struct SendContent(Retained<SCShareableContent>);
+    // SAFETY: the retained SCShareableContent is only moved from the
+    // completion-handler thread to the waiting owner thread, never shared.
+    unsafe impl Send for SendContent {}
+
+    fn shareable_content() -> Result<Retained<SCShareableContent>, SystemAudioFailure> {
+        let (tx, rx) = mpsc::channel();
+        let handler = RcBlock::new(
+            move |content: *mut SCShareableContent, error: *mut NSError| {
+                let result = match unsafe { error.as_ref() } {
+                    Some(error) => Err(failure_from_ns_error(SystemAudioPhase::Starting, error)),
+                    None => unsafe { Retained::retain(content) }
+                        .map(SendContent)
+                        .ok_or_else(|| {
+                            SystemAudioFailure::StartFailed(
+                                "ScreenCaptureKit returned no shareable content".into(),
+                            )
+                        }),
+                };
+                let _ = tx.send(result);
+            },
+        );
+        // All apps, not only on-screen ones: the Electron main app must be
+        // listed even with every window hidden.
+        unsafe {
+            SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+                false, false, &handler,
+            );
+        }
+        rx.recv_timeout(SHAREABLE_CONTENT_TIMEOUT)
+            .map_err(|_| {
+                SystemAudioFailure::StartFailed("ScreenCaptureKit discovery timed out".into())
+            })?
+            .map(|content| content.0)
+    }
+
+    fn start_capture(stream: &SCStream) -> Result<(), SystemAudioFailure> {
+        let (tx, rx) = mpsc::channel();
+        let handler = RcBlock::new(move |error: *mut NSError| {
+            let result = match unsafe { error.as_ref() } {
+                Some(error) => Err(failure_from_ns_error(SystemAudioPhase::Starting, error)),
+                None => Ok(()),
+            };
+            let _ = tx.send(result);
+        });
+        unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
+        rx.recv_timeout(START_CAPTURE_TIMEOUT).map_err(|_| {
+            SystemAudioFailure::StartFailed("ScreenCaptureKit startCapture timed out".into())
+        })?
+    }
+
+    fn stop_capture(stream: &SCStream) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        let handler = RcBlock::new(move |error: *mut NSError| {
+            let _ = tx.send(
+                unsafe { error.as_ref() }
+                    .map(|error| format!("{} ({})", error.localizedDescription(), error.code())),
+            );
+        });
+        unsafe { stream.stopCaptureWithCompletionHandler(Some(&handler)) };
+        match rx.recv_timeout(STOP_CAPTURE_TIMEOUT) {
+            Ok(None) => Ok(()),
+            Ok(Some(error)) => Err(error),
+            Err(_) => Err("timed out".into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +1409,40 @@ mod tests {
     }
 
     #[test]
+    fn system_audio_frame_follows_the_bus_clock_convention() {
+        let base = Instant::now() + Duration::from_secs(10);
+        let anchor = HostClockAnchor {
+            host_nanos: 7_000_000_000,
+            instant: base,
+        };
+        // One S0-shaped buffer: 960 frames (20 ms), PTS 100 ms after the anchor.
+        let pts = 7_100_000_000;
+        let frame = system_audio_frame(vec![0.25; 960 * 2], pts, &anchor);
+        assert_eq!(frame.sample_rate, 48_000);
+        assert_eq!(frame.channels, 2);
+        assert_eq!(frame.frame_count(), 960);
+        assert_eq!(frame.timestamp_micros, 7_100_000);
+        assert_eq!(frame.captured_at, base + Duration::from_millis(120));
+        // `SourceClock::new` recovers the first sample's instant as
+        // `captured_at - duration()`: that must be the PTS instant.
+        let start = frame.captured_at - frame.duration();
+        let pts_instant = anchor.instant_for_host_nanos(pts);
+        let skew = if start > pts_instant {
+            start - pts_instant
+        } else {
+            pts_instant - start
+        };
+        assert!(skew <= Duration::from_micros(1), "skew {skew:?}");
+        // Consecutive buffers advance `timestamp_micros` by exactly 20 ms.
+        let next = system_audio_frame(vec![0.0; 960 * 2], pts + 20_000_000, &anchor);
+        assert_eq!(next.timestamp_micros - frame.timestamp_micros, 20_000);
+        assert_eq!(
+            next.captured_at - frame.captured_at,
+            Duration::from_millis(20)
+        );
+    }
+
+    #[test]
     fn system_audio_bundle_prefix_matches_only_dotted_children() {
         let prefix = PACKAGED_VIDEORC_BUNDLE_ID;
         assert!(bundle_id_matches_prefix("dev.theorcdev.videorc", prefix));
@@ -588,26 +1459,17 @@ mod tests {
     }
 
     #[test]
-    fn system_audio_exclusion_prefixes_add_the_dev_host_once() {
+    fn system_audio_videorc_exclusion_names_the_parent_pid_and_the_packaged_id() {
         assert_eq!(
-            videorc_exclusion_prefixes(None),
-            vec![PACKAGED_VIDEORC_BUNDLE_ID.to_string()]
+            AppExclusion::videorc(4242),
+            AppExclusion {
+                bundle_prefixes: vec![PACKAGED_VIDEORC_BUNDLE_ID.to_string()],
+                pids: vec![4242],
+            }
         );
-        assert_eq!(
-            videorc_exclusion_prefixes(Some(DEV_ELECTRON_BUNDLE_ID)),
-            vec![
-                PACKAGED_VIDEORC_BUNDLE_ID.to_string(),
-                DEV_ELECTRON_BUNDLE_ID.to_string()
-            ]
-        );
-        assert_eq!(
-            videorc_exclusion_prefixes(Some("dev.theorcdev.videorc")),
-            vec![PACKAGED_VIDEORC_BUNDLE_ID.to_string()]
-        );
-        assert_eq!(
-            videorc_exclusion_prefixes(Some("  ")),
-            vec![PACKAGED_VIDEORC_BUNDLE_ID.to_string()]
-        );
+        // Orphaned (launchd) or unknown parents name no app.
+        assert!(AppExclusion::videorc(1).pids.is_empty());
+        assert!(AppExclusion::videorc(0).pids.is_empty());
     }
 
     #[test]
@@ -627,472 +1489,162 @@ mod tests {
             ("com.github.Electron.helper", 3001),
             ("dev.theorcdev.videorcweb", 4000),
             ("", 5000),
+            ("com.github.Electron", 6000),
         ];
-        let packaged_only = videorc_exclusion_prefixes(None);
+        // Packaged app: its main process is the parent; the prefix also
+        // catches its helpers and any second packaged instance.
         assert_eq!(
-            excluded_application_indices(running, &packaged_only, &[]),
+            AppExclusion::videorc(1000).matching_indices(running),
             vec![1, 2, 3, 4]
         );
-        let dev = videorc_exclusion_prefixes(Some(DEV_ELECTRON_BUNDLE_ID));
+        // `pnpm dev`: the parent is the dev Electron (pid 3000). Only that
+        // process is excluded, not the unrelated Electron dev app (pid 6000).
         assert_eq!(
-            excluded_application_indices(running, &dev, &[5000]),
-            vec![1, 2, 3, 4, 7, 8, 10]
+            AppExclusion::videorc(3000).matching_indices(running),
+            vec![1, 2, 3, 4, 7]
         );
+        // A parent without a bundle id is still excluded by pid.
+        assert_eq!(
+            AppExclusion::videorc(5000).matching_indices(running),
+            vec![1, 2, 3, 4, 10]
+        );
+        // Standalone backend: only the packaged prefix applies.
+        assert_eq!(
+            AppExclusion::videorc(1).matching_indices(running),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn system_audio_errors_classify_by_phase_and_permission() {
+        let declined = classify_capture_error(
+            SystemAudioPhase::Starting,
+            SC_STREAM_ERROR_DOMAIN,
+            SC_STREAM_ERROR_USER_DECLINED,
+            "The user declined TCCs for application, window, display capture",
+        );
+        assert!(matches!(declined, SystemAudioFailure::PermissionDenied(_)));
+        assert!(declined.message().contains("-3801"), "{declined}");
+
+        // TCC wording from discovery counts as permission even off-domain.
+        assert!(matches!(
+            classify_capture_error(
+                SystemAudioPhase::Starting,
+                "NSOSStatusErrorDomain",
+                -1,
+                "Screen recording permission denied"
+            ),
+            SystemAudioFailure::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            classify_capture_error(
+                SystemAudioPhase::Starting,
+                SC_STREAM_ERROR_DOMAIN,
+                -3818,
+                "Failed to start audio capture"
+            ),
+            SystemAudioFailure::StartFailed(_)
+        ));
+        // Once running, everything is loss, a revoked grant included.
+        assert!(matches!(
+            classify_capture_error(
+                SystemAudioPhase::Running,
+                SC_STREAM_ERROR_DOMAIN,
+                SC_STREAM_ERROR_USER_DECLINED,
+                "The user declined"
+            ),
+            SystemAudioFailure::StreamStopped(_)
+        ));
+        assert!(matches!(
+            classify_capture_error(
+                SystemAudioPhase::Running,
+                SC_STREAM_ERROR_DOMAIN,
+                -3821,
+                "System stopped the stream"
+            ),
+            SystemAudioFailure::StreamStopped(_)
+        ));
+    }
+
+    #[test]
+    fn system_audio_failures_map_to_health_kinds_and_device_status() {
+        let cases = [
+            (
+                SystemAudioFailure::PermissionDenied("p".into()),
+                "system-audio-unavailable",
+                Some(DeviceStatus::PermissionRequired),
+            ),
+            (
+                SystemAudioFailure::StartFailed("s".into()),
+                "system-audio-unavailable",
+                Some(DeviceStatus::Unavailable),
+            ),
+            (
+                SystemAudioFailure::StreamStopped("x".into()),
+                "system-audio-lost",
+                None,
+            ),
+            (
+                SystemAudioFailure::UnsupportedFormat("f".into()),
+                "system-audio-lost",
+                Some(DeviceStatus::Unavailable),
+            ),
+        ];
+        for (failure, kind, status) in cases {
+            assert_eq!(failure.health_kind(), kind, "{failure:?}");
+            assert_eq!(failure.device_status(), status, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn system_audio_failure_slot_keeps_the_first_failure() {
+        let slot = SystemAudioFailureSlot::default();
+        assert_eq!(slot.get(), None);
+        assert!(slot.record(SystemAudioFailure::StreamStopped("first".into())));
+        assert!(!slot.record(SystemAudioFailure::StartFailed("second".into())));
+        let reader = slot.clone();
+        assert_eq!(
+            reader.get(),
+            Some(SystemAudioFailure::StreamStopped("first".into()))
+        );
+    }
+
+    #[test]
+    fn system_audio_capture_handle_can_be_a_producer_owner() {
+        fn assert_send<T: Send + 'static>() {}
+        assert_send::<SystemAudioCapture>();
+        assert_send::<SystemAudioFailureSlot>();
     }
 }
 
-/// The S0 spike: an audio-only SCStream that writes a WAV and a JSON summary.
+/// Live capture check (plan 069 S3), promoted from the S0 spike. Needs the
+/// host terminal's Screen Recording grant and plays a short 1 kHz tone
+/// through the current output with `afplay`. Volume, mute and output device
+/// are left alone: SCK captures before the master volume (S0 Q4).
 ///
 /// Run: `VIDEORC_SYSTEM_AUDIO_SPIKE=1 cargo test -p videorc-backend
-/// system_audio_spike -- --ignored --nocapture`. Knobs (all optional):
-/// - `VIDEORC_SYSTEM_AUDIO_SPIKE_SECONDS` capture length (default 30)
-/// - `VIDEORC_SYSTEM_AUDIO_SPIKE_DIR` output dir (default temp dir)
-/// - `VIDEORC_SYSTEM_AUDIO_SPIKE_LABEL` output file stem (default `spike`)
-/// - `VIDEORC_SYSTEM_AUDIO_SPIKE_EXCLUDE` comma-separated bundle-id prefixes
-///   to exclude (default: packaged + dev Electron ids; `none` for no apps,
-///   `all` for every listed application)
-/// - `VIDEORC_SYSTEM_AUDIO_SPIKE_EXCLUDE_CURRENT_PROCESS=0` control run
-/// - `VIDEORC_SYSTEM_AUDIO_SPIKE_SELF_TONE_AT=<s>` plays a 3 s 1 kHz tone
-///   from inside the test process starting at `s` seconds
-/// - `VIDEORC_SYSTEM_AUDIO_SPIKE_SCREEN=1` adds a SECOND SCStream with only a
-///   Screen output (the product shape: separate streams) and pairs flash and
-///   click onsets from the A/V sync stimulus to measure capture-level o_sys
-#[cfg(all(test, target_os = "macos"))]
-mod spike {
-    use std::fs;
-    use std::path::PathBuf;
-    use std::ptr::{self, NonNull};
-    use std::slice;
-    use std::sync::{Arc, Mutex, mpsc};
-    use std::thread;
+/// system_audio_capture_live -- --ignored --nocapture`.
+#[cfg(test)]
+mod live {
+    use std::process::Command;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use block2::RcBlock;
-    use dispatch2::DispatchQueue;
-    use objc2::rc::{Retained, autoreleasepool};
-    use objc2::runtime::ProtocolObject;
-    use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-    use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
-    use objc2_core_foundation::CFRetained;
-    use objc2_core_graphics::{CGMainDisplayID, CGPreflightScreenCaptureAccess};
-    use objc2_core_media::{
-        CMAudioFormatDescriptionGetStreamBasicDescription, CMBlockBuffer, CMSampleBuffer, CMTime,
-        CMTimeFlags, kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-    };
-    use objc2_core_video::{
-        CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
-        CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-        CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
-    };
-    use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
-    use objc2_screen_capture_kit::{
-        SCContentFilter, SCRunningApplication, SCShareableContent, SCStream, SCStreamConfiguration,
-        SCStreamDelegate, SCStreamOutput, SCStreamOutputType, SCWindow,
-    };
-    use serde_json::json;
-
-    use super::host_clock;
     use super::*;
 
-    unsafe extern "C-unwind" {
-        // CoreMedia (already linked through objc2-core-media). Declared here
-        // because the crate's `CMSync` feature is off; used only to cross-check
-        // `cm_time_to_host_nanos` against Apple's own conversion.
-        fn CMClockConvertHostTimeToSystemUnits(host_time: CMTime) -> u64;
-    }
+    const TONE_HZ: f64 = 1_000.0;
+    const TONE_AMPLITUDE: f64 = 0.25; // -12 dBFS in the file
 
-    #[derive(Default)]
-    struct AudioBufferRecord {
-        pts_nanos: u64,
-        pts_value: i64,
-        pts_timescale: i32,
-        arrival_host_nanos: u64,
-        pts_ticks_nanos: u64,
-        frames: usize,
-        peak: f32,
-        first_sample_index: usize,
-    }
-
-    struct ScreenFrameRecord {
-        pts_nanos: u64,
-        arrival_host_nanos: u64,
-        luma: f32,
-    }
-
-    #[derive(Default)]
-    struct SpikeState {
-        audio_buffers: Vec<AudioBufferRecord>,
-        samples: Vec<f32>,
-        format: Option<serde_json::Value>,
-        format_errors: Vec<String>,
-        screen_frames: Vec<ScreenFrameRecord>,
-        unexpected_output_types: Vec<isize>,
-        stop_errors: Vec<String>,
-    }
-
-    struct SpikeIvars {
-        state: Arc<Mutex<SpikeState>>,
-        timebase: MachTimebase,
-    }
-
-    define_class!(
-        #[unsafe(super(NSObject))]
-        #[thread_kind = AnyThread]
-        #[name = "VideorcSystemAudioSpikeDelegate"]
-        #[ivars = SpikeIvars]
-        struct SpikeDelegate;
-
-        unsafe impl NSObjectProtocol for SpikeDelegate {}
-
-        #[allow(non_snake_case)]
-        unsafe impl SCStreamOutput for SpikeDelegate {
-            #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
-            unsafe fn stream_didOutputSampleBuffer_ofType(
-                &self,
-                _stream: &SCStream,
-                sample_buffer: &CMSampleBuffer,
-                output_type: SCStreamOutputType,
-            ) {
-                let arrival = host_clock::host_nanos_now(self.ivars().timebase);
-                let mut state = self
-                    .ivars()
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if output_type == SCStreamOutputType::Audio {
-                    record_audio(sample_buffer, arrival, &mut state);
-                } else if output_type == SCStreamOutputType::Screen {
-                    record_screen(sample_buffer, arrival, &mut state);
-                } else {
-                    state.unexpected_output_types.push(output_type.0);
-                }
-            }
+    fn write_tone_wav(path: &std::path::Path, seconds: f64) {
+        let rate = SYSTEM_AUDIO_SAMPLE_RATE;
+        let frames = (seconds * f64::from(rate)) as usize;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for index in 0..frames {
+            let value = (TONE_AMPLITUDE
+                * (2.0 * std::f64::consts::PI * TONE_HZ * index as f64 / f64::from(rate)).sin())
+                as f32;
+            samples.extend_from_slice(&[value, value]);
         }
-
-        #[allow(non_snake_case)]
-        unsafe impl SCStreamDelegate for SpikeDelegate {
-            #[unsafe(method(stream:didStopWithError:))]
-            unsafe fn stream_didStopWithError(&self, _stream: &SCStream, error: &NSError) {
-                let mut state = self
-                    .ivars()
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.stop_errors.push(format!(
-                    "{} ({})",
-                    error.localizedDescription(),
-                    error.code()
-                ));
-            }
-        }
-    );
-
-    impl SpikeDelegate {
-        fn new(state: Arc<Mutex<SpikeState>>, timebase: MachTimebase) -> Retained<Self> {
-            let delegate = Self::alloc().set_ivars(SpikeIvars { state, timebase });
-            unsafe { msg_send![super(delegate), init] }
-        }
-    }
-
-    fn cm_time_nanos(time: CMTime) -> Option<u64> {
-        cm_time_to_host_nanos(
-            time.value,
-            time.timescale,
-            time.flags.contains(CMTimeFlags::Valid),
-        )
-    }
-
-    fn record_audio(sample_buffer: &CMSampleBuffer, arrival: u64, state: &mut SpikeState) {
-        let pts = unsafe { sample_buffer.presentation_time_stamp() };
-        let Some(pts_nanos) = cm_time_nanos(pts) else {
-            state
-                .format_errors
-                .push("audio buffer without a valid PTS".into());
-            return;
-        };
-        let pts_ticks_nanos = host_clock::timebase()
-            .map(|tb| tb.ticks_to_nanos(unsafe { CMClockConvertHostTimeToSystemUnits(pts) }))
-            .unwrap_or(0);
-        let Some(description) = (unsafe { sample_buffer.format_description() }) else {
-            state
-                .format_errors
-                .push("audio buffer without a format".into());
-            return;
-        };
-        let asbd = unsafe { CMAudioFormatDescriptionGetStreamBasicDescription(&description) };
-        let Some(asbd) = (unsafe { asbd.as_ref() }) else {
-            state
-                .format_errors
-                .push("audio format without an ASBD".into());
-            return;
-        };
-        let layout = match pcm_layout_from_stream_description(
-            asbd.mFormatID,
-            asbd.mFormatFlags,
-            asbd.mBitsPerChannel,
-            asbd.mChannelsPerFrame,
-            asbd.mSampleRate,
-        ) {
-            Ok(layout) => layout,
-            Err(error) => {
-                state.format_errors.push(error);
-                return;
-            }
-        };
-
-        let mut size_needed = 0usize;
-        let status = unsafe {
-            sample_buffer.audio_buffer_list_with_retained_block_buffer(
-                &mut size_needed,
-                ptr::null_mut(),
-                0,
-                None,
-                None,
-                0,
-                ptr::null_mut(),
-            )
-        };
-        if status != 0 || size_needed == 0 {
-            state
-                .format_errors
-                .push(format!("buffer list size query failed: {status}"));
-            return;
-        }
-        // u64 backing keeps the AudioBufferList pointer-aligned.
-        let mut storage = vec![0u64; size_needed.div_ceil(8)];
-        let list = storage.as_mut_ptr().cast::<AudioBufferList>();
-        let mut block: *mut CMBlockBuffer = ptr::null_mut();
-        let status = unsafe {
-            sample_buffer.audio_buffer_list_with_retained_block_buffer(
-                ptr::null_mut(),
-                list,
-                size_needed,
-                None,
-                None,
-                kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-                &mut block,
-            )
-        };
-        // Owns the retained block buffer for the rest of this call.
-        let _block = NonNull::new(block).map(|raw| unsafe { CFRetained::from_raw(raw) });
-        if status != 0 {
-            state
-                .format_errors
-                .push(format!("buffer list read failed: {status}"));
-            return;
-        }
-        let buffer_count = unsafe { (*list).mNumberBuffers } as usize;
-        let audio_buffers: &[AudioBuffer] = unsafe {
-            slice::from_raw_parts(
-                ptr::addr_of!((*list).mBuffers).cast::<AudioBuffer>(),
-                buffer_count,
-            )
-        };
-        let byte_slices: Vec<&[u8]> = audio_buffers
-            .iter()
-            .map(|buffer| {
-                if buffer.mData.is_null() {
-                    &[][..]
-                } else {
-                    unsafe {
-                        slice::from_raw_parts(
-                            buffer.mData.cast::<u8>(),
-                            buffer.mDataByteSize as usize,
-                        )
-                    }
-                }
-            })
-            .collect();
-
-        if state.format.is_none() {
-            state.format = Some(json!({
-                "formatId": four_char_code(asbd.mFormatID),
-                "formatFlags": format!("{:#x}", asbd.mFormatFlags),
-                "sampleRate": asbd.mSampleRate,
-                "channelsPerFrame": asbd.mChannelsPerFrame,
-                "bitsPerChannel": asbd.mBitsPerChannel,
-                "bytesPerFrame": asbd.mBytesPerFrame,
-                "bytesPerPacket": asbd.mBytesPerPacket,
-                "framesPerPacket": asbd.mFramesPerPacket,
-                "audioBufferCount": buffer_count,
-                "channelsPerAudioBuffer": audio_buffers.iter().map(|b| b.mNumberChannels).collect::<Vec<_>>(),
-                "layout": format!("{layout:?}"),
-                "numSamples": unsafe { sample_buffer.num_samples() },
-                "ptsTimescale": pts.timescale,
-            }));
-        }
-
-        match interleaved_stereo_f32(&layout, &byte_slices) {
-            Ok(samples) => {
-                let peak = samples.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
-                let first_sample_index = state.samples.len() / 2;
-                state.audio_buffers.push(AudioBufferRecord {
-                    pts_nanos,
-                    pts_value: pts.value,
-                    pts_timescale: pts.timescale,
-                    arrival_host_nanos: arrival,
-                    pts_ticks_nanos,
-                    frames: samples.len() / 2,
-                    peak,
-                    first_sample_index,
-                });
-                state.samples.extend_from_slice(&samples);
-            }
-            Err(error) => state.format_errors.push(error),
-        }
-    }
-
-    fn record_screen(sample_buffer: &CMSampleBuffer, arrival: u64, state: &mut SpikeState) {
-        let Some(pts_nanos) = cm_time_nanos(unsafe { sample_buffer.presentation_time_stamp() })
-        else {
-            return;
-        };
-        // Idle/blank frames carry no image buffer; only complete frames count.
-        let Some(pixel_buffer) = (unsafe { sample_buffer.image_buffer() }) else {
-            return;
-        };
-        let lock = unsafe {
-            CVPixelBufferLockBaseAddress(&pixel_buffer, CVPixelBufferLockFlags::ReadOnly)
-        };
-        if lock != 0 {
-            return;
-        }
-        let width = CVPixelBufferGetWidth(&pixel_buffer);
-        let height = CVPixelBufferGetHeight(&pixel_buffer);
-        let stride = CVPixelBufferGetBytesPerRow(&pixel_buffer);
-        let base = CVPixelBufferGetBaseAddress(&pixel_buffer).cast::<u8>();
-        let mut sum = 0.0f64;
-        let mut count = 0usize;
-        if !base.is_null() {
-            let bytes = unsafe { slice::from_raw_parts(base, stride * height) };
-            for y in (0..height).step_by(4) {
-                for x in (0..width).step_by(4) {
-                    let offset = y * stride + x * 4;
-                    let (b, g, r) = (bytes[offset], bytes[offset + 1], bytes[offset + 2]);
-                    sum += 0.0722 * f64::from(b) + 0.7152 * f64::from(g) + 0.2126 * f64::from(r);
-                    count += 1;
-                }
-            }
-        }
-        unsafe {
-            CVPixelBufferUnlockBaseAddress(&pixel_buffer, CVPixelBufferLockFlags::ReadOnly);
-        }
-        if count > 0 {
-            state.screen_frames.push(ScreenFrameRecord {
-                pts_nanos,
-                arrival_host_nanos: arrival,
-                luma: (sum / count as f64) as f32,
-            });
-        }
-    }
-
-    struct SendContent(Retained<SCShareableContent>);
-    // SAFETY: the retained SCShareableContent is only moved from the
-    // completion-handler thread to the waiting test thread, never shared.
-    unsafe impl Send for SendContent {}
-
-    fn shareable_content() -> Result<Retained<SCShareableContent>, String> {
-        let (tx, rx) = mpsc::channel();
-        let handler = RcBlock::new(
-            move |content: *mut SCShareableContent, error: *mut NSError| {
-                let result = if let Some(error) = unsafe { error.as_ref() } {
-                    Err(format!(
-                        "{} ({})",
-                        error.localizedDescription(),
-                        error.code()
-                    ))
-                } else {
-                    unsafe { Retained::retain(content) }
-                        .map(SendContent)
-                        .ok_or_else(|| "no shareable content".to_string())
-                };
-                let _ = tx.send(result);
-            },
-        );
-        // All apps, not only on-screen ones: background helpers must be
-        // visible to the exclusion builder.
-        unsafe {
-            SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-                false, false, &handler,
-            );
-        }
-        rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "shareable content timed out".to_string())?
-            .map(|content| content.0)
-    }
-
-    fn start(stream: &SCStream) -> Result<Duration, String> {
-        let (tx, rx) = mpsc::channel();
-        let started = Instant::now();
-        let handler = RcBlock::new(move |error: *mut NSError| {
-            let result = match unsafe { error.as_ref() } {
-                Some(error) => Err(format!(
-                    "{} (domain {}, code {})",
-                    error.localizedDescription(),
-                    error.domain(),
-                    error.code()
-                )),
-                None => Ok(()),
-            };
-            let _ = tx.send(result);
-        });
-        unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
-        rx.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "start timed out".to_string())??;
-        Ok(started.elapsed())
-    }
-
-    fn stop(stream: &SCStream) {
-        let (tx, rx) = mpsc::channel();
-        let handler = RcBlock::new(move |_error: *mut NSError| {
-            let _ = tx.send(());
-        });
-        unsafe { stream.stopCaptureWithCompletionHandler(Some(&handler)) };
-        let _ = rx.recv_timeout(Duration::from_secs(3));
-    }
-
-    fn env_flag(name: &str) -> Option<String> {
-        std::env::var(name).ok().filter(|value| !value.is_empty())
-    }
-
-    /// Plays a 1 kHz sine from THIS process through the default output, to
-    /// prove `excludesCurrentProcessAudio`.
-    fn play_self_tone(seconds: f64) -> coreaudio::audio_unit::AudioUnit {
-        use coreaudio::audio_unit::render_callback::{self, data};
-        use coreaudio::audio_unit::{AudioUnit, IOType};
-        let mut unit = AudioUnit::new(IOType::DefaultOutput).expect("default output unit");
-        let rate = unit
-            .output_stream_format()
-            .expect("output format")
-            .sample_rate;
-        let total = (seconds * rate) as u64;
-        let mut index = 0u64;
-        type Args = render_callback::Args<data::NonInterleaved<f32>>;
-        unit.set_render_callback(move |args: Args| {
-            let Args {
-                num_frames,
-                mut data,
-                ..
-            } = args;
-            for frame in 0..num_frames {
-                let value = if index < total {
-                    (0.3 * (2.0 * std::f64::consts::PI * 1000.0 * index as f64 / rate).sin()) as f32
-                } else {
-                    0.0
-                };
-                index += 1;
-                for channel in data.channels_mut() {
-                    channel[frame] = value;
-                }
-            }
-            Ok(())
-        })
-        .expect("render callback");
-        unit.start().expect("start self tone");
-        unit
-    }
-
-    fn write_wav_f32(path: &PathBuf, samples: &[f32], rate: u32, channels: u16) {
         let data_bytes = (samples.len() * 4) as u32;
         let mut out = Vec::with_capacity(44 + data_bytes as usize);
         out.extend_from_slice(b"RIFF");
@@ -1100,506 +1652,149 @@ mod spike {
         out.extend_from_slice(b"WAVEfmt ");
         out.extend_from_slice(&16u32.to_le_bytes());
         out.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
-        out.extend_from_slice(&channels.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
         out.extend_from_slice(&rate.to_le_bytes());
-        out.extend_from_slice(&(rate * u32::from(channels) * 4).to_le_bytes());
-        out.extend_from_slice(&(channels * 4).to_le_bytes());
+        out.extend_from_slice(&(rate * 2 * 4).to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes());
         out.extend_from_slice(&32u16.to_le_bytes());
         out.extend_from_slice(b"data");
         out.extend_from_slice(&data_bytes.to_le_bytes());
         for sample in samples {
             out.extend_from_slice(&sample.to_le_bytes());
         }
-        fs::write(path, out).expect("write wav");
+        std::fs::write(path, out).expect("write tone wav");
     }
 
-    /// Rising-edge onsets with a 500 ms refractory period.
-    fn onsets(points: impl Iterator<Item = (f64, f32)>, threshold: f32) -> Vec<f64> {
-        let mut found: Vec<f64> = Vec::new();
-        let mut above = false;
-        for (time, value) in points {
-            let is_above = value >= threshold;
-            if is_above && !above && found.last().is_none_or(|last| time - last > 0.5) {
-                found.push(time);
-            }
-            above = is_above;
+    /// Amplitude of the `TONE_HZ` component of the left channel (Goertzel).
+    /// Unlike a plain peak it ignores whatever else the Mac is playing.
+    fn tone_amplitude(samples: &[f32]) -> f64 {
+        let n = samples.len() / 2;
+        if n == 0 {
+            return 0.0;
         }
-        found
-    }
-
-    /// Pairs each audio onset with the nearest video onset within 300 ms and
-    /// returns `audio - video` in milliseconds.
-    fn paired_offsets_ms(audio: &[f64], video: &[f64]) -> Vec<f64> {
-        audio
-            .iter()
-            .filter_map(|a| {
-                video
-                    .iter()
-                    .map(|v| a - v)
-                    .filter(|delta| delta.abs() <= 0.3)
-                    .min_by(|x, y| x.abs().total_cmp(&y.abs()))
-                    .map(|delta| delta * 1000.0)
-            })
-            .collect()
-    }
-
-    fn stats(values: &[f64]) -> serde_json::Value {
-        if values.is_empty() {
-            return json!({ "count": 0 });
+        let coefficient = 2.0
+            * (2.0 * std::f64::consts::PI * TONE_HZ / f64::from(SYSTEM_AUDIO_SAMPLE_RATE)).cos();
+        let (mut previous, mut before) = (0.0f64, 0.0f64);
+        for frame in samples.chunks_exact(2) {
+            let current = f64::from(frame[0]) + coefficient * previous - before;
+            before = previous;
+            previous = current;
         }
-        let mut sorted = values.to_vec();
-        sorted.sort_by(f64::total_cmp);
-        let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
-        json!({
-            "count": sorted.len(),
-            "medianMs": sorted[sorted.len() / 2],
-            "meanMs": mean,
-            "minMs": sorted[0],
-            "maxMs": sorted[sorted.len() - 1],
-        })
+        let power = previous * previous + before * before - coefficient * previous * before;
+        2.0 * power.max(0.0).sqrt() / n as f64
     }
 
-    fn analyze_sync(state: &SpikeState, origin: u64) -> serde_json::Value {
-        let rate = f64::from(SYSTEM_AUDIO_SAMPLE_RATE);
-        let seconds = |nanos: u64| (nanos as f64 - origin as f64) / 1.0e9;
-        let audio_points = |use_arrival: bool| {
-            state.audio_buffers.iter().flat_map(move |buffer| {
-                (0..buffer.frames).map(move |frame| {
-                    let index = (buffer.first_sample_index + frame) * 2;
-                    let value = state.samples[index]
-                        .abs()
-                        .max(state.samples[index + 1].abs());
-                    let time = if use_arrival {
-                        seconds(buffer.arrival_host_nanos) - (buffer.frames - frame) as f64 / rate
-                    } else {
-                        seconds(buffer.pts_nanos) + frame as f64 / rate
-                    };
-                    (time, value)
-                })
-            })
-        };
-        let (min_luma, max_luma) = state
-            .screen_frames
-            .iter()
-            .fold((f32::MAX, f32::MIN), |(lo, hi), f| {
-                (lo.min(f.luma), hi.max(f.luma))
-            });
-        let luma_threshold = (min_luma + max_luma) / 2.0;
-        let video_pts = onsets(
-            state
-                .screen_frames
-                .iter()
-                .map(|f| (seconds(f.pts_nanos), f.luma)),
-            luma_threshold,
-        );
-        let video_arrival = onsets(
-            state
-                .screen_frames
-                .iter()
-                .map(|f| (seconds(f.arrival_host_nanos), f.luma)),
-            luma_threshold,
-        );
-        let audio_pts = onsets(audio_points(false), 0.05);
-        let audio_arrival = onsets(audio_points(true), 0.05);
-        let screen_latency: Vec<f64> = state
-            .screen_frames
-            .iter()
-            .map(|f| (f.arrival_host_nanos as f64 - f.pts_nanos as f64) / 1.0e6)
-            .collect();
-        let audio_latency: Vec<f64> = state
-            .audio_buffers
-            .iter()
-            .map(|b| {
-                (b.arrival_host_nanos as f64
-                    - (b.pts_nanos as f64 + b.frames as f64 / rate * 1.0e9))
-                    / 1.0e6
-            })
-            .collect();
-        let screen_intervals: Vec<f64> = state
-            .screen_frames
-            .windows(2)
-            .map(|w| (w[1].pts_nanos as f64 - w[0].pts_nanos as f64) / 1.0e6)
-            .collect();
-        json!({
-            "lumaRange": [min_luma, max_luma],
-            "videoOnsetsPts": video_pts.len(),
-            "audioOnsetsPts": audio_pts.len(),
-            "audioMinusVideoPts": stats(&paired_offsets_ms(&audio_pts, &video_pts)),
-            "audioMinusVideoArrival": stats(&paired_offsets_ms(&audio_arrival, &video_arrival)),
-            "audioMinusVideoAudioPtsVideoArrival": stats(&paired_offsets_ms(&audio_pts, &video_arrival)),
-            "screenArrivalMinusPts": stats(&screen_latency),
-            "screenPtsIntervals": stats(&screen_intervals),
-            "audioArrivalMinusBufferEnd": stats(&audio_latency),
-            "audioMinusVideoPtsSeries": paired_offsets_ms(&audio_pts, &video_pts),
-        })
+    fn dbfs(amplitude: f64) -> f64 {
+        if amplitude <= 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            20.0 * amplitude.log10()
+        }
     }
 
     #[test]
-    #[ignore = "local macOS spike: needs Screen Recording, set VIDEORC_SYSTEM_AUDIO_SPIKE=1"]
-    fn system_audio_spike_capture() {
-        if env_flag("VIDEORC_SYSTEM_AUDIO_SPIKE").as_deref() != Some("1") {
-            eprintln!("VIDEORC_SYSTEM_AUDIO_SPIKE != 1; skipping the ScreenCaptureKit spike");
+    #[ignore = "local macOS: needs Screen Recording, set VIDEORC_SYSTEM_AUDIO_SPIKE=1"]
+    fn system_audio_capture_live_tone() {
+        if std::env::var("VIDEORC_SYSTEM_AUDIO_SPIKE").as_deref() != Ok("1") {
+            eprintln!("VIDEORC_SYSTEM_AUDIO_SPIKE != 1; skipping the live capture test");
             return;
         }
-        autoreleasepool(|_| run_spike());
-    }
-
-    fn run_spike() {
-        let seconds: f64 = env_flag("VIDEORC_SYSTEM_AUDIO_SPIKE_SECONDS")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(30.0);
-        let dir = env_flag("VIDEORC_SYSTEM_AUDIO_SPIKE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("videorc-system-audio-spike"));
-        let label = env_flag("VIDEORC_SYSTEM_AUDIO_SPIKE_LABEL").unwrap_or_else(|| "spike".into());
-        let exclude_current_process =
-            env_flag("VIDEORC_SYSTEM_AUDIO_SPIKE_EXCLUDE_CURRENT_PROCESS").as_deref() != Some("0");
-        let with_screen = env_flag("VIDEORC_SYSTEM_AUDIO_SPIKE_SCREEN").as_deref() == Some("1");
-        let self_tone_at: Option<f64> = env_flag("VIDEORC_SYSTEM_AUDIO_SPIKE_SELF_TONE_AT")
-            .and_then(|value| value.parse().ok());
-        let exclude_all = env_flag("VIDEORC_SYSTEM_AUDIO_SPIKE_EXCLUDE").as_deref() == Some("all");
-        let prefixes: Vec<String> = match env_flag("VIDEORC_SYSTEM_AUDIO_SPIKE_EXCLUDE") {
-            Some(value) if value == "none" || value == "all" => Vec::new(),
-            Some(value) => value
-                .split(',')
-                .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty())
-                .collect(),
-            None => videorc_exclusion_prefixes(Some(DEV_ELECTRON_BUNDLE_ID)),
-        };
-        fs::create_dir_all(&dir).expect("create spike dir");
-
-        let preflight = CGPreflightScreenCaptureAccess();
-        eprintln!("CGPreflightScreenCaptureAccess = {preflight}");
         assert!(
-            preflight,
+            screen_recording_permission_granted(),
             "Screen Recording is not granted to the host app of {:?}",
             std::env::current_exe()
         );
-        let timebase = host_clock::timebase().expect("mach timebase");
-        let (anchor_start, anchor_bracket) = host_clock::sample_anchor(timebase);
+        let dir = std::env::temp_dir().join(format!("videorc-system-audio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tone dir");
+        let tone = dir.join("tone-1k.wav");
+        write_tone_wav(&tone, 1.5);
 
-        let content = shareable_content().expect("shareable content");
-        let main_display_id = CGMainDisplayID();
-        let displays = unsafe { content.displays() };
-        let display = (0..displays.count())
-            .map(|i| displays.objectAtIndex(i))
-            .find(|d| unsafe { d.displayID() } == main_display_id)
-            .expect("main display in shareable content");
-        let applications = unsafe { content.applications() };
-        let apps: Vec<(String, i32, String)> = (0..applications.count())
-            .map(|i| {
-                let app = applications.objectAtIndex(i);
-                unsafe {
-                    (
-                        app.bundleIdentifier().to_string(),
-                        app.processID(),
-                        app.applicationName().to_string(),
-                    )
-                }
-            })
-            .collect();
-        let excluded_indices = if exclude_all {
-            (0..apps.len()).collect()
-        } else {
-            excluded_application_indices(
-                apps.iter().map(|(id, pid, _)| (id.as_str(), *pid)),
-                &prefixes,
-                &[],
-            )
-        };
-        let excluded_apps: Vec<Retained<SCRunningApplication>> = excluded_indices
-            .iter()
-            .map(|&i| applications.objectAtIndex(i))
-            .collect();
-        let excluded_report: Vec<_> = excluded_indices
-            .iter()
-            .map(|&i| json!({ "bundleId": apps[i].0, "pid": apps[i].1, "name": apps[i].2 }))
-            .collect();
+        let requested = Instant::now();
+        let mut capture = SystemAudioCapture::start(SystemAudioCaptureOptions::default())
+            .unwrap_or_else(|failure| panic!("system audio start failed: {failure:?}"));
         eprintln!(
-            "{} running applications listed; excluding {:?}",
-            apps.len(),
-            excluded_report
+            "started in {:?} (handle {:?}); excluded {:?}",
+            capture.info().start_latency,
+            requested.elapsed(),
+            capture.info().excluded_apps
+        );
+        let receiver = capture.take_receiver().expect("receiver");
+        assert!(
+            capture.take_receiver().is_none(),
+            "the receiver is take-once"
         );
 
-        let filter = unsafe {
-            SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
-                SCContentFilter::alloc(),
-                &display,
-                &NSArray::from_retained_slice(&excluded_apps),
-                &NSArray::<SCWindow>::new(),
-            )
-        };
-        let config = unsafe { SCStreamConfiguration::new() };
-        unsafe {
-            config.setWidth(2);
-            config.setHeight(2);
-            config.setMinimumFrameInterval(CMTime::new(1, 1));
-            config.setQueueDepth(3);
-            config.setShowsCursor(false);
-            config.setCapturesAudio(true);
-            config.setExcludesCurrentProcessAudio(exclude_current_process);
-            config.setSampleRate(48_000);
-            config.setChannelCount(2);
-        }
-        let state = Arc::new(Mutex::new(SpikeState::default()));
-        let delegate = SpikeDelegate::new(Arc::clone(&state), timebase);
-        let stream = unsafe {
-            SCStream::initWithFilter_configuration_delegate(
-                SCStream::alloc(),
-                &filter,
-                &config,
-                Some(ProtocolObject::from_ref(&*delegate)),
-            )
-        };
-        let audio_queue = DispatchQueue::new("com.videorc.system-audio.spike", None);
-        unsafe {
-            stream
-                .addStreamOutput_type_sampleHandlerQueue_error(
-                    ProtocolObject::from_ref(&*delegate),
-                    SCStreamOutputType::Audio,
-                    Some(&audio_queue),
-                )
-                .expect("add audio output");
-        }
+        // Wait for the first buffer, then play the tone.
+        let first = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("a first system audio buffer within 3 s");
+        eprintln!(
+            "first buffer {:?} after start; {} frames",
+            requested.elapsed(),
+            first.frame_count()
+        );
+        let mut player = Command::new("afplay")
+            .arg(&tone)
+            .spawn()
+            .expect("spawn afplay");
 
-        // Optional second stream: screen only, the product shape, to pair
-        // stimulus flashes with clicks on the shared host clock.
-        let screen_queue = DispatchQueue::new("com.videorc.system-audio.spike.screen", None);
-        let screen_stream = with_screen.then(|| {
-            let filter = unsafe {
-                SCContentFilter::initWithDisplay_excludingWindows(
-                    SCContentFilter::alloc(),
-                    &display,
-                    &NSArray::<SCWindow>::new(),
-                )
-            };
-            let config = unsafe { SCStreamConfiguration::new() };
-            unsafe {
-                config.setWidth(320);
-                config.setHeight(180);
-                config.setPixelFormat(kCVPixelFormatType_32BGRA);
-                config.setMinimumFrameInterval(CMTime::new(1, 60));
-                config.setQueueDepth(6);
-                config.setShowsCursor(false);
-                config.setCapturesAudio(false);
+        let mut frames = vec![first];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(200)) {
+                Ok(frame) => frames.push(frame),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            let stream = unsafe {
-                SCStream::initWithFilter_configuration_delegate(
-                    SCStream::alloc(),
-                    &filter,
-                    &config,
-                    Some(ProtocolObject::from_ref(&*delegate)),
-                )
-            };
-            unsafe {
-                stream
-                    .addStreamOutput_type_sampleHandlerQueue_error(
-                        ProtocolObject::from_ref(&*delegate),
-                        SCStreamOutputType::Screen,
-                        Some(&screen_queue),
-                    )
-                    .expect("add screen output");
-            }
-            (stream, filter, config)
-        });
-
-        let start_requested_host = host_clock::host_nanos_now(timebase);
-        let start_result = start(&stream);
-        eprintln!("audio-only stream start: {start_result:?}");
-        let start_latency = start_result.expect("audio-only SCStream starts");
-        if let Some((screen, _, _)) = &screen_stream {
-            start(screen).expect("screen SCStream starts");
         }
+        let _ = player.wait();
+        let stats = capture.stats();
+        assert_eq!(capture.failure(), None, "no failure while running");
+        assert!(capture.stop(), "stop finishes within the budget");
+        let drained = receiver.try_iter().count();
+        assert!(
+            matches!(
+                receiver.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the channel disconnects after stop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
 
-        let started_at = Instant::now();
-        let mut self_tone = None;
-        let mut self_tone_started_host = None;
-        while started_at.elapsed().as_secs_f64() < seconds {
-            if let Some(at) = self_tone_at
-                && self_tone.is_none()
-                && started_at.elapsed().as_secs_f64() >= at
-            {
-                self_tone_started_host = Some(host_clock::host_nanos_now(timebase));
-                self_tone = Some(play_self_tone(3.0));
-            }
-            thread::sleep(Duration::from_millis(20));
+        for frame in &frames {
+            assert_eq!(frame.sample_rate, 48_000);
+            assert_eq!(frame.channels, 2);
+            assert!(
+                frame.captured_at <= Instant::now(),
+                "captured_at is never in the future"
+            );
         }
-        drop(self_tone);
-        stop(&stream);
-        if let Some((screen, _, _)) = &screen_stream {
-            stop(screen);
-        }
-        let (anchor_end, _) = host_clock::sample_anchor(timebase);
-
-        let state = state.lock().unwrap_or_else(|p| p.into_inner());
-        let wav_path = dir.join(format!("{label}.wav"));
-        write_wav_f32(&wav_path, &state.samples, SYSTEM_AUDIO_SAMPLE_RATE, 2);
-
-        let origin = start_requested_host;
-        let frames: Vec<usize> = state.audio_buffers.iter().map(|b| b.frames).collect();
-        let mut frame_histogram = std::collections::BTreeMap::<usize, usize>::new();
-        for f in &frames {
-            *frame_histogram.entry(*f).or_default() += 1;
-        }
-        // Gaps between consecutive buffers on the PTS timeline (expected ==
-        // the previous buffer's duration when delivery is continuous).
-        let pts_gaps_ms: Vec<f64> = state
-            .audio_buffers
-            .windows(2)
-            .map(|w| {
-                (w[1].pts_nanos as f64
-                    - w[0].pts_nanos as f64
-                    - w[0].frames as f64 / 48_000.0 * 1.0e9)
-                    / 1.0e6
-            })
-            .collect();
-        let arrival_intervals_ms: Vec<f64> = state
-            .audio_buffers
-            .windows(2)
-            .map(|w| (w[1].arrival_host_nanos as f64 - w[0].arrival_host_nanos as f64) / 1.0e6)
-            .collect();
-        let max_arrival_interval = arrival_intervals_ms.iter().cloned().fold(0.0, f64::max);
-        let pts_vs_cm_conversion_ns = state
-            .audio_buffers
+        assert!(
+            frames
+                .windows(2)
+                .all(|pair| pair[1].timestamp_micros > pair[0].timestamp_micros),
+            "timestamps increase"
+        );
+        let best_tone = frames
             .iter()
-            .map(|b| (b.pts_nanos as i128 - b.pts_ticks_nanos as i128).abs())
-            .max()
-            .unwrap_or(0);
-        // Instant vs host drift over the run: both anchors should map the
-        // same host time to the same Instant.
-        let anchor_drift_ns = {
-            let predicted = anchor_start.instant_for_host_nanos(anchor_end.host_nanos);
-            if predicted >= anchor_end.instant {
-                predicted.duration_since(anchor_end.instant).as_nanos() as i128
-            } else {
-                -(anchor_end.instant.duration_since(predicted).as_nanos() as i128)
-            }
-        };
-        // Per-second peak envelope (dBFS) for the silence / tone questions.
-        let per_second_peak_db: Vec<f64> = state
-            .samples
-            .chunks(48_000 * 2)
-            .map(|chunk| {
-                let peak = chunk.iter().fold(0.0f32, |p, s| p.max(s.abs()));
-                if peak <= 0.0 {
-                    -f64::INFINITY
-                } else {
-                    20.0 * f64::from(peak).log10()
-                }
-            })
-            .map(|db| {
-                if db.is_finite() {
-                    (db * 10.0).round() / 10.0
-                } else {
-                    -999.0
-                }
-            })
-            .collect();
-        // If S3 places buffers by PTS, a bus that plays out `delay` behind the
-        // wall clock has already rendered (as zeros) every frame older than
-        // `arrival - delay`. Fraction of captured frames that would be late:
-        let late_fraction_at = |delay_ms: f64| {
-            let late: f64 = state
-                .audio_buffers
-                .iter()
-                .map(|b| {
-                    let late_ms =
-                        (b.arrival_host_nanos as f64 - b.pts_nanos as f64) / 1.0e6 - delay_ms;
-                    (late_ms * 48.0).clamp(0.0, b.frames as f64)
-                })
-                .sum();
-            let total = (state.samples.len() / 2).max(1) as f64;
-            (late / total * 10_000.0).round() / 10_000.0
-        };
-        // PTS advances by exact sample counts (S0: zero PTS gaps), so a drift
-        // between the audio clock and the host clock shows up as a trend in
-        // (arrival - PTS). Least-squares slope, in ppm.
-        let latency_trend_ppm = {
-            let points: Vec<(f64, f64)> = state
-                .audio_buffers
-                .iter()
-                .map(|b| {
-                    (
-                        b.pts_nanos as f64 / 1.0e9,
-                        (b.arrival_host_nanos as f64 - b.pts_nanos as f64) / 1.0e9,
-                    )
-                })
-                .collect();
-            let n = points.len() as f64;
-            if n < 2.0 {
-                None
-            } else {
-                let mx = points.iter().map(|p| p.0).sum::<f64>() / n;
-                let my = points.iter().map(|p| p.1).sum::<f64>() / n;
-                let sxx: f64 = points.iter().map(|p| (p.0 - mx).powi(2)).sum();
-                let sxy: f64 = points.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
-                (sxx > 0.0).then(|| sxy / sxx * 1.0e6)
-            }
-        };
-        let first = state.audio_buffers.first();
-        let summary = json!({
-            "label": label,
-            "seconds": seconds,
-            "wav": wav_path.display().to_string(),
-            "preflight": preflight,
-            "excludeCurrentProcessAudio": exclude_current_process,
-            "excludedPrefixes": prefixes,
-            "excludedApps": excluded_report,
-            "runningApplicationCount": apps.len(),
-            "runningApplications": apps.iter().map(|(id, pid, name)| json!([id, pid, name])).collect::<Vec<_>>(),
-            "startCompletionMs": start_latency.as_secs_f64() * 1000.0,
-            "firstBufferArrivalAfterStartRequestMs": first.map(|b| (b.arrival_host_nanos as f64 - origin as f64) / 1.0e6),
-            "firstBufferPtsAfterStartRequestMs": first.map(|b| (b.pts_nanos as f64 - origin as f64) / 1.0e6),
-            "firstPts": first.map(|b| json!({"value": b.pts_value, "timescale": b.pts_timescale})),
-            "format": state.format,
-            "formatErrors": state.format_errors.iter().take(10).collect::<Vec<_>>(),
-            "formatErrorCount": state.format_errors.len(),
-            "unexpectedOutputTypes": state.unexpected_output_types.len(),
-            "stopErrors": state.stop_errors,
-            "audioBufferCount": state.audio_buffers.len(),
-            "digitallySilentBufferCount": state.audio_buffers.iter().filter(|b| b.peak == 0.0).count(),
-            "buffersAboveMinus60Dbfs": state.audio_buffers.iter().filter(|b| b.peak > 0.001).count(),
-            "framesPerBufferHistogram": frame_histogram,
-            "capturedFrames": state.samples.len() / 2,
-            "expectedFramesForWallTime": (seconds * 48_000.0) as u64,
-            "ptsGapMs": stats(&pts_gaps_ms),
-            "ptsGapsOver5ms": pts_gaps_ms.iter().filter(|g| g.abs() > 5.0).count(),
-            "arrivalIntervalMs": stats(&arrival_intervals_ms),
-            "maxArrivalIntervalMs": max_arrival_interval,
-            "lateFractionIfPtsPlacedAtPlayoutDelayMs": {
-                "50": late_fraction_at(50.0),
-                "80": late_fraction_at(80.0),
-                "100": late_fraction_at(100.0),
-                "150": late_fraction_at(150.0),
-            },
-            "arrivalLatencyTrendPpm": latency_trend_ppm,
-            "arrivalMinusBufferEndMs": stats(&state.audio_buffers.iter().map(|b| (b.arrival_host_nanos as f64 - (b.pts_nanos as f64 + b.frames as f64 / 48_000.0 * 1.0e9)) / 1.0e6).collect::<Vec<_>>()),
-            "ptsVsCMClockConvertHostTimeToSystemUnitsMaxAbsNs": pts_vs_cm_conversion_ns,
-            "timebase": [timebase.numer, timebase.denom],
-            "anchorBracketNs": anchor_bracket.as_nanos() as u64,
-            "anchorDriftOverRunNs": anchor_drift_ns,
-            "selfToneStartedAfterStartRequestMs": self_tone_started_host.map(|h| (h as f64 - origin as f64) / 1.0e6),
-            "perSecondPeakDbfs": per_second_peak_db,
-            "screenFrames": state.screen_frames.len(),
-            "sync": with_screen.then(|| analyze_sync(&state, origin)),
-        });
-        let csv_path = dir.join(format!("{label}-buffers.csv"));
-        let mut csv = String::from("pts_host_ns,arrival_host_ns,frames,peak\n");
-        for b in &state.audio_buffers {
-            csv.push_str(&format!(
-                "{},{},{},{}\n",
-                b.pts_nanos, b.arrival_host_nanos, b.frames, b.peak
-            ));
-        }
-        fs::write(&csv_path, csv).expect("write buffer csv");
-        let json_path = dir.join(format!("{label}.json"));
-        fs::write(
-            &json_path,
-            serde_json::to_string_pretty(&summary).expect("summary json"),
-        )
-        .expect("write summary");
-        eprintln!("wrote {} and {}", wav_path.display(), json_path.display());
-        drop(screen_stream);
+            .map(|frame| tone_amplitude(&frame.samples))
+            .fold(0.0f64, f64::max);
+        let peak = frames
+            .iter()
+            .flat_map(|frame| frame.samples.iter())
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        eprintln!(
+            "{} buffers, stats {stats:?}, {drained} drained after stop; 1 kHz tone {:.1} dBFS, peak {:.1} dBFS",
+            frames.len(),
+            dbfs(best_tone),
+            dbfs(f64::from(peak))
+        );
+        assert!(stats.captured_frames > 0);
+        assert_eq!(stats.rejected_buffers, 0);
+        assert!(
+            dbfs(best_tone) > -30.0,
+            "the afplay tone reached the capture above -30 dBFS (got {:.1})",
+            dbfs(best_tone)
+        );
     }
 }
