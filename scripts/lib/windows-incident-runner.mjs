@@ -1,6 +1,9 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import {
+  closeSync,
+  openSync,
+  readSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -15,6 +18,8 @@ import { setTimeout as delay } from 'node:timers/promises'
 import {
   createIncidentReadyParser,
   incidentAudioPath,
+  incidentAudioEnvironment,
+  incidentSessionEvidence,
   incidentAdapterInventory,
   executeIncidentAttempt,
   incidentProcessGroups,
@@ -175,7 +180,8 @@ export async function runWindowsIncident(argv) {
             backendPath,
             ffmpegPath,
             root: caseRoot,
-            injectFailure: scenario.audio === 'direct-fallback'
+            injectFailure: scenario.audio === 'direct-fallback',
+            audio: scenario.audio
           })
           group.backendPid = backend.child.pid
           group.backendVersion = backend.health.version
@@ -291,9 +297,10 @@ export function incidentAggregateVerdict(runs, expected) {
   return 'PASS'
 }
 
-async function launchBackend({ runtime, backendPath, ffmpegPath, root, injectFailure }) {
+async function launchBackend({ runtime, backendPath, ffmpegPath, root, injectFailure, audio }) {
   const env = {
     ...process.env,
+    ...incidentAudioEnvironment(audio),
     VIDEORC_DATABASE_PATH: join(root, 'videorc.sqlite3'),
     VIDEORC_RECORDINGS_DIR: join(root, 'recordings'),
     VIDEORC_SECRETS_PATH: join(root, 'secrets.json'),
@@ -459,28 +466,37 @@ async function runAttempt({
       },
       collect: async () => {
         const deadline = performance.now() + 30000
-        let logs = []
+        let sessionPage = { items: [] }
+        let logPage = { entries: [] }
         do {
-          const page = await rpc('sessions.list', { limit: 100 })
-          session = page.items?.find((item) => item.id === sessionId) ?? null
-          if (sessionId)
-            logs = (await rpc('sessions.logs.list', { sessionId, limit: 500 })).items ?? []
+          sessionPage = await rpc('sessions.list', { limit: 100 })
+          session = sessionPage.items?.find((item) => item.id === sessionId) ?? null
+          if (sessionId) logPage = await rpc('sessions.logs.list', { sessionId, limit: 500 })
           if (
-            session?.finalDiagnostics &&
+            session?.endedAt &&
             (!scenario.recordEnabled || session.mp4Path || session.status === 'failed')
           )
             break
           if (!sessionId) break
           await delay(100)
         } while (performance.now() < deadline)
-        const diagnostic = session?.finalDiagnostics
-        const log = (code) => logs.find((item) => item.code === code)?.message ?? null
-        const fallbackReason = log('microphone-capture-worker-fallback')
-        const observedAudio = incidentAudioPath(fallbackReason, firstPcm, scenario.audio)
         const bundle = await rpc('diagnostics.supportBundle.export', {
           ffmpegPath,
           outputDirectory: runDirectory
         })
+        const retained = incidentSessionEvidence(
+          sessionPage,
+          logPage,
+          readBoundedSupportBundle(bundle.path),
+          sessionId
+        )
+        session = retained.session
+        const logs = retained.logs
+        const diagnostic = session?.finalDiagnostics
+        const log = (code) => logs.find((item) => item.code === code)?.message ?? null
+        const fallbackReason = log('microphone-capture-worker-fallback')
+        const observedAudio = incidentAudioPath(fallbackReason, firstPcm, scenario.audio)
+
         return {
           sessionId,
           finalDiagnostics: diagnostic ?? null,
@@ -498,9 +514,14 @@ async function runAttempt({
           effectiveOutput: diagnostic?.encoderBridgeEffectiveVideoOutput ?? null,
           firstPcm: firstPcm ?? {
             state: 'unknown',
-            reason: 'No worker PCM counter was observed; direct/sine input PCM is not exported'
+            reason:
+              'No session PCM counter was observed; direct DirectShow input PCM is not exported'
           },
           audioPath: observedAudio,
+          audioInputProvenance:
+            scenario.audio === 'controlled'
+              ? 'Portable debug native PCM fixture: continuous 440 Hz tone; coreaudio-prefixed fixture ID does not mean physical CoreAudio capture'
+              : 'Selected physical Windows microphone',
           fallbackReason,
           milestones: events,
           logs,
@@ -718,4 +739,22 @@ export async function reapIncidentReceivers(receivers, stopProcess, waitForExit 
     receiversReaped: receiverResults.every((item) => item.cleanup.childExited === true),
     receiverResults
   }
+}
+
+function readBoundedSupportBundle(path) {
+  const maximum = 16 * 1024 * 1024
+  const descriptor = openSync(path, 'r')
+  const buffer = Buffer.alloc(maximum + 1)
+  let length = 0
+  try {
+    while (length < buffer.length) {
+      const count = readSync(descriptor, buffer, length, buffer.length - length, null)
+      if (!count) break
+      length += count
+    }
+  } finally {
+    closeSync(descriptor)
+  }
+  if (length > maximum) throw new Error('Support bundle exceeds incident evidence byte limit')
+  return JSON.parse(buffer.subarray(0, length).toString('utf8'))
 }

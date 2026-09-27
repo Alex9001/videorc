@@ -112,6 +112,14 @@ export function assertOwnedLoopbackTarget(target) {
   }
 }
 
+export function incidentAudioEnvironment(audio) {
+  return {
+    VIDEORC_CAPTION_CONTRACT_TEST: audio === 'controlled' ? '1' : '0',
+    VIDEORC_LIVE_SOURCE_SWITCH_TEST: audio === 'controlled' ? '1' : '0',
+    VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '0'
+  }
+}
+
 export function incidentSessionParams(scenario, targets, microphoneId) {
   if (targets.length !== scenario.receivers) throw new Error('Missing incident receiver')
   targets.forEach(assertOwnedLoopbackTarget)
@@ -136,7 +144,11 @@ export function incidentSessionParams(scenario, targets, microphoneId) {
     cropBottom: 0
   }
   return {
-    sources: { testPattern: true, ...(microphoneId ? { microphoneId } : {}) },
+    sources: {
+      testPattern: true,
+      microphoneId:
+        scenario.audio === 'controlled' ? 'microphone:coreaudio:4294967295' : microphoneId
+    },
     scene: {
       id: 'incident-motion',
       name: 'Incident synthetic motion',
@@ -182,7 +194,7 @@ export function incidentSessionParams(scenario, targets, microphoneId) {
     streaming: {
       enabled: targets.length > 0,
       mode: targets.length > 1 ? 'multi' : 'single',
-      defaultOutputPreset: 'custom',
+      defaultOutputPreset: scenario.height === 720 ? 'tutorial-720p30' : 'stream-safe-1080p30',
       defaultBitrateKbps: scenario.bitrateKbps,
       enabledTargetIds: targets.map((_, index) => `incident-${index}`),
       selectedTargetId: targets.length ? 'incident-0' : null,
@@ -241,7 +253,9 @@ export function evaluateWindowsIncidentRun(scenario, run) {
       artifact.height !== scenario.height ||
       artifact.hasAudio !== true
     )
-      failures.push(`${role} analyzed A/V artifact missing or failed`)
+      failures.push(
+        `${role} analyzed A/V artifact missing or failed${artifact?.reason ? `: ${artifact.reason}` : artifact?.failures?.length ? `: ${artifact.failures.join('; ')}` : ''}`
+      )
   }
   return { pass: failures.length === 0, failures }
 }
@@ -330,8 +344,9 @@ export function incidentAudioPath(fallbackReason, firstPcm, requestedAudio) {
     return fallbackReason.includes('Injected incident capture-worker')
       ? 'direct-fallback'
       : 'unexpected-direct-fallback'
+  if (requestedAudio === 'controlled') return 'controlled'
   if (firstPcm) return 'worker'
-  return requestedAudio === 'controlled' ? 'controlled' : 'unknown'
+  return 'unknown'
 }
 
 export function incidentAdapterInventory(result) {
@@ -342,5 +357,16 @@ export function incidentAdapterInventory(result) {
     return { state: 'observed', provenance: 'Win32_VideoController', values }
   } catch {
     return { state: 'unknown', reason: 'Windows adapter inventory unavailable or invalid' }
+  }
+}
+
+export function incidentSessionEvidence(sessionPage, logPage, supportBundle, sessionId) {
+  const row = sessionPage?.items?.find((item) => item.id === sessionId) ?? null
+  const bundled = supportBundle?.sessions?.find((item) => item.id === sessionId)
+  return {
+    session: row ? { ...row, finalDiagnostics: bundled?.finalDiagnostics ?? null } : null,
+    logs: Array.isArray(logPage?.entries)
+      ? logPage.entries.filter((entry) => entry.sessionId === sessionId)
+      : []
   }
 }

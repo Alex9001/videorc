@@ -380,7 +380,11 @@ The incident matrix crosses both profiles with local recording, one receiver,
 two receivers, and recording plus two receivers; controlled tone, real capture
 worker, and an injected worker-open failure into real DirectShow fallback;
 three same-process attempts versus three backend restarts. Its fixed preview
-state is the backend compositor without a presenter. A named case can be run:
+state is the backend compositor without a presenter. Controlled audio selects the
+existing portable debug native PCM fixture: continuous 440 Hz tone, with
+runner-owned fixture flags. Its CoreAudio-prefixed synthetic device ID does not
+represent a physical CoreAudio device on Windows. An absent microphone would
+produce intentional silence and is not used as tone evidence. A named case can be run:
 
 ```powershell
 pnpm smoke:windows-stream-performance -- --incident --scenario 1080p30-record-dual-controlled-same-process --output "$env:TEMP/incident-one-new"

@@ -238,3 +238,79 @@ test('worker PCM before fallback never proves the final worker audio path', asyn
   )
   assert.equal(incidentAudioPath(null, { frames: 100 }, 'worker'), 'worker')
 })
+
+test('720p single, dual and record-dual select the backend named stream profile at 6000 kbps', () => {
+  for (const topology of ['single', 'dual', 'record-dual']) {
+    const scenario = buildWindowsIncidentMatrix().find(
+      (item) => item.height === 720 && item.topology === topology && item.audio === 'controlled'
+    )
+    const targets = Array.from({ length: scenario.receivers }, (_, index) => ({
+      serverUrl: `rtmp://127.0.0.1:${19000 + index}/live`,
+      streamKey: 'owned'
+    }))
+    const params = incidentSessionParams(scenario, targets)
+    assert.equal(params.streaming.defaultOutputPreset, 'tutorial-720p30')
+    assert.equal(params.streaming.defaultBitrateKbps, 6000)
+    assert.equal(params.output.video.width, 1280)
+    assert.equal(params.output.video.height, 720)
+    assert.equal(params.output.video.bitrateKbps, 6000)
+    assert.ok(params.streaming.targets.every((target) => target.outputPreset === undefined))
+  }
+})
+
+test('incident collection reads lightweight Library rows, log entries and exact-session bundle diagnostics', async () => {
+  const { incidentSessionEvidence } = await import('./windows-incident-matrix.mjs')
+  const row = { id: 'current', status: 'completed', mp4Path: 'owned/current.mp4' }
+  const logs = [{ sessionId: 'current', code: 'ffmpeg-startup-evidence', message: 'retained' }]
+  const evidence = incidentSessionEvidence(
+    { items: [row] },
+    { entries: logs },
+    {
+      sessions: [
+        { id: 'previous', finalDiagnostics: { sessionId: 'previous' } },
+        {
+          id: 'current',
+          finalDiagnostics: { sessionId: 'current', encoderBridgeRawVideoCopiedFrames: 360 }
+        }
+      ]
+    },
+    'current'
+  )
+  assert.equal(evidence.session.mp4Path, row.mp4Path)
+  assert.equal(evidence.session.finalDiagnostics.encoderBridgeRawVideoCopiedFrames, 360)
+  assert.deepEqual(evidence.logs, logs)
+  assert.equal(
+    incidentSessionEvidence(
+      { items: [row] },
+      { entries: [] },
+      { sessions: [{ id: 'previous', finalDiagnostics: {} }] },
+      'current'
+    ).session.finalDiagnostics,
+    null
+  )
+})
+
+test('controlled audio selects the portable debug PCM fixture and owns its enabling flags', async () => {
+  const { incidentAudioEnvironment, incidentAudioPath } =
+    await import('./windows-incident-matrix.mjs')
+  const controlled = buildWindowsIncidentMatrix().find(
+    (item) => item.audio === 'controlled' && item.receivers === 0
+  )
+  assert.equal(
+    incidentSessionParams(controlled, []).sources.microphoneId,
+    'microphone:coreaudio:4294967295'
+  )
+  assert.deepEqual(incidentAudioEnvironment('controlled'), {
+    VIDEORC_CAPTION_CONTRACT_TEST: '1',
+    VIDEORC_LIVE_SOURCE_SWITCH_TEST: '1',
+    VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '0'
+  })
+  for (const audio of ['worker', 'direct-fallback']) {
+    assert.deepEqual(incidentAudioEnvironment(audio), {
+      VIDEORC_CAPTION_CONTRACT_TEST: '0',
+      VIDEORC_LIVE_SOURCE_SWITCH_TEST: '0',
+      VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '0'
+    })
+  }
+  assert.equal(incidentAudioPath(null, { frames: 100 }, 'controlled'), 'controlled')
+})
