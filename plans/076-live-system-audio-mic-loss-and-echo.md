@@ -1,7 +1,7 @@
-# Plan 075: live stream with System audio — a stalled output kills the mic for good, and your own stream loops back as an echo
+# Plan 076: live stream with System audio — a stalled output kills the mic for good, and your own stream loops back as an echo
 
 Status: investigated 2026-09-28; **IMPLEMENTED 2026-09-29** on
-`fix/075-live-mic-loss-and-echo` (all slices; see
+`fix/076-live-mic-loss-and-echo` (all slices; see
 [Implementation record](#implementation-record-2026-09-29)). Owner acceptance
 on a packaged candidate and a quiet-machine `smoke:system-audio` are owed.
 Two owner live streams on 0.9.120 (macOS), both with System audio. Priority **P0** for part A, since a
@@ -163,7 +163,7 @@ decision to rely on documentation alone has failed in practice.
    warn-only; choose it if the owner prefers never to change the mix
    automatically.
 4. Per-app capture (only certain apps, or excluding browsers) is the real
-   prevention, but it is a separate plan (076). This plan fixes the
+   prevention, but it is a separate plan (077). This plan fixes the
    misleading copy and adds detection.
 
 ## Ordered slices
@@ -389,14 +389,14 @@ warnings`. Also run `cargo build --release` (per the release-build cfg gap
 
 ## Out of scope (follow-ups)
 
-- **Plan 076: per-app capture.** "Capture: All apps / Only these apps /
+- **Plan 077: per-app capture.** "Capture: All apps / Only these apps /
   Exclude browsers" via `SCContentFilter` including or excluding
   applications, and WASAPI include/exclude process trees on Windows. This is
   the prevention path for playing music while monitoring the stream.
 - **FFmpeg input coupling.** If A0 confirms that the scheduler pauses the
   audio FIFO whenever video is late, a separate plan can weigh decoupling:
   for example, the bus pacing audio independently and FFmpeg reading with
-  timestamps rather than by pipe backpressure. Plan 075 only makes the stall
+  timestamps rather than by pipe backpressure. Plan 076 only makes the stall
   survivable and visible. It does not remove the gap.
 - Acoustic echo, where the mic hears the speakers, and echo cancellation.
 - A "Reconnect microphone" action for a genuinely stopped device.
@@ -475,7 +475,7 @@ Stop and report to the owner if:
 
 ## Implementation record (2026-09-29)
 
-Branch `fix/075-live-mic-loss-and-echo`, from main `febb5ca8`. The owner said
+Branch `fix/076-live-mic-loss-and-echo`, from main `febb5ca8`. The owner said
 "execute the entire plan"; decision 3 took the recommended default (auto-pause
 with Resume).
 

@@ -108,7 +108,7 @@ const VIDEOTOOLBOX_FIFO_WRITE_STALL_TOLERANCE: Duration = FIFO_FRAME_WRITE_HARD_
 const VIDEORC_TEST_VT_FIFO_PAUSE_AFTER_FRAMES_ENV: &str = "VIDEORC_TEST_VT_FIFO_PAUSE_AFTER_FRAMES";
 #[cfg(all(target_os = "macos", debug_assertions))]
 const VIDEORC_TEST_VT_FIFO_PAUSE_MS_ENV: &str = "VIDEORC_TEST_VT_FIFO_PAUSE_MS";
-/// Plan 075: repeat the pause this many times (default 1), each after one
+/// Plan 076: repeat the pause this many times (default 1), each after one
 /// more written access unit. Sustained pressure, never 2 s without progress.
 #[cfg(all(target_os = "macos", debug_assertions))]
 const VIDEORC_TEST_VT_FIFO_PAUSE_REPEAT_ENV: &str = "VIDEORC_TEST_VT_FIFO_PAUSE_REPEAT";
@@ -10913,7 +10913,7 @@ mod tests {
         assert_eq!(pause.take_before_write(3), None);
     }
 
-    /// Plan 075: sustained pressure, one access unit of progress between
+    /// Plan 076: sustained pressure, one access unit of progress between
     /// pauses, so no single pause trips the 2 s no-progress watchdog.
     #[cfg(all(target_os = "macos", debug_assertions))]
     #[test]

@@ -6157,7 +6157,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (/^(microphone-(input|timeline)|system-audio)-lost$/.test(event.code)) {
           void publishMicrophoneInputLost(event)
         } else {
-          // Plan 075: a timeline loss that recovered clears its notice.
+          // Plan 076: a timeline loss that recovered clears its notice.
           if (
             /-recovered$/.test(event.code) &&
             sessionRuntimeNoticeRef.current?.kind === 'microphone-input-lost'
@@ -9611,7 +9611,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       audio: { ...current.audio, systemAudioEnabled }
     }))
   }
-  // Plan 075: Resume after the echo guard paused System audio, from its
+  // Plan 076: Resume after the echo guard paused System audio, from its
   // toast or a mixer row (lazy chunks), re-sends On like a shortcut does.
   const resumeSystemAudio = useEffectEvent(() => setSystemAudioEnabled(true))
   useEffect(() => {

@@ -334,7 +334,7 @@ export function showSessionHealthEvent(
 }
 
 /**
- * Plan 075: what the audio bus reports mid-session. An echo pause stays up
+ * Plan 076: what the audio bus reports mid-session. An echo pause stays up
  * until it is resumed (a live loop repeats every word); a stall and a
  * recovered microphone are news the interface shows nowhere else.
  */

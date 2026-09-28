@@ -1401,7 +1401,7 @@ export interface AudioSettings {
   /** System audio level in dB, within SYSTEM_AUDIO_GAIN_DB_MIN..MAX. */
   systemAudioGainDb: number
   /** Pause System audio when it carries your own stream back as an echo
-   * (plan 075). On unless turned off; the backend defaults a missing key On. */
+   * (plan 076). On unless turned off; the backend defaults a missing key On. */
   systemAudioEchoGuard?: boolean
 }
 
@@ -1419,7 +1419,7 @@ export interface AudioProcessingUpdateParams {
   systemAudioEnabled?: boolean
   /** Live System audio level in dB. Omitted means unchanged. */
   systemAudioGainDb?: number
-  /** Live echo guard On/Off (plan 075). Omitted means unchanged. */
+  /** Live echo guard On/Off (plan 076). Omitted means unchanged. */
   systemAudioEchoGuard?: boolean
 }
 

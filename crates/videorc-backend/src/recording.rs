@@ -5727,7 +5727,7 @@ fn system_audio_lost_message(kind: crate::session_audio::SourceLossReason) -> &'
 }
 
 const SYSTEM_AUDIO_LOST_MESSAGE: &str = "System audio stopped during this session. The session continues without it; turn System audio off and on to try again.";
-/// Plan 075: a placement loss keeps the source; the bus realigns it.
+/// Plan 076: a placement loss keeps the source; the bus realigns it.
 const SYSTEM_AUDIO_TIMELINE_LOST_MESSAGE: &str = "System audio kept arriving, but Videorc could not place it on the session timeline. Videorc is realigning it; until then the gap is silent.";
 
 /// Marks a freshly-created session row failed if session startup bails before
@@ -8072,7 +8072,7 @@ async fn sample_native_audio_during_recording(state: AppState, session_id: Strin
 
         // Plan 069: a system-audio stream the platform stopped mid-session.
         // The bus already ramped it out; the session keeps its microphone.
-        // Plan 075: a timeline loss keeps the slot, and reports its recovery.
+        // Plan 076: a timeline loss keeps the slot, and reports its recovery.
         if let Some(sample) = system_audio.as_ref()
             && emit_system_audio_sample_events(&state, &session_id, sample)
         {
@@ -8163,9 +8163,9 @@ async fn sample_native_audio_during_recording(state: AppState, session_id: Strin
 struct SystemAudioSample {
     observation: crate::session_audio::SystemAudioObservation,
     losses: Vec<crate::session_audio::SystemAudioLoss>,
-    /// Plan 075: timeline losses that ended with the slot still in the mix.
+    /// Plan 076: timeline losses that ended with the slot still in the mix.
     recoveries: Vec<crate::session_audio::SystemAudioRecovery>,
-    /// Plan 075: loops the echo guard paused.
+    /// Plan 076: loops the echo guard paused.
     echo_pauses: Vec<crate::session_audio::SystemAudioEchoPause>,
 }
 
@@ -8204,7 +8204,7 @@ fn emit_system_audio_sample_events(
             .any(|loss| loss.kind == crate::session_audio::SourceLossReason::CaptureStopped)
 }
 
-/// Plan 075: the echo guard paused system audio. Free of device words, so
+/// Plan 076: the echo guard paused system audio. Free of device words, so
 /// the health row links no permission pane.
 fn emit_system_audio_echo_paused_health_event(
     state: &AppState,
@@ -8229,7 +8229,7 @@ fn system_audio_echo_paused_message(lag_ms: u32) -> String {
     )
 }
 
-/// Plan 075: the output stalled and audio in the gap is silent. Free of
+/// Plan 076: the output stalled and audio in the gap is silent. Free of
 /// device words, so the health row links no permission pane.
 fn emit_audio_output_stalled_health_event(
     state: &AppState,
@@ -8257,7 +8257,7 @@ fn audio_output_stalled_message(report: &crate::session_audio::OutputStallReport
     )
 }
 
-/// Plan 075: the microphone's timeline loss ended; it never stopped.
+/// Plan 076: the microphone's timeline loss ended; it never stopped.
 fn emit_microphone_recovered_health_event(
     state: &AppState,
     session_id: &str,
@@ -8280,7 +8280,7 @@ fn emit_microphone_recovered_health_event(
 
 const MICROPHONE_TIMELINE_RECOVERED_CODE: &str = "microphone-timeline-recovered";
 
-/// Plan 075: system audio places again after a timeline loss.
+/// Plan 076: system audio places again after a timeline loss.
 fn emit_system_audio_recovered_health_event(
     state: &AppState,
     session_id: &str,
@@ -10942,7 +10942,7 @@ struct NativeAudioStats {
     input_state: NativeAudioInputState,
     source_loss_after_ms: Option<u64>,
     unreported_source_loss_after_ms: Vec<crate::session_audio::SourceLoss>,
-    /// Recoveries and output stalls the sampler had not reported (plan 075).
+    /// Recoveries and output stalls the sampler had not reported (plan 076).
     unreported_recoveries: Vec<crate::session_audio::SourceRecovery>,
     unreported_output_stalls: Vec<crate::session_audio::OutputStallReport>,
     /// Final system-audio counters and events the sampler had not reported
@@ -21366,7 +21366,7 @@ mod tests {
         let microphone = microphone_timeline_lost_message("MacBook Pro Microphone", 2_100);
         assert!(microphone.contains("kept delivering audio"), "{microphone}");
         assert!(!microphone.contains("stopped"), "{microphone}");
-        // Plan 075: the source stays and is realigned, never retired.
+        // Plan 076: the source stays and is realigned, never retired.
         assert!(microphone.contains("realigning"), "{microphone}");
         let system =
             system_audio_lost_message(crate::session_audio::SourceLossReason::TimelineRejected);

@@ -623,7 +623,7 @@ export function SystemAudioSettings({
   view: SystemAudioSwitchView
   gainDb: number
   macOS: boolean
-  /** Plan 075: pause System audio when it carries the stream back. */
+  /** Plan 076: pause System audio when it carries the stream back. */
   echoGuard: boolean
   onEnabledChange: (enabled: boolean) => void
   onGainChange: (gainDb: number) => void

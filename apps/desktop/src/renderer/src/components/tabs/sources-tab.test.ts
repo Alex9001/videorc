@@ -70,13 +70,13 @@ describe('Sources System audio settings (plan 069)', () => {
     )
   })
 
-  it('has the echo guard On by default, and it can be turned off (plan 075)', () => {
+  it('has the echo guard On by default, and it can be turned off (plan 076)', () => {
     const guard = /<button[^>]*aria-label="Pause System audio if your stream echoes back"[^>]*>/
     expect(render({}).match(guard)?.[0]).toContain('aria-checked="true"')
     expect(render({}, true, false).match(guard)?.[0]).toContain('aria-checked="false"')
   })
 
-  it('offers Resume when the echo guard paused it (plan 075)', () => {
+  it('offers Resume when the echo guard paused it (plan 076)', () => {
     const markup = render({ requested: true, sessionActive: true, confirmed: false, issue: 'echo' })
     expect(markup).toContain('coming back as an echo. Mute that tab, then resume.')
     expect(markup).toContain('>Resume<')

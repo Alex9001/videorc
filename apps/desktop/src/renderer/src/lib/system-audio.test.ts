@@ -81,7 +81,7 @@ describe('systemAudioIssueFromHealthEvent', () => {
     expect(systemAudioIssueFromHealthEvent({ code: 'microphone-input-lost' })).toBeNull()
   })
 
-  it('maps the echo guard pause, and a recovery is not an issue (plan 075)', () => {
+  it('maps the echo guard pause, and a recovery is not an issue (plan 076)', () => {
     expect(systemAudioIssueFromHealthEvent({ code: 'system-audio-echo-paused' })).toBe('echo')
     expect(systemAudioIssueFromHealthEvent({ code: 'system-audio-recovered' })).toBeNull()
     expect(systemAudioIssueCopy('echo')).toBe(
@@ -179,7 +179,7 @@ describe('systemAudioSwitchView', () => {
     ).toBeNull()
   })
 
-  it('says Paused while the echo guard holds system audio out (plan 075)', () => {
+  it('says Paused while the echo guard holds system audio out (plan 076)', () => {
     expect(
       view({ sessionActive: true, requested: true, confirmed: false, issue: 'echo' })
     ).toMatchObject({ checked: true, issue: 'echo', meter: false, stateLabel: 'Paused' })

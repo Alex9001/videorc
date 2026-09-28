@@ -345,7 +345,7 @@ export function SystemAudioInspectorValue({
   view: SystemAudioSwitchView
   onEnabledChange: (enabled: boolean) => void
   onOpenPermissions: () => void
-  /** Plan 075: turn System audio on again after the echo guard paused it. */
+  /** Plan 076: turn System audio on again after the echo guard paused it. */
   onResume: () => void
 }): ReactElement {
   const status =

@@ -107,7 +107,7 @@ describe('System audio mixer row (plan 069)', () => {
     expect(markup).toMatch(/role="switch"[^>]*disabled=""/)
   })
 
-  it('offers Resume when the echo guard paused it (plan 075)', () => {
+  it('offers Resume when the echo guard paused it (plan 076)', () => {
     const markup = render({ requested: true, sessionActive: true, confirmed: false, issue: 'echo' })
     expect(markup).toContain('data-videorc-system-audio-row="issue-echo"')
     expect(markup).toContain('aria-checked="true"')

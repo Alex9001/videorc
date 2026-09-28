@@ -39,10 +39,10 @@ pub(crate) const SYSTEM_AUDIO_SYNC_OFFSET_MS: i32 = 0;
 /// `health.event` codes (the renderer's `SYSTEM_AUDIO_*_CODE`).
 pub(crate) const SYSTEM_AUDIO_UNAVAILABLE_CODE: &str = "system-audio-unavailable";
 pub(crate) const SYSTEM_AUDIO_LOST_CODE: &str = "system-audio-lost";
-/// Plan 075: the bus paused system audio because it carried the stream back
+/// Plan 076: the bus paused system audio because it carried the stream back
 /// into itself.
 pub(crate) const SYSTEM_AUDIO_ECHO_PAUSED_CODE: &str = "system-audio-echo-paused";
-/// Plan 075: a timeline loss ended; the slot never left the mix.
+/// Plan 076: a timeline loss ended; the slot never left the mix.
 pub(crate) const SYSTEM_AUDIO_RECOVERED_CODE: &str = "system-audio-recovered";
 /// The session's microphone is a direct FFmpeg input (on Windows, the
 /// DirectShow fallback when the capture worker cannot open it, or a bundle
@@ -310,17 +310,17 @@ impl SessionSystemAudio {
         self.handle.claim_loss()
     }
 
-    /// One recovery per timeline loss that ended (plan 075).
+    /// One recovery per timeline loss that ended (plan 076).
     pub(crate) fn claim_recovery(&self) -> Option<SystemAudioRecovery> {
         self.handle.claim_recovery()
     }
 
-    /// One pause per loop the echo guard caught (plan 075).
+    /// One pause per loop the echo guard caught (plan 076).
     pub(crate) fn claim_echo_pause(&self) -> Option<SystemAudioEchoPause> {
         self.handle.claim_echo_pause()
     }
 
-    /// Live echo guard On/Off (plan 075).
+    /// Live echo guard On/Off (plan 076).
     pub(crate) fn set_echo_guard(&self, enabled: bool) {
         self.handle.set_echo_guard(enabled);
     }
@@ -679,7 +679,7 @@ mod tests {
     fn health_codes_match_the_capture_and_the_renderer() {
         assert_eq!(SYSTEM_AUDIO_UNAVAILABLE_CODE, "system-audio-unavailable");
         assert_eq!(SYSTEM_AUDIO_LOST_CODE, "system-audio-lost");
-        // Plan 075; the renderer's lib/system-audio-session.ts mirrors both.
+        // Plan 076; the renderer's lib/system-audio-session.ts mirrors both.
         assert_eq!(SYSTEM_AUDIO_ECHO_PAUSED_CODE, "system-audio-echo-paused");
         assert_eq!(SYSTEM_AUDIO_RECOVERED_CODE, "system-audio-recovered");
         #[cfg(target_os = "macos")]

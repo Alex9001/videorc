@@ -195,7 +195,7 @@ export function systemAudioProcessingDelta(
   if (known?.systemAudioGainDb !== desired.systemAudioGainDb) {
     delta.systemAudioGainDb = desired.systemAudioGainDb
   }
-  // Plan 075: absent means On on both sides.
+  // Plan 076: absent means On on both sides.
   const echoGuard = desired.systemAudioEchoGuard !== false
   if (!known || (known.systemAudioEchoGuard !== false) !== echoGuard) {
     delta.systemAudioEchoGuard = echoGuard

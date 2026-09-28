@@ -602,7 +602,7 @@ describe('systemAudioProcessingDelta (plan 069)', () => {
     })
   })
 
-  it('sends the echo guard only when it changes, and absent means On (plan 075)', () => {
+  it('sends the echo guard only when it changes, and absent means On (plan 076)', () => {
     expect(systemAudioProcessingDelta({ ...off, systemAudioEchoGuard: true }, off)).toStrictEqual(
       {}
     )

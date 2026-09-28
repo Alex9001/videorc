@@ -1,4 +1,4 @@
-// Output-stall smoke (plan 075 A): a healthy microphone survives FFmpeg
+// Output-stall smoke (plan 076 A): a healthy microphone survives FFmpeg
 // pausing its audio input.
 //
 // The owner's 2026-09-28 live stream (0.9.120) lost its microphone for the

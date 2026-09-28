@@ -1,4 +1,4 @@
-// Plan 075 A: an output stall must never retire a healthy microphone.
+// Plan 076 A: an output stall must never retire a healthy microphone.
 //
 // FFmpeg (8.1.1, threaded scheduler) stops draining the session audio FIFO
 // while its video input is late. The owner's 2026-09-28 live stream lost its

@@ -19,7 +19,7 @@ function windows(seconds, audible) {
 const stall = { code: 'audio-output-stalled', message: 'Output fell behind for 3.0 seconds.' }
 const base = { pauseStartSeconds: 4, pauseSeconds: 3, fileSeconds: 12 }
 
-describe('evaluateOutputStall (plan 075)', () => {
+describe('evaluateOutputStall (plan 076)', () => {
   it('passes when the microphone is back right after a reported stall', () => {
     const result = evaluateOutputStall({
       ...base,

@@ -415,7 +415,7 @@ impl AudioCaptureStats {
         );
     }
 
-    /// Plan 075: a source whose timeline loss ended is live again, and a later
+    /// Plan 076: a source whose timeline loss ended is live again, and a later
     /// loss is reported anew. A stopped source never comes back this way.
     pub(crate) fn mark_recovered(&self) {
         if self

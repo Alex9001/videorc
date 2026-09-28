@@ -112,7 +112,7 @@ pub struct BusLosses {
     /// Refused because it landed more than `MAX_BUFFERED_FRAMES` past the cursor.
     pub dropped_ahead_of_cap: u64,
     /// The part of `dropped_ahead_of_cap` that was on time by the wall clock
-    /// while the output had fallen behind (plan 075): the reader stalled, the
+    /// while the output had fallen behind (plan 076): the reader stalled, the
     /// source did not.
     pub dropped_output_behind: u64,
     /// Refused for a wrong generation, format, or non-finite samples.
@@ -254,7 +254,7 @@ impl AudioTimeline {
         PushOutcome::Placed
     }
 
-    /// Plan 075: a packet refused ahead of the cursor, but whose end lies
+    /// Plan 076: a packet refused ahead of the cursor, but whose end lies
     /// within the ahead limit of where the cursor would be if the output kept
     /// pace with the wall clock (`wall_cursor`), was on time. The output fell
     /// behind, not the source. Counted as `dropped_output_behind`.
@@ -974,7 +974,7 @@ pub struct SourceLoss {
     pub after_ms: u64,
 }
 
-/// A timeline loss that ended (plan 075): the source, which never stopped
+/// A timeline loss that ended (plan 076): the source, which never stopped
 /// delivering, placed audio again. A placement loss never retires a source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceRecovery {
@@ -987,7 +987,7 @@ pub struct SourceRecovery {
 }
 
 /// The output fell behind the wall clock and captured audio was replaced with
-/// silence (plan 075): the FIFO reader stopped draining, the sources did not.
+/// silence (plan 076): the FIFO reader stopped draining, the sources did not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputStallReport {
     pub duration_ms: u64,
@@ -1379,7 +1379,7 @@ impl SessionAudio {
     pub fn source_loss_after_ms(&self) -> Option<u64> {
         self.stats().source_loss_after_ms()
     }
-    /// The microphone producer is still owned: never retired (plan 075).
+    /// The microphone producer is still owned: never retired (plan 076).
     #[cfg(test)]
     pub fn microphone_owner_present(&self) -> bool {
         self.handle
@@ -1930,7 +1930,7 @@ fn wall_cursor_at(now: Instant, epoch: Instant, playout_delay: Duration) -> u64 
         / 1_000_000_000) as u64
 }
 
-/// How the bus judges a packet refused ahead of its cursor (plan 075).
+/// How the bus judges a packet refused ahead of its cursor (plan 076).
 #[derive(Debug, Clone, Copy)]
 struct Placement {
     epoch: Instant,
@@ -1965,10 +1965,10 @@ impl SourceActivity {
 }
 
 /// A source can only be re-anchored this often while its buffers keep
-/// failing to place (plan 075).
+/// failing to place (plan 076).
 const REANCHOR_INTERVAL: Duration = Duration::from_secs(10);
 
-/// A source whose buffers keep arriving but cannot be placed (plan 075). It
+/// A source whose buffers keep arriving but cannot be placed (plan 076). It
 /// is reported once, re-anchored at most every [`REANCHOR_INTERVAL`], never
 /// retired, and reported recovered at its next placed buffer. Only a stopped
 /// capture (EOF, a stall, a platform failure) retires a source.
@@ -2022,7 +2022,7 @@ const OUTPUT_CAUGHT_UP_FRAMES: u64 = 2_400;
 /// longer is stuck, not stalled, and its sources report the loss.
 const OUTPUT_STALL_FORGIVENESS: Duration = Duration::from_secs(15);
 
-/// Output-stall bookkeeping (plan 075). The cursor advances only as the FIFO
+/// Output-stall bookkeeping (plan 076). The cursor advances only as the FIFO
 /// reader drains; the wall clock does not wait. A bus that has kept pace and
 /// then falls behind is in a stall episode: the reader stopped (FFmpeg pauses
 /// its audio input while its video input is late), and a buffer that is on
@@ -2141,7 +2141,7 @@ fn push_microphone_loss(
     }
 }
 
-/// Acts on one system-slot observation at bus sample `cursor` (plan 075). A
+/// Acts on one system-slot observation at bus sample `cursor` (plan 076). A
 /// stopped capture ramps out; a timeline loss is reported while the slot
 /// stays in the mix, and so is its recovery.
 fn handle_slot_health(
@@ -2855,7 +2855,7 @@ pub struct SessionAudioOptions {
     /// Initial system-audio level; live changes use
     /// [`SystemAudioHandle::set_gain_db`].
     pub system_gain_db: f32,
-    /// Plan 075: pause system audio when it carries the stream back into
+    /// Plan 076: pause system audio when it carries the stream back into
     /// itself. Live changes use [`SystemAudioHandle::set_echo_guard`].
     pub echo_guard: bool,
 }
@@ -2944,7 +2944,7 @@ pub struct SystemAudioObservation {
 }
 
 /// The bus paused system audio because it carried the stream back into
-/// itself (plan 075): the microphone returned `lag_ms` later. The slot left
+/// itself (plan 076): the microphone returned `lag_ms` later. The slot left
 /// the mix; turning System audio on again resumes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemAudioEchoPause {
@@ -2952,7 +2952,7 @@ pub struct SystemAudioEchoPause {
     pub at_sample: u64,
 }
 
-/// System audio placed again after a timeline loss (plan 075). The slot never
+/// System audio placed again after a timeline loss (plan 076). The slot never
 /// left the mix; `gap_ms` of it was silence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemAudioRecovery {
@@ -2961,7 +2961,7 @@ pub struct SystemAudioRecovery {
 }
 
 /// A system source the platform reported lost mid-session. The bus ramped it
-/// out and keeps running on the microphone. A timeline loss (plan 075) is
+/// out and keeps running on the microphone. A timeline loss (plan 076) is
 /// reported the same way, but its slot stays in the mix and re-anchors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemAudioLoss {
@@ -3126,7 +3126,7 @@ impl SystemAudioHandle {
             .pop_front()
     }
 
-    /// Plan 075: whether a detected loop pauses system audio. Off, a loop is
+    /// Plan 076: whether a detected loop pauses system audio. Off, a loop is
     /// only logged.
     pub fn set_echo_guard(&self, enabled: bool) {
         self.echo_guard.store(enabled, Ordering::Release);
@@ -3194,7 +3194,7 @@ struct SourceSlot {
     exit: Option<SlotExit>,
     /// The bus's playout delay: where the cursor would be by the wall clock.
     playout_delay: Duration,
-    /// Set by the bus before every ingest pass (plan 075): the output is in
+    /// Set by the bus before every ingest pass (plan 076): the output is in
     /// a stall episode, so a buffer on time by the wall clock is not refused
     /// by this source's fault.
     output_behind: bool,
@@ -3204,11 +3204,11 @@ struct SourceSlot {
     unplayable_since: Option<Instant>,
     last_placed: Instant,
     /// That run lasted [`SYSTEM_UNPLAYABLE_LOSS_AFTER`]: reported once, then
-    /// re-anchored until a buffer places again (plan 075). Never an exit.
+    /// re-anchored until a buffer places again (plan 076). Never an exit.
     fault: TimelineFault,
 }
 
-/// What one ingest pass of a mixed source observed (plan 075).
+/// What one ingest pass of a mixed source observed (plan 076).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SlotHealth {
     Healthy,
@@ -3651,7 +3651,7 @@ struct BusContext<'a> {
     source_stall_timeout: Duration,
     timing: BusTiming,
     shared: &'a std::sync::Mutex<AudioShared>,
-    /// Plan 075: a detected loop pauses system audio.
+    /// Plan 076: a detected loop pauses system audio.
     echo_guard: &'a AtomicBool,
 }
 
@@ -3866,7 +3866,7 @@ fn run_bus_owned(
     let mut activity = SourceActivity::new(Instant::now());
     let mut microphone_fault = TimelineFault::default();
     let mut stall = OutputStall::default();
-    // Plan 075: the microphone's band envelope, and the system slot's while
+    // Plan 076: the microphone's band envelope, and the system slot's while
     // one mixes, feed the loop detector.
     let mut echo = crate::echo_guard::EchoWatch::default();
     let mut echo_slot = false;
@@ -3983,7 +3983,7 @@ fn run_bus_owned(
                 producer_stats = None;
                 push_microphone_loss(shared, &stats, SourceLossReason::CaptureStopped, generation);
             }
-            // Plan 075: buffers keep arriving but none place. The input is
+            // Plan 076: buffers keep arriving but none place. The input is
             // healthy, so it stays open: reported once, re-anchored, and
             // reported again when it places.
             Some(SourceLossReason::TimelineRejected) => {
@@ -4322,7 +4322,7 @@ fn run_bus_owned(
             }
             // The FIFO reader is behind. Keep ingesting so a bursty reader
             // never pushes the microphone into the timeline's drop path, and
-            // keep the stall episode current (plan 075): a reader that stops
+            // keep the stall episode current (plan 076): a reader that stops
             // for seconds is the output's fault, not the sources'.
             let now = Instant::now();
             if let Some(report) = stall.observe(
@@ -6736,7 +6736,7 @@ mod mix_tests {
 
     /// A reader that, once it has read `stall.0` frames, stops draining the
     /// FIFO for `stall.1`: FFmpeg pausing its audio input while its video
-    /// input is late (plan 075).
+    /// input is late (plan 076).
     fn spawn_fifo_reader_with_stall(
         path: PathBuf,
         mut stall: Option<(usize, Duration)>,
@@ -7219,7 +7219,7 @@ mod mix_tests {
             .count()
     }
 
-    /// Plan 075, the owner's stream 1: FFmpeg stopped draining the audio
+    /// Plan 076, the owner's stream 1: FFmpeg stopped draining the audio
     /// FIFO for about 3 s (its audio input paused while video was late). The
     /// microphone kept delivering, so it is never retired: the stretch the
     /// reader missed is silent, the microphone is back as soon as the reader
@@ -7347,7 +7347,7 @@ mod mix_tests {
         })
     }
 
-    /// Plan 075, the owner's stream 2: a Twitch tab plays the stream 3.16 s
+    /// Plan 076, the owner's stream 2: a Twitch tab plays the stream 3.16 s
     /// behind while System audio is on, so the microphone comes back through
     /// it. The echo guard pauses system audio (the slot ramps out and a pause
     /// is reported with the lag) and the microphone is untouched.
@@ -8320,7 +8320,7 @@ mod mix_tests {
         let reason = feed(&mut slot, restart + Duration::from_secs(2), far)
             .expect("2 s of unplaceable buffers is a loss");
         assert!(reason.contains("drifted out of range"), "{reason}");
-        // Plan 075: the buffers kept arriving, so this is a placement loss,
+        // Plan 076: the buffers kept arriving, so this is a placement loss,
         // reported once. The slot stays in the mix and re-anchors; it never
         // exits for it.
         assert!(slot.exit.is_none());

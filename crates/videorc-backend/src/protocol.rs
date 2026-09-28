@@ -1198,7 +1198,7 @@ pub struct AudioSettings {
     #[serde(default = "default_system_audio_gain_db")]
     pub system_audio_gain_db: f32,
     /// Pause System audio when it carries the streamer's own stream back
-    /// into itself (plan 075). On by default; older clients omit the key.
+    /// into itself (plan 076). On by default; older clients omit the key.
     #[serde(default = "default_true")]
     pub system_audio_echo_guard: bool,
 }
@@ -1253,7 +1253,7 @@ pub struct AudioProcessingUpdateParams {
     /// Live System audio level in dB. Omitted means "unchanged".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_audio_gain_db: Option<f32>,
-    /// Live echo guard On/Off (plan 075). Omitted means "unchanged".
+    /// Live echo guard On/Off (plan 076). Omitted means "unchanged".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_audio_echo_guard: Option<bool>,
 }

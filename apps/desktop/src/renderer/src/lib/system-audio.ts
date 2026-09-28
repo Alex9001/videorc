@@ -128,11 +128,11 @@ export function systemAudioIssueCopy(issue: SystemAudioIssue): string {
 
 /** The window event the Studio answers by turning System audio on again. */
 export const SYSTEM_AUDIO_RESUME_EVENT = 'videorc:resume-system-audio'
-/** The toast the echo guard's pause shows (plan 075). */
+/** The toast the echo guard's pause shows (plan 076). */
 export const SYSTEM_AUDIO_ECHO_TOAST_ID = 'system-audio-echo-paused'
 
 /**
- * Plan 075: resume System audio after the echo guard paused it. The Studio
+ * Plan 076: resume System audio after the echo guard paused it. The Studio
  * owns the switch; a lazy surface asks through a window event.
  */
 export function requestSystemAudioResume(): void {

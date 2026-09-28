@@ -232,7 +232,7 @@ it('recovers both audio sources after reconnect without dropping either explanat
   ).toBeNull()
 })
 
-describe('session audio news (plan 075)', () => {
+describe('session audio news (plan 076)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
   })

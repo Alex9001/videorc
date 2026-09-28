@@ -47,7 +47,7 @@ describe('Studio inputs System audio row (plan 069)', () => {
     expect(markup).toContain('aria-checked="true"')
   })
 
-  it('puts Resume where the status goes when the echo guard paused it (plan 075)', () => {
+  it('puts Resume where the status goes when the echo guard paused it (plan 076)', () => {
     const markup = render({ requested: true, sessionActive: true, confirmed: false, issue: 'echo' })
     expect(markup).toContain('>Resume<')
     expect(markup).toContain('coming back as an echo')
