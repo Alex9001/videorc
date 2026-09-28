@@ -2565,6 +2565,9 @@ pub async fn update_active_audio_processing(
             if let Some(gain_db) = params.system_audio_gain_db {
                 system_audio.set_gain_db(gain_db);
             }
+            if let Some(echo_guard) = params.system_audio_echo_guard {
+                system_audio.set_echo_guard(echo_guard);
+            }
             if let Some(enabled) = params.system_audio_enabled {
                 system_audio.request(enabled);
             }
@@ -8161,6 +8164,8 @@ struct SystemAudioSample {
     losses: Vec<crate::session_audio::SystemAudioLoss>,
     /// Plan 075: timeline losses that ended with the slot still in the mix.
     recoveries: Vec<crate::session_audio::SystemAudioRecovery>,
+    /// Plan 075: loops the echo guard paused.
+    echo_pauses: Vec<crate::session_audio::SystemAudioEchoPause>,
 }
 
 /// `None` where the session cannot mix system audio (its `diagnostics.stats`
@@ -8170,6 +8175,7 @@ fn system_audio_sample(active: &ActiveRecording) -> Option<SystemAudioSample> {
     Some(SystemAudioSample {
         losses: std::iter::from_fn(|| system_audio.claim_loss()).collect(),
         recoveries: std::iter::from_fn(|| system_audio.claim_recovery()).collect(),
+        echo_pauses: std::iter::from_fn(|| system_audio.claim_echo_pause()).collect(),
         observation: system_audio.observation(),
     })
 }
@@ -8187,10 +8193,39 @@ fn emit_system_audio_sample_events(
     for recovery in &sample.recoveries {
         emit_system_audio_recovered_health_event(state, session_id, recovery);
     }
-    sample
-        .losses
-        .iter()
-        .any(|loss| loss.kind == crate::session_audio::SourceLossReason::CaptureStopped)
+    for pause in &sample.echo_pauses {
+        emit_system_audio_echo_paused_health_event(state, session_id, pause);
+    }
+    !sample.echo_pauses.is_empty()
+        || sample
+            .losses
+            .iter()
+            .any(|loss| loss.kind == crate::session_audio::SourceLossReason::CaptureStopped)
+}
+
+/// Plan 075: the echo guard paused system audio. Free of device words, so
+/// the health row links no permission pane.
+fn emit_system_audio_echo_paused_health_event(
+    state: &AppState,
+    session_id: &str,
+    pause: &crate::session_audio::SystemAudioEchoPause,
+) {
+    let message = system_audio_echo_paused_message(pause.lag_ms);
+    state.emit_log("warn", &message);
+    let _ = emit_health_event(
+        state,
+        Some(session_id),
+        HealthLevel::Warn,
+        crate::system_audio_session::SYSTEM_AUDIO_ECHO_PAUSED_CODE,
+        &message,
+    );
+}
+
+fn system_audio_echo_paused_message(lag_ms: u32) -> String {
+    format!(
+        "System audio is paused: your stream is playing on this Mac and came back {:.1} seconds later, so viewers heard it twice. Mute that tab, then turn System audio on again.",
+        f64::from(lag_ms) / 1_000.0
+    )
 }
 
 /// Plan 075: the output stalled and audio in the gap is silent. Free of
@@ -17464,6 +17499,7 @@ fn session_audio_options(
             microphone_delay_frames: split.microphone_delay_frames,
             system_delay_frames: split.system_delay_frames,
             system_gain_db: audio.system_audio_gain_db,
+            echo_guard: audio.system_audio_echo_guard,
         },
         None => crate::session_audio::SessionAudioOptions::default(),
     }
@@ -30764,6 +30800,7 @@ mod tests {
                     microphone_muted: false,
                     system_audio_enabled: None,
                     system_audio_gain_db: None,
+                    system_audio_echo_guard: None,
                 },
             )
             .await
@@ -30812,6 +30849,7 @@ mod tests {
                 microphone_muted: true,
                 system_audio_enabled: None,
                 system_audio_gain_db: None,
+                system_audio_echo_guard: None,
             },
         )
         .await;
@@ -35347,6 +35385,7 @@ mod tests {
                         microphone_muted: false,
                         system_audio_enabled: enabled,
                         system_audio_gain_db: Some(-3.0),
+                        system_audio_echo_guard: None,
                     },
                 )
                 .await
@@ -35597,6 +35636,7 @@ mod tests {
                     microphone_muted: true,
                     system_audio_enabled: Some(true),
                     system_audio_gain_db: Some(6.0),
+                    system_audio_echo_guard: None,
                 },
             )
             .await;
@@ -35765,6 +35805,7 @@ mod tests {
                 microphone_muted: false,
                 system_audio_enabled: enabled,
                 system_audio_gain_db: Some(-3.0),
+                system_audio_echo_guard: None,
             };
             let result = update_active_audio_processing(&state, update(Some(true))).await;
             assert!(result.applied, "{result:?}");

@@ -1781,6 +1781,7 @@ pub fn attach_prepared_with(
     });
     let (system_commands, system_command_rx) = mpsc::sync_channel(2);
     let system_count = Arc::new(AtomicU64::new(0));
+    let echo_guard = Arc::new(AtomicBool::new(options.echo_guard));
     let system = SystemAudioHandle {
         commands: system_commands,
         shared: shared.clone(),
@@ -1788,6 +1789,7 @@ pub fn attach_prepared_with(
         count: system_count.clone(),
         stop: stop.clone(),
         draining: draining.clone(),
+        echo_guard: echo_guard.clone(),
     };
     let timing = BusTiming {
         playout_delay: options.playout_delay,
@@ -1827,6 +1829,7 @@ pub fn attach_prepared_with(
                         source_stall_timeout,
                         timing,
                         shared: &shared,
+                        echo_guard: &echo_guard,
                     },
                 )
             });
@@ -2846,6 +2849,9 @@ pub struct SessionAudioOptions {
     /// Initial system-audio level; live changes use
     /// [`SystemAudioHandle::set_gain_db`].
     pub system_gain_db: f32,
+    /// Plan 075: pause system audio when it carries the stream back into
+    /// itself. Live changes use [`SystemAudioHandle::set_echo_guard`].
+    pub echo_guard: bool,
 }
 impl Default for SessionAudioOptions {
     fn default() -> Self {
@@ -2854,6 +2860,7 @@ impl Default for SessionAudioOptions {
             microphone_delay_frames: 0,
             system_delay_frames: 0,
             system_gain_db: crate::protocol::SYSTEM_AUDIO_GAIN_DB_DEFAULT,
+            echo_guard: true,
         }
     }
 }
@@ -2930,6 +2937,15 @@ pub struct SystemAudioObservation {
     pub mix_clipped_samples: u64,
 }
 
+/// The bus paused system audio because it carried the stream back into
+/// itself (plan 075): the microphone returned `lag_ms` later. The slot left
+/// the mix; turning System audio on again resumes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemAudioEchoPause {
+    pub lag_ms: u32,
+    pub at_sample: u64,
+}
+
 /// System audio placed again after a timeline loss (plan 075). The slot never
 /// left the mix; `gap_ms` of it was silence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2956,6 +2972,7 @@ struct SystemShared {
     cutover_sample: Option<u64>,
     losses: VecDeque<SystemAudioLoss>,
     recoveries: VecDeque<SystemAudioRecovery>,
+    echo_pauses: VecDeque<SystemAudioEchoPause>,
 }
 
 enum SystemCommand {
@@ -2999,6 +3016,7 @@ pub struct SystemAudioHandle {
     count: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
+    echo_guard: Arc<AtomicBool>,
 }
 impl SystemAudioHandle {
     /// Opens a system-audio capture on its own owner thread, inside the
@@ -3102,6 +3120,22 @@ impl SystemAudioHandle {
             .pop_front()
     }
 
+    /// Plan 075: whether a detected loop pauses system audio. Off, a loop is
+    /// only logged.
+    pub fn set_echo_guard(&self, enabled: bool) {
+        self.echo_guard.store(enabled, Ordering::Release);
+    }
+
+    /// One `system-audio-echo-paused` event per pause.
+    pub fn claim_echo_pause(&self) -> Option<SystemAudioEchoPause> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .system
+            .echo_pauses
+            .pop_front()
+    }
+
     /// One `system-audio-recovered` event per timeline loss that ended.
     pub fn claim_recovery(&self) -> Option<SystemAudioRecovery> {
         self.shared
@@ -3131,6 +3165,8 @@ enum SlotExit {
     },
     /// A silent drain ended capture: a deliberate stop, never a loss.
     Drained { cutover_sample: u64 },
+    /// The echo guard paused it: it carried the stream back into itself.
+    EchoPaused { cutover_sample: u64, lag_ms: u32 },
 }
 
 /// A mixed source beside the microphone. It has its own timeline, clock,
@@ -3515,6 +3551,24 @@ fn retire_system_slot(
             });
         }
     }
+    if let Some(SlotExit::EchoPaused {
+        cutover_sample,
+        lag_ms,
+    }) = &exit
+    {
+        tracing::warn!(
+            "System audio left the mix at sample {cutover_sample}: it carried the stream back {lag_ms} ms later."
+        );
+        shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .system
+            .echo_pauses
+            .push_back(SystemAudioEchoPause {
+                lag_ms: *lag_ms,
+                at_sample: *cutover_sample,
+            });
+    }
     if let Some(SlotExit::Drained { cutover_sample }) = &exit {
         tracing::info!(
             "System audio left the mix for the silent drain at sample {cutover_sample}."
@@ -3591,6 +3645,8 @@ struct BusContext<'a> {
     source_stall_timeout: Duration,
     timing: BusTiming,
     shared: &'a std::sync::Mutex<AudioShared>,
+    /// Plan 075: a detected loop pauses system audio.
+    echo_guard: &'a AtomicBool,
 }
 
 fn run_bus(
@@ -3723,6 +3779,7 @@ fn run_bus_owned(
         source_stall_timeout,
         timing,
         shared,
+        echo_guard,
     } = context;
     let playout_delay = timing.playout_delay;
     // Plan 069: the system slot, and the limiter that runs only while one is
@@ -3803,6 +3860,11 @@ fn run_bus_owned(
     let mut activity = SourceActivity::new(Instant::now());
     let mut microphone_fault = TimelineFault::default();
     let mut stall = OutputStall::default();
+    // Plan 075: the microphone's band envelope, and the system slot's while
+    // one mixes, feed the loop detector.
+    let mut echo = crate::echo_guard::EchoWatch::default();
+    let mut echo_slot = false;
+    let mut echo_logged = false;
     let mut clock = None;
     let mut accounted = AudioBusCounters::default();
     let mut diagnostics = BusDiagnostics::default();
@@ -3965,6 +4027,34 @@ fn run_bus_owned(
             // signal or the end of the stream retires a system source.
             let health = slot.ingest_health(epoch);
             handle_slot_health(slot, health, timeline.cursor(), shared);
+        }
+        if echo_slot != system.is_some() {
+            echo_slot = system.is_some();
+            echo_logged = false;
+            echo.system_changed();
+        }
+        if let Some(found) = echo.take_detection()
+            && let Some(slot) = system.as_mut()
+            && slot.exit.is_none()
+        {
+            let cutover_sample = timeline.cursor();
+            if echo_guard.load(Ordering::Acquire) {
+                tracing::warn!(
+                    lag_ms = found.lag_ms,
+                    correlation = found.correlation,
+                    "System audio carries the stream back into itself; pausing it."
+                );
+                slot.begin_exit(SlotExit::EchoPaused {
+                    cutover_sample,
+                    lag_ms: found.lag_ms,
+                });
+            } else if !echo_logged {
+                echo_logged = true;
+                tracing::warn!(
+                    lag_ms = found.lag_ms,
+                    "System audio carries the stream back into itself; the echo guard is off."
+                );
+            }
         }
         let now = Instant::now();
         let wall_cursor = wall_cursor_at(now, epoch, playout_delay);
@@ -4341,6 +4431,16 @@ fn run_bus_owned(
             if let Some(observer) = observer {
                 observer(start);
             }
+        }
+        if !draining.load(Ordering::Acquire) {
+            let mixing_system = system.as_ref().is_some_and(|slot| slot.exit.is_none());
+            echo.chunk(
+                &microphone_samples,
+                mixed
+                    .as_ref()
+                    .filter(|_| mixing_system)
+                    .map(|(system, _)| system.as_slice()),
+            );
         }
         let frame = AudioFrame {
             timestamp_micros: start * 1_000_000 / u64::from(NATIVE_AUDIO_SAMPLE_RATE),
@@ -7230,6 +7330,66 @@ mod mix_tests {
             frames_at(&samples, 288_000, 384_000, 0.2),
             96_000,
             "placed again from its capture times"
+        );
+    }
+
+    /// Mono samples as stereo packets of `packet_frames`, stamped like a
+    /// real device from `epoch`.
+    fn mono_packets(epoch: Instant, mono: &[f32], packet_frames: usize) -> Vec<AudioFrame> {
+        signal_packets(epoch, 0, mono.len(), packet_frames, |position| {
+            (mono[position], mono[position])
+        })
+    }
+
+    /// Plan 075, the owner's stream 2: a Twitch tab plays the stream 3.16 s
+    /// behind while System audio is on, so the microphone comes back through
+    /// it. The echo guard pauses system audio (the slot ramps out and a pause
+    /// is reported with the lag) and the microphone is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_echo_guard_pauses_system_audio_that_carries_the_stream_back() {
+        use crate::echo_guard::fixtures::{looped, music, speech};
+        let seconds = 22.0;
+        let voice = speech(seconds, 7, 0.25);
+        let system_signal = looped(&voice, &music(seconds, 0.12), 3.16, 0.5);
+        let epoch = Instant::now() + Duration::from_millis(100);
+        let bus = start_bus(
+            epoch,
+            Some(mono_packets(epoch, &voice, 480)),
+            AudioProcessingSettings::default(),
+            system_options(),
+        )
+        .await;
+        let system = bus.session.system_audio();
+        let producer = prepare_system(
+            &system,
+            mono_packets(epoch, &system_signal, 960),
+            quiet_failure(),
+        )
+        .await;
+        bus.session.attach_system(producer).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while system.observation().attached {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the guard paused system audio");
+        let pause = system.claim_echo_pause().expect("a pause is reported");
+        assert!(pause.lag_ms.abs_diff(3_160) <= 30, "{pause:?}");
+        assert_eq!(system.claim_loss(), None, "a pause is not a loss");
+        let cutover = pause.at_sample as usize;
+        bus.wait_for_frames(cutover + 48_000).await;
+        let (bytes, _) = bus.finish();
+        let samples = decode(&bytes);
+        // The microphone path flushes near-silent samples to zero, so compare
+        // within a hair; any system audio left would be orders larger.
+        let after = cutover + RAMP_FRAMES as usize;
+        let worst = (after..cutover + 48_000)
+            .map(|frame| (samples[frame * 2] - voice[frame]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            worst <= 1.0e-4,
+            "after the pause the output is the microphone alone (worst {worst})"
         );
     }
 

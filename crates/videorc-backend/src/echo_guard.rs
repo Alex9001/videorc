@@ -339,30 +339,29 @@ fn spawn_worker(history: VecDeque<f32>) -> Option<Worker> {
     }
 }
 
+/// Synthetic audio for the detector's tests and the bus's end-to-end guard
+/// test: speech-like voice, strictly periodic music, and recursive loops.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const RATE: usize = 48_000;
-    const CHUNK: usize = 480;
+pub(crate) mod fixtures {
+    pub(crate) const RATE: usize = 48_000;
 
     /// Deterministic noise.
-    struct Noise(u64);
+    pub(crate) struct Noise(pub(crate) u64);
     impl Noise {
-        fn next(&mut self) -> f32 {
+        pub(crate) fn next(&mut self) -> f32 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         }
-        fn range(&mut self, low: f32, high: f32) -> f32 {
+        pub(crate) fn range(&mut self, low: f32, high: f32) -> f32 {
             low + (self.next() * 0.5 + 0.5) * (high - low)
         }
     }
 
     /// Speech-like mono: voiced syllables (harmonics on a wandering pitch,
     /// plus breath noise) of 80–260 ms, short gaps, and word pauses.
-    fn speech(seconds: f32, seed: u64, level: f32) -> Vec<f32> {
+    pub(crate) fn speech(seconds: f32, seed: u64, level: f32) -> Vec<f32> {
         let total = (seconds * RATE as f32) as usize;
         let mut noise = Noise(seed);
         let mut out = vec![0.0; total];
@@ -399,7 +398,7 @@ mod tests {
 
     /// Strictly periodic music (120 BPM, one bar repeating): the worst case
     /// for a detector that correlates onsets.
-    fn music(seconds: f32, level: f32) -> Vec<f32> {
+    pub(crate) fn music(seconds: f32, level: f32) -> Vec<f32> {
         let total = (seconds * RATE as f32) as usize;
         let beat = RATE / 2;
         let mut noise = Noise(99);
@@ -432,21 +431,26 @@ mod tests {
             .collect()
     }
 
-    fn delayed(signal: &[f32], frames: usize) -> Vec<f32> {
+    pub(crate) fn delayed(signal: &[f32], frames: usize) -> Vec<f32> {
         let mut out = vec![0.0; signal.len()];
         out[frames.min(signal.len())..]
             .copy_from_slice(&signal[..signal.len().saturating_sub(frames)]);
         out
     }
 
-    fn add(a: &[f32], b: &[f32], gain: f32) -> Vec<f32> {
+    pub(crate) fn add(a: &[f32], b: &[f32], gain: f32) -> Vec<f32> {
         a.iter().zip(b).map(|(a, b)| a + gain * b).collect()
     }
 
     /// The loop: system = `extra` plus the stream (mic + system) played back
     /// `lag` later through a codec-ish low-pass at `gain`. Recursive, as a
     /// real loop is.
-    fn looped(microphone: &[f32], extra: &[f32], lag_seconds: f32, gain: f32) -> Vec<f32> {
+    pub(crate) fn looped(
+        microphone: &[f32],
+        extra: &[f32],
+        lag_seconds: f32,
+        gain: f32,
+    ) -> Vec<f32> {
         let lag = (lag_seconds * RATE as f32) as usize;
         let mut system = extra.to_vec();
         let mut smooth = 0.0;
@@ -457,6 +461,14 @@ mod tests {
         }
         system
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+
+    const CHUNK: usize = 480;
 
     fn stereo(mono: &[f32], from: usize) -> Vec<f32> {
         mono[from..from + CHUNK]
