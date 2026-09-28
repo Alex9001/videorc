@@ -12,10 +12,18 @@ const toastSpies = vi.hoisted(() => ({
 }))
 vi.mock('sonner', () => ({ toast: toastSpies }))
 // The highlight card is painted on an OffscreenCanvas, which the node test
-// environment lacks. Only the painter is stubbed; layout stays real elsewhere.
+// environment lacks. Only the painter (and the card pair it paints, whose
+// vertical card exists exactly when a vertical canvas is passed) is stubbed;
+// layout stays real elsewhere.
 vi.mock('@/lib/caption-overlay', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/caption-overlay')>()),
-  renderCommentHighlightPng: async () => 'cG5n'
+  renderCommentHighlightPng: async () => 'cG5n',
+  renderCommentHighlightCards: async (
+    _message: unknown,
+    _avatarUrl: unknown,
+    _stream: unknown,
+    vertical?: unknown
+  ) => (vertical ? { pngBase64: 'cG5n', verticalPngBase64: 'cG5n' } : { pngBase64: 'cG5n' })
 }))
 
 import { revealInFileManagerLabel } from '@/lib/platform'
@@ -465,6 +473,7 @@ class StudioBackend {
     updatedAt: now
   }
   commentHighlightState: CommentHighlightState = { generation: 0, phase: 'idle' }
+  commentHighlightCanvases: { vertical?: { width: number; height: number } } = {}
   commentHighlightClearOutcomeUnknownRemaining = 0
   liveChatSendOperations: CommentsSendOperation[] = []
   liveChatSendFailure: { code: string; message: string } | null = null
@@ -744,6 +753,8 @@ class StudioBackend {
           })
         }
         return this.commentHighlightState
+      case 'comments.highlight.canvases':
+        return this.commentHighlightCanvases
       case 'comments.highlight.set':
         this.commentHighlightState = {
           sessionId: String(params.sessionId),
@@ -2241,6 +2252,57 @@ describe('real StudioProvider lifecycle', () => {
     await act(async () => emitIpc?.('onCommentsWindowState', windowState('middle')))
     await waitForObservation(() => highlightSets().length === 3)
     expect(highlightSets()[2]!.params).toMatchObject({ anchor: 'bottom-left' })
+  })
+
+  it('sends a second card for the vertical leg only when the backend reports one', async () => {
+    const backend = new StudioBackend()
+    backend.liveChatSnapshot = {
+      sessionId: highlightMessage.sessionId,
+      providers: [],
+      messages: [highlightMessage],
+      unreadCount: 0,
+      updatedAt: now
+    }
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => []
+    })
+    const testDom = installProviderTestEnvironment(api)
+    restoreEnvironment = testDom.restore
+    const observations: StudioObservation[] = []
+    const latest = (): StudioObservation | undefined => observations.at(-1)
+    root = await mountStudioProvider(testDom.container, (value) => {
+      observations.push(value)
+    })
+    await waitForObservation(
+      () =>
+        latest()?.core.wsStatus === 'connected' &&
+        backend.commands.some((command) => command.method === 'liveChat.status')
+    )
+    const highlightSets = (): BackendCommand[] =>
+      backend.commands.filter((command) => command.method === 'comments.highlight.set')
+
+    // Horizontal-only session: one card, no vertical raster on the wire.
+    await act(async () => latest()!.core.toggleCommentHighlight(highlightMessage))
+    await waitForObservation(() => highlightSets().length === 1)
+    expect(highlightSets()[0]!.params).not.toHaveProperty('verticalPngBase64')
+
+    // Dual-orientation session (plan 074): the vertical leg gets its own card.
+    await act(async () => latest()!.core.toggleCommentHighlight(highlightMessage))
+    await waitForObservation(() => latest()?.core.commentHighlightState.phase === 'idle')
+    backend.commentHighlightCanvases = { vertical: { width: 1080, height: 1920 } }
+    await act(async () => latest()!.core.toggleCommentHighlight(highlightMessage))
+    await waitForObservation(() => highlightSets().length === 2)
+    expect(highlightSets()[1]!.params).toMatchObject({
+      messageId: highlightMessage.id,
+      pngBase64: 'cG5n',
+      verticalPngBase64: 'cG5n'
+    })
   })
 
   it('returns success to Main after reconciling an outcome-unknown detached highlight request', async () => {

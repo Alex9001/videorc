@@ -112,6 +112,11 @@ pub struct SetCommentHighlightParams {
     /// `"position": "top"`, which is accepted and ignored.
     #[serde(default)]
     pub anchor: CommentHighlightAnchor,
+    /// The same card rasterized for the vertical simulcast leg's portrait
+    /// canvas (see `comments.highlight.canvases`). Missing => the vertical leg
+    /// streams without the card; ignored when the session has no vertical leg.
+    #[serde(default)]
+    pub vertical_png_base64: Option<String>,
     #[cfg(test)]
     #[serde(skip)]
     preparation_blocker: Option<CommentHighlightPreparationBlocker>,
@@ -296,6 +301,32 @@ pub async fn comment_highlight_status(state: &AppState) -> CommentHighlightState
     state.comment_highlight.lock().await.clone()
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentHighlightCanvas {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Which extra canvases the active session burns the card on, so the renderer
+/// knows to rasterize a second card. Today only the vertical simulcast leg.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentHighlightCanvases {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vertical: Option<CommentHighlightCanvas>,
+}
+
+pub async fn comment_highlight_canvases(state: &AppState) -> CommentHighlightCanvases {
+    let recording = state.recording.lock().await;
+    CommentHighlightCanvases {
+        vertical: recording
+            .as_ref()
+            .and_then(|active| active.comment_highlight_vertical_canvas)
+            .map(|(width, height)| CommentHighlightCanvas { width, height }),
+    }
+}
+
 pub async fn set_comment_highlight(
     state: &AppState,
     params: SetCommentHighlightParams,
@@ -316,6 +347,10 @@ async fn set_comment_highlight_with_ttl(
     }
 
     let png_base64 = std::mem::take(&mut params.png_base64);
+    let vertical_png_base64 = params
+        .vertical_png_base64
+        .take()
+        .filter(|value| !value.trim().is_empty());
     #[cfg(test)]
     let preparation_blocker = params.preparation_blocker.take();
     #[cfg(test)]
@@ -328,7 +363,15 @@ async fn set_comment_highlight_with_ttl(
         if let Some(blocker) = preparation_blocker.as_ref() {
             blocker.block();
         }
-        crate::captions::prepare_caption_overlay(&png_base64)
+        let horizontal = crate::captions::prepare_caption_overlay(&png_base64)?;
+        let vertical = vertical_png_base64
+            .as_deref()
+            .map(crate::captions::prepare_caption_overlay)
+            .transpose()?;
+        anyhow::Ok(PreparedHighlight {
+            horizontal,
+            vertical,
+        })
     })
     .await
     .map_err(|error| {
@@ -369,11 +412,28 @@ async fn set_comment_highlight_with_ttl(
         message,
     };
     validate_eligibility(&params, &eligibility)?;
+    let session_has_vertical_leg = recording
+        .as_ref()
+        .is_some_and(|active| active.comment_highlight_vertical_canvas.is_some());
+    let prepared = PreparedHighlight {
+        vertical: prepared.vertical.filter(|_| session_has_vertical_leg),
+        ..prepared
+    };
+    let anchor = params.anchor;
+    let vertical_card = prepared.vertical.is_some();
 
     let mut highlight = state.comment_highlight.lock().await;
     let snapshot = install_validated_highlight(state, &mut highlight, params, prepared, ttl);
     let generation = snapshot.generation;
     emit_state(state, &snapshot);
+    tracing::info!(
+        session = snapshot.session_id.as_deref().unwrap_or_default(),
+        generation,
+        ?anchor,
+        vertical_card,
+        session_has_vertical_leg,
+        "comment highlight on stream"
+    );
     drop(highlight);
     drop(compositor);
     drop(_commit);
@@ -386,18 +446,37 @@ async fn set_comment_highlight_with_ttl(
 /// Install and publish the already-decoded overlay as one bounded synchronous
 /// critical section. Preparation failure returned before these locks preserves
 /// both the old pixels and the matching generation/state.
+struct PreparedHighlight {
+    horizontal: crate::captions::PreparedCaptionOverlay,
+    vertical: Option<crate::captions::PreparedCaptionOverlay>,
+}
+
 fn install_validated_highlight(
     state: &AppState,
     highlight: &mut CommentHighlightState,
     params: SetCommentHighlightParams,
-    prepared: crate::captions::PreparedCaptionOverlay,
+    prepared: PreparedHighlight,
     ttl: Duration,
 ) -> CommentHighlightState {
     crate::captions::install_prepared_caption_overlay(
         &state.highlight_overlay,
-        prepared,
+        prepared.horizontal,
         params.anchor,
     );
+    // A replacement without a vertical raster must not leave the previous
+    // card on the vertical leg.
+    match prepared.vertical {
+        Some(vertical) => {
+            crate::captions::install_prepared_caption_overlay(
+                &state.simulcast_highlight_overlay,
+                vertical,
+                params.anchor,
+            );
+        }
+        None => {
+            crate::captions::clear_caption_overlay(&state.simulcast_highlight_overlay);
+        }
+    }
 
     let generation = next_generation(highlight.generation);
     let expires_at =
@@ -427,7 +506,7 @@ async fn expire_generation(state: &AppState, generation: u64) -> bool {
         return false;
     }
 
-    crate::captions::clear_caption_overlay(&state.highlight_overlay);
+    clear_highlight_overlays(state);
     *highlight = CommentHighlightState {
         generation: next_generation(highlight.generation),
         reason: Some("expired".to_string()),
@@ -436,6 +515,7 @@ async fn expire_generation(state: &AppState, generation: u64) -> bool {
     let snapshot = highlight.clone();
     drop(highlight);
     emit_state(state, &snapshot);
+    tracing::info!(generation, "comment highlight expired");
     true
 }
 
@@ -463,8 +543,9 @@ async fn clear_internal_under_commit_fence(
         return highlight.clone();
     }
 
-    let overlay_active =
-        crate::captions::current_caption_overlay(&state.highlight_overlay).is_some();
+    let overlay_active = crate::captions::current_caption_overlay(&state.highlight_overlay)
+        .is_some()
+        || crate::captions::current_caption_overlay(&state.simulcast_highlight_overlay).is_some();
     if highlight.phase == CommentHighlightPhase::Idle
         && highlight.session_id.is_none()
         && highlight.message_id.is_none()
@@ -473,7 +554,7 @@ async fn clear_internal_under_commit_fence(
         return highlight.clone();
     }
 
-    crate::captions::clear_caption_overlay(&state.highlight_overlay);
+    clear_highlight_overlays(state);
     *highlight = CommentHighlightState {
         generation: next_generation(highlight.generation),
         reason: Some(reason.to_string()),
@@ -482,7 +563,13 @@ async fn clear_internal_under_commit_fence(
     let snapshot = highlight.clone();
     drop(highlight);
     emit_state(state, &snapshot);
+    tracing::info!(reason, "comment highlight cleared");
     snapshot
+}
+
+fn clear_highlight_overlays(state: &AppState) {
+    crate::captions::clear_caption_overlay(&state.highlight_overlay);
+    crate::captions::clear_caption_overlay(&state.simulcast_highlight_overlay);
 }
 
 /// Explicit user action: clear whichever comment is currently on stream.
@@ -613,6 +700,7 @@ mod tests {
             message_id: "session-1:x:x-target:message-1".to_string(),
             png_base64: TEST_PNG.to_string(),
             anchor: CommentHighlightAnchor::default(),
+            vertical_png_base64: None,
             preparation_blocker: None,
             commit_blocker: None,
         }
@@ -707,7 +795,10 @@ mod tests {
         let mut highlight = CommentHighlightState::default();
         let mut params = params();
         params.anchor = CommentHighlightAnchor::BottomRight;
-        let prepared = crate::captions::prepare_caption_overlay(TEST_PNG).unwrap();
+        let prepared = PreparedHighlight {
+            horizontal: crate::captions::prepare_caption_overlay(TEST_PNG).unwrap(),
+            vertical: None,
+        };
         let installed = install_validated_highlight(
             &state,
             &mut highlight,
@@ -720,6 +811,94 @@ mod tests {
         assert_eq!(
             overlay.placement,
             OverlayPlacement::from(CommentHighlightAnchor::BottomRight)
+        );
+    }
+
+    #[test]
+    fn vertical_card_installs_beside_the_horizontal_one_and_never_outlives_it() {
+        let state = test_state();
+        let mut highlight = CommentHighlightState::default();
+        let mut params = params();
+        params.anchor = CommentHighlightAnchor::TopRight;
+        let both = PreparedHighlight {
+            horizontal: crate::captions::prepare_caption_overlay(TEST_PNG).unwrap(),
+            vertical: Some(crate::captions::prepare_caption_overlay(TEST_PNG).unwrap()),
+        };
+        install_validated_highlight(
+            &state,
+            &mut highlight,
+            params.clone(),
+            both,
+            Duration::from_secs(10),
+        );
+        let vertical = crate::captions::current_caption_overlay(&state.simulcast_highlight_overlay)
+            .expect("vertical card installed");
+        assert_eq!(
+            vertical.placement,
+            OverlayPlacement::from(CommentHighlightAnchor::TopRight)
+        );
+
+        // A replacement without a vertical raster must not leave the old card
+        // on the vertical leg.
+        let horizontal_only = PreparedHighlight {
+            horizontal: crate::captions::prepare_caption_overlay(TEST_PNG).unwrap(),
+            vertical: None,
+        };
+        install_validated_highlight(
+            &state,
+            &mut highlight,
+            params,
+            horizontal_only,
+            Duration::from_secs(10),
+        );
+        assert!(crate::captions::current_caption_overlay(&state.highlight_overlay).is_some());
+        assert!(
+            crate::captions::current_caption_overlay(&state.simulcast_highlight_overlay).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_and_expiry_remove_the_vertical_card_too() {
+        let state = test_state();
+        let mut params = params();
+        params.anchor = CommentHighlightAnchor::BottomLeft;
+        let generation = {
+            let mut highlight = state.comment_highlight.lock().await;
+            install_validated_highlight(
+                &state,
+                &mut highlight,
+                params.clone(),
+                PreparedHighlight {
+                    horizontal: crate::captions::prepare_caption_overlay(TEST_PNG).unwrap(),
+                    vertical: Some(crate::captions::prepare_caption_overlay(TEST_PNG).unwrap()),
+                },
+                Duration::from_secs(10),
+            )
+            .generation
+        };
+        assert!(expire_generation(&state, generation).await);
+        assert!(crate::captions::current_caption_overlay(&state.highlight_overlay).is_none());
+        assert!(
+            crate::captions::current_caption_overlay(&state.simulcast_highlight_overlay).is_none()
+        );
+
+        {
+            let mut highlight = state.comment_highlight.lock().await;
+            install_validated_highlight(
+                &state,
+                &mut highlight,
+                params,
+                PreparedHighlight {
+                    horizontal: crate::captions::prepare_caption_overlay(TEST_PNG).unwrap(),
+                    vertical: Some(crate::captions::prepare_caption_overlay(TEST_PNG).unwrap()),
+                },
+                Duration::from_secs(10),
+            );
+        }
+        let cleared = clear_comment_highlight(&state).await;
+        assert_eq!(cleared.phase, CommentHighlightPhase::Idle);
+        assert!(
+            crate::captions::current_caption_overlay(&state.simulcast_highlight_overlay).is_none()
         );
     }
 
@@ -860,6 +1039,45 @@ mod tests {
         assert_eq!(surviving_overlay.width, previous_overlay.width);
         assert_eq!(surviving_overlay.height, previous_overlay.height);
         assert_eq!(surviving_overlay.rgba, previous_overlay.rgba);
+    }
+
+    #[tokio::test]
+    async fn set_installs_the_vertical_card_only_for_a_session_with_a_vertical_leg() {
+        for vertical_canvas in [None, Some((1080, 1920))] {
+            let state = test_state();
+            state.compositor.lock().await.status.state = CompositorState::Live;
+            {
+                let mut chat = state.live_chat.lock().await;
+                chat.start_session("session-1".to_string(), Vec::new());
+                chat.ingest(message(LiveChatEventType::Message, false));
+            }
+            let mut active = crate::recording::test_active_recording_stub("session-1");
+            active.mode = "record+stream".to_string();
+            active.comment_highlight_available = true;
+            active.comment_highlight_vertical_canvas = vertical_canvas;
+            *state.recording.lock().await = Some(active);
+
+            assert_eq!(
+                comment_highlight_canvases(&state).await,
+                CommentHighlightCanvases {
+                    vertical: vertical_canvas
+                        .map(|(width, height)| CommentHighlightCanvas { width, height }),
+                }
+            );
+
+            let mut request = params();
+            request.vertical_png_base64 = Some(TEST_PNG.to_string());
+            let status = set_comment_highlight(&state, request).await.unwrap();
+            assert_eq!(status.phase, CommentHighlightPhase::Live);
+            assert!(crate::captions::current_caption_overlay(&state.highlight_overlay).is_some());
+            assert_eq!(
+                crate::captions::current_caption_overlay(&state.simulcast_highlight_overlay)
+                    .is_some(),
+                vertical_canvas.is_some(),
+                "vertical_canvas={vertical_canvas:?}"
+            );
+            state.recording.lock().await.take();
+        }
     }
 
     #[tokio::test]

@@ -1979,6 +1979,9 @@ pub struct ActiveRecording {
     /// the compositor bridge. Legacy FFmpeg and record-only paths must reject
     /// comment highlights before touching the overlay slot.
     pub comment_highlight_available: bool,
+    /// Portrait canvas `(width, height)` of the vertical simulcast leg when it
+    /// burns the comment card. The renderer rasterizes a second card for it.
+    pub comment_highlight_vertical_canvas: Option<(u32, u32)>,
     pub _capture_permit: Option<CapturePermit>,
     /// Signals the process monitor at the exact user-stop edge. The monitor
     /// orders this against FFmpeg exit readiness before it touches the shared
@@ -2091,6 +2094,7 @@ pub(crate) fn test_active_recording_stub(session_id: &str) -> ActiveRecording {
         keep_original_media: false,
         performance_check: false,
         comment_highlight_available: false,
+        comment_highlight_vertical_canvas: None,
         _capture_permit: None,
         stop_intent_sender: None,
         stop_requested: false,
@@ -3738,7 +3742,13 @@ async fn start_session_with_timeline(
                     crate::captions::highlight_overlay_leg_plan(
                         params.output.record_enabled,
                         params.output.stream_enabled,
-                        plan.auxiliary.is_some(),
+                        // The D3D11 path refuses simulcast sessions above, so
+                        // its auxiliary is always a split stream leg.
+                        if plan.auxiliary.is_some() {
+                            crate::captions::HighlightAuxLeg::Stream
+                        } else {
+                            crate::captions::HighlightAuxLeg::None
+                        },
                     );
                 let overlays = WindowsD3d11OverlayInput {
                     captions: state.caption_overlay.clone(),
@@ -4026,8 +4036,21 @@ async fn start_session_with_timeline(
     let highlight_overlay_plan = crate::captions::highlight_overlay_leg_plan(
         params.output.record_enabled,
         params.output.stream_enabled,
-        encoder_bridge_stream_output.is_some(),
+        highlight_aux_leg(encoder_bridge_stream_output.as_ref()),
     );
+    let comment_highlight_vertical_canvas = comment_highlight_vertical_canvas(
+        encoder_bridge_stream_output.as_ref(),
+        highlight_overlay_plan,
+    );
+    if use_encoder_bridge && params.output.stream_enabled {
+        tracing::info!(
+            session = %session_id,
+            primary = highlight_overlay_plan.0,
+            aux = highlight_overlay_plan.1,
+            vertical_canvas = ?comment_highlight_vertical_canvas,
+            "comment highlight leg plan"
+        );
+    }
     #[cfg(target_os = "windows")]
     let (direct_d3d11_recording_source, direct_d3d11_camera_overlay) = if !use_windows_d3d11_media
         && use_encoder_bridge
@@ -5248,7 +5271,11 @@ async fn start_session_with_timeline(
         captioned_copy_requested: session_caption_plan.captioned_copy,
         keep_original_media: params.output.keep_original_mkv,
         performance_check: params.purpose.is_performance_check(),
-        comment_highlight_available: comment_highlight_available(&params, use_encoder_bridge),
+        comment_highlight_available: comment_highlight_available(
+            use_encoder_bridge,
+            highlight_overlay_plan,
+        ),
+        comment_highlight_vertical_canvas,
         _capture_permit: Some(capture_permit),
         stop_intent_sender: Some(stop_intent_sender),
         stop_requested: false,
@@ -18877,8 +18904,35 @@ fn caption_leg_plan(params: &StartSessionParams) -> crate::captions::CaptionOver
     )
 }
 
-fn comment_highlight_available(params: &StartSessionParams, use_encoder_bridge: bool) -> bool {
-    params.output.stream_enabled && use_encoder_bridge
+/// A session can put a comment card on stream only when the compositor bridge
+/// renders it AND the leg plan burns it on at least one leg. Deriving this
+/// from the same plan the compositor receives keeps "On stream" honest: the
+/// backend never acknowledges a card that no output draws.
+fn comment_highlight_available(use_encoder_bridge: bool, leg_plan: (bool, bool)) -> bool {
+    use_encoder_bridge && (leg_plan.0 || leg_plan.1)
+}
+
+fn highlight_aux_leg(
+    stream_output: Option<&CompositorAuxiliaryOutput>,
+) -> crate::captions::HighlightAuxLeg {
+    match stream_output {
+        None => crate::captions::HighlightAuxLeg::None,
+        Some(output) if output.composes_simulcast_scene => {
+            crate::captions::HighlightAuxLeg::VerticalSimulcast
+        }
+        Some(_) => crate::captions::HighlightAuxLeg::Stream,
+    }
+}
+
+/// Portrait canvas the renderer must rasterize a second card for, when the
+/// vertical simulcast leg burns the highlight.
+fn comment_highlight_vertical_canvas(
+    stream_output: Option<&CompositorAuxiliaryOutput>,
+    leg_plan: (bool, bool),
+) -> Option<(u32, u32)> {
+    stream_output
+        .filter(|output| output.composes_simulcast_scene && leg_plan.1)
+        .map(|output| (output.width, output.height))
 }
 
 #[cfg(test)]
@@ -24465,6 +24519,7 @@ mod tests {
             keep_original_media: false,
             performance_check: false,
             comment_highlight_available: false,
+            comment_highlight_vertical_canvas: None,
             _capture_permit: None,
             stop_intent_sender: None,
             stop_requested: false,
@@ -30584,6 +30639,7 @@ mod tests {
             keep_original_media: false,
             performance_check: false,
             comment_highlight_available: false,
+            comment_highlight_vertical_canvas: None,
             _capture_permit: None,
             stop_intent_sender: Some(stop_intent_sender),
             stop_requested: false,
@@ -33581,20 +33637,72 @@ mod tests {
 
     #[test]
     fn comment_highlight_requires_a_composited_stream_leg() {
+        use crate::captions::{HighlightAuxLeg, highlight_overlay_leg_plan};
+
+        let plan = |record, stream, aux| highlight_overlay_leg_plan(record, stream, aux);
+        // Record-only: no leg burns the card.
         assert!(!comment_highlight_available(
-            &base_params(true, false),
-            true
+            true,
+            plan(true, false, HighlightAuxLeg::None)
+        ));
+        // Legacy FFmpeg path: no compositor bridge.
+        assert!(!comment_highlight_available(
+            false,
+            plan(false, true, HighlightAuxLeg::None)
         ));
         assert!(!comment_highlight_available(
-            &base_params(false, true),
-            false
+            false,
+            plan(true, true, HighlightAuxLeg::Stream)
         ));
-        assert!(!comment_highlight_available(
-            &base_params(true, true),
-            false
+        assert!(comment_highlight_available(
+            true,
+            plan(false, true, HighlightAuxLeg::None)
         ));
-        assert!(comment_highlight_available(&base_params(false, true), true));
-        assert!(comment_highlight_available(&base_params(true, true), true));
+        assert!(comment_highlight_available(
+            true,
+            plan(true, true, HighlightAuxLeg::Stream)
+        ));
+        // Dual orientation (owner live stream 2026-09-28): available, and the
+        // horizontal viewers' primary leg burns it.
+        let dual = plan(true, true, HighlightAuxLeg::VerticalSimulcast);
+        assert!(comment_highlight_available(true, dual));
+        assert!(dual.0, "the horizontal stream rides the primary leg");
+    }
+
+    #[test]
+    fn comment_highlight_vertical_canvas_follows_the_simulcast_aux() {
+        use crate::captions::{HighlightAuxLeg, highlight_overlay_leg_plan};
+
+        let vertical = CompositorAuxiliaryOutput {
+            width: 1080,
+            height: 1920,
+            frame_consumer: CompositorFrameConsumer::VideoToolboxEncoder,
+            composes_simulcast_scene: true,
+        };
+        let split = CompositorAuxiliaryOutput {
+            composes_simulcast_scene: false,
+            width: 1280,
+            height: 720,
+            ..vertical
+        };
+        assert_eq!(
+            highlight_aux_leg(Some(&vertical)),
+            HighlightAuxLeg::VerticalSimulcast
+        );
+        assert_eq!(highlight_aux_leg(Some(&split)), HighlightAuxLeg::Stream);
+        assert_eq!(highlight_aux_leg(None), HighlightAuxLeg::None);
+
+        let dual = highlight_overlay_leg_plan(true, true, HighlightAuxLeg::VerticalSimulcast);
+        assert_eq!(
+            comment_highlight_vertical_canvas(Some(&vertical), dual),
+            Some((1080, 1920))
+        );
+        let split_plan = highlight_overlay_leg_plan(true, true, HighlightAuxLeg::Stream);
+        assert_eq!(
+            comment_highlight_vertical_canvas(Some(&split), split_plan),
+            None
+        );
+        assert_eq!(comment_highlight_vertical_canvas(None, (true, false)), None);
     }
 
     #[test]

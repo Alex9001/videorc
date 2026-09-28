@@ -7416,6 +7416,11 @@ async fn publish_compositor_frame(
     // auxiliary bars without scaling one leg's pixels onto the other.
     let caption_overlays = crate::captions::current_caption_overlays(&state.caption_overlay);
     let highlight_overlay = crate::captions::current_caption_overlay(&state.highlight_overlay);
+    // The vertical leg needs its own portrait-sized card; the horizontal
+    // raster is up to 60% of a landscape width and would crop.
+    let simulcast_highlight_overlay = stream_output
+        .filter(|output| output.composes_simulcast_scene)
+        .and_then(|_| crate::captions::current_caption_overlay(&state.simulcast_highlight_overlay));
     let mut bytes;
     {
         let inputs = CompositorRenderInputs {
@@ -7520,8 +7525,8 @@ async fn publish_compositor_frame(
     if let (Some(stream_output), Some(stream_frame_store)) = (stream_output, stream_frame_store) {
         // A simulcast-bound aux composes the VERTICAL scene; the classic
         // caption/profile-split aux re-renders the primary snapshot. The
-        // vertical leg streams clean in Phase 1 (no caption bar/highlight —
-        // their rasters are sized for the primary geometry).
+        // vertical leg carries no caption bar (its raster is sized for the
+        // primary geometry); the highlight card uses its own portrait raster.
         let aux_snapshot = if stream_output.composes_simulcast_scene {
             simulcast_snapshot.as_ref()
         } else {
@@ -7551,12 +7556,12 @@ async fn publish_compositor_frame(
                     caption_overlay_on_aux,
                 )
             },
-            highlight_overlay: if highlight_overlay_on_aux
-                && !stream_output.composes_simulcast_scene
-            {
-                highlight_overlay.as_ref()
-            } else {
+            highlight_overlay: if !highlight_overlay_on_aux {
                 None
+            } else if stream_output.composes_simulcast_scene {
+                simulcast_highlight_overlay.as_ref()
+            } else {
+                highlight_overlay.as_ref()
             },
         };
         let proof_store = stream_frame_store.clone();

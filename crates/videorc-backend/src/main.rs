@@ -4953,6 +4953,7 @@ fn websocket_observation_requires_operator_fence(text: &str) -> bool {
                 | "capture.recovery.status"
                 | "captions.status.get"
                 | "comments.highlight.status"
+                | "comments.highlight.canvases"
                 | CAPTURE_RECOVERY_SMOKE_CAMERA_CADENCE_EVIDENCE_METHOD
                 | CAPTURE_RECOVERY_SMOKE_SCREEN_CADENCE_EVIDENCE_METHOD
         )
@@ -5208,6 +5209,7 @@ fn websocket_method_execution_policy(method: &str) -> Option<WebSocketMethodExec
         | "captions.status.get"
         | "captions.test.snapshot"
         | "comments.highlight.status"
+        | "comments.highlight.canvases"
         | "cohost.status"
         | "cohost.settings.get"
         | "ai.capabilities.get"
@@ -8633,6 +8635,10 @@ async fn handle_text_message_with_role(
         "comments.highlight.status" => ServerResponse::ok(
             command.id,
             comment_highlight::comment_highlight_status(state).await,
+        ),
+        "comments.highlight.canvases" => ServerResponse::ok(
+            command.id,
+            comment_highlight::comment_highlight_canvases(state).await,
         ),
         "comments.highlight.set" => {
             match serde_json::from_value::<comment_highlight::SetCommentHighlightParams>(
@@ -13653,6 +13659,7 @@ mod tests {
             "account.get",
             "captions.status.get",
             "comments.highlight.status",
+            "comments.highlight.canvases",
             "scene.get",
             "liveChat.status",
             "liveChat.sendOperations.list",
