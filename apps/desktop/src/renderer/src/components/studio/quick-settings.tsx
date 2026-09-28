@@ -344,7 +344,13 @@ export function SystemAudioInspectorValue({
   onOpenPermissions: () => void
 }): ReactElement {
   const status =
-    view.issue === 'lost' ? 'Stopped' : view.issue ? 'Could not start' : view.stateLabel
+    view.issue === 'lost'
+      ? 'Stopped'
+      : view.issue === 'bypassed'
+        ? 'Off for this session'
+        : view.issue
+          ? 'Could not start'
+          : view.stateLabel
   return (
     <div className="flex h-control min-w-0 items-center justify-end gap-2.5 px-2">
       {view.permissionRequired ? (

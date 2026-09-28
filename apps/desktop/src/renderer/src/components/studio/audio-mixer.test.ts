@@ -32,7 +32,8 @@ describe('System audio mixer row (plan 069)', () => {
   const noop = (): void => {}
   const render = (
     input: Partial<SystemAudioSwitchInput>,
-    reading: BackendMeterReading | null = null
+    reading: BackendMeterReading | null = null,
+    macOS = true
   ): string => {
     const view = systemAudioSwitchView({
       device: { status: 'available' },
@@ -47,6 +48,7 @@ describe('System audio mixer row (plan 069)', () => {
           createElement(SystemAudioMixerRowView, {
             view,
             reading,
+            macOS,
             onEnabledChange: noop,
             onOpenPermissions: noop
           })
@@ -117,5 +119,31 @@ describe('System audio mixer row (plan 069)', () => {
     })
     expect(unavailable).toContain('System audio could not start.')
     expect(unavailable).toContain('Open Settings')
+  })
+
+  it('offers Settings for a failed start only on macOS, where a grant can fix it', () => {
+    const windows = render(
+      { requested: true, sessionActive: true, confirmed: false, issue: 'unavailable' },
+      null,
+      false
+    )
+    expect(windows).toContain('System audio could not start.')
+    expect(windows).not.toContain('Open Settings')
+    expect(windows).not.toContain('Screen Recording')
+  })
+
+  it('says a fallback microphone keeps system audio out of this session (Windows, plan 069 S8)', () => {
+    const markup = render(
+      { requested: true, sessionActive: true, confirmed: false, issue: 'bypassed' },
+      null,
+      false
+    )
+    expect(markup).toContain('data-videorc-system-audio-row="issue-bypassed"')
+    expect(markup).toContain('aria-checked="true"')
+    expect(markup).toContain(
+      'System audio is off for this session because the microphone is on a fallback input.'
+    )
+    expect(markup).not.toContain('Open Settings')
+    expect(markup).not.toContain('data-videorc-system-audio-visualizer')
   })
 })

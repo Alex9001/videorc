@@ -27,6 +27,19 @@
 //! `--disable-features=AudioServiceOutOfProcess` on macOS.
 //!
 //! Evidence and numbers: `docs/acceptance/2026-09-27-system-audio-spike.md`.
+//!
+//! Windows (S8): the platform-neutral half of this module (the constants,
+//! health kinds, [`SystemAudioFailure`], [`SystemAudioFailureSlot`],
+//! [`SystemAudioCaptureStats`], [`HostClockAnchor`] and
+//! [`system_audio_frame`]) also compiles on Windows, where
+//! `system_audio_capture_windows.rs` implements the same
+//! [`SystemAudioCapture`] API over WASAPI process loopback and is re-exported
+//! from here, so consumers import one path on both platforms. The
+//! ScreenCaptureKit half is `cfg(target_os = "macos")`.
+
+// The ScreenCaptureKit conversion helpers stay compiled (and unit-tested) on
+// Windows, where only the shared half is used.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -320,6 +333,7 @@ pub(crate) fn system_audio_frame(
     }
 }
 
+#[cfg(target_os = "macos")]
 mod host_clock {
     use super::{HostClockAnchor, MachTimebase};
     use std::time::{Duration, Instant};
@@ -651,18 +665,27 @@ pub(crate) struct SystemAudioCaptureStats {
 /// The screen-capture preflight that also covers system audio ("Screen &
 /// System Audio Recording"). It neither prompts nor starts a stream.
 /// `devices.rs` (S1) makes the same call for the device row.
+#[cfg(target_os = "macos")]
 pub(crate) fn screen_recording_permission_granted() -> bool {
     objc2_core_graphics::CGPreflightScreenCaptureAccess()
 }
 
 /// The backend's parent pid: the Electron main process in the app.
+#[cfg(target_os = "macos")]
 pub(crate) fn parent_pid() -> i32 {
     // SAFETY: getppid has no preconditions and cannot fail.
     unsafe { libc::getppid() }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) use capture::{SystemAudioCapture, SystemAudioCaptureOptions};
 
+#[cfg(windows)]
+pub(crate) use crate::system_audio_capture_windows::{
+    SystemAudioCapture, SystemAudioCaptureOptions,
+};
+
+#[cfg(target_os = "macos")]
 mod capture {
     use std::ptr::{self, NonNull};
     use std::slice;
@@ -1823,7 +1846,7 @@ mod tests {
 ///
 /// Run: `VIDEORC_SYSTEM_AUDIO_SPIKE=1 cargo test -p videorc-backend
 /// system_audio_capture_live -- --ignored --nocapture`.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod live {
     use std::process::Command;
     use std::sync::mpsc;

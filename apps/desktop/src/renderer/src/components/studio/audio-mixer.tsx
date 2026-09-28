@@ -258,6 +258,7 @@ export function AudioMixer(): ReactElement {
       </div>
       <SystemAudioMixerRow
         diagnosticStats={diagnosticStats}
+        macOS={runtimeInfo?.platform === 'darwin'}
         onOpenPermissions={() => openSettings('permissions')}
       />
     </PanelSection>
@@ -271,9 +272,11 @@ export function AudioMixer(): ReactElement {
  */
 function SystemAudioMixerRow({
   diagnosticStats,
+  macOS,
   onOpenPermissions
 }: {
   diagnosticStats: DiagnosticStats | null | undefined
+  macOS: boolean
   onOpenPermissions: () => void
 }): ReactElement | null {
   const {
@@ -303,6 +306,7 @@ function SystemAudioMixerRow({
             )
           : null
       }
+      macOS={macOS}
       view={view}
       onEnabledChange={(systemAudioEnabled) =>
         setCaptureConfig((current) => ({
@@ -319,11 +323,14 @@ function SystemAudioMixerRow({
 export function SystemAudioMixerRowView({
   view,
   reading,
+  macOS,
   onEnabledChange,
   onOpenPermissions
 }: {
   view: SystemAudioSwitchView
   reading: BackendMeterReading | null
+  /** Settings > Permissions can only help on macOS (the Screen Recording grant). */
+  macOS: boolean
   onEnabledChange: (enabled: boolean) => void
   onOpenPermissions: () => void
 }): ReactElement {
@@ -381,7 +388,7 @@ export function SystemAudioMixerRowView({
           <span className="min-w-16 shrink-0 text-right text-xs text-muted-foreground">Live</span>
         </div>
       ) : null}
-      {view.permissionRequired || view.issue === 'unavailable' ? (
+      {view.permissionRequired || (view.issue === 'unavailable' && macOS) ? (
         <div className="flex items-center justify-between gap-2 text-xs text-warning">
           <span className="min-w-0">
             {view.permissionRequired
@@ -392,8 +399,8 @@ export function SystemAudioMixerRowView({
             Open Settings
           </Button>
         </div>
-      ) : view.issue === 'lost' ? (
-        <span className="text-xs text-warning">{systemAudioIssueCopy('lost')}</span>
+      ) : view.issue ? (
+        <span className="text-xs text-warning">{systemAudioIssueCopy(view.issue)}</span>
       ) : null}
     </div>
   )

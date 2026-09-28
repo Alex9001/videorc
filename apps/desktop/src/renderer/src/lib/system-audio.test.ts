@@ -5,6 +5,7 @@ import { backendMeterReading } from '@/lib/mic-meter'
 import {
   confirmedSystemAudioMix,
   systemAudioDevice,
+  systemAudioIssueCopy,
   systemAudioIssueFromHealthEvent,
   systemAudioSwitchView,
   systemAudioTarget,
@@ -61,10 +62,17 @@ describe('confirmedSystemAudioMix', () => {
 })
 
 describe('systemAudioIssueFromHealthEvent', () => {
-  it('maps only the two system-audio codes', () => {
+  it('maps only the system-audio codes', () => {
     expect(systemAudioIssueFromHealthEvent({ code: 'system-audio-lost' })).toBe('lost')
     expect(systemAudioIssueFromHealthEvent({ code: 'system-audio-unavailable' })).toBe(
       'unavailable'
+    )
+    // Windows (plan 069 S8): the mic fell back to a direct input.
+    expect(systemAudioIssueFromHealthEvent({ code: 'system-audio-mic-fallback-bypass' })).toBe(
+      'bypassed'
+    )
+    expect(systemAudioIssueCopy('bypassed')).toBe(
+      'System audio is off for this session because the microphone is on a fallback input.'
     )
     expect(systemAudioIssueFromHealthEvent({ code: 'microphone-input-lost' })).toBeNull()
   })

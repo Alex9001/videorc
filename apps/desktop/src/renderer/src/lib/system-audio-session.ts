@@ -7,7 +7,7 @@ import type { AudioTrack, HealthEvent } from '@/lib/backend'
 export const SYSTEM_AUDIO_LOST_CODE = 'system-audio-lost'
 export const SYSTEM_AUDIO_UNAVAILABLE_CODE = 'system-audio-unavailable'
 
-export type SystemAudioIssue = 'lost' | 'unavailable'
+export type SystemAudioIssue = 'lost' | 'unavailable' | 'bypassed'
 
 /**
  * What the running session actually mixes, from `recording.status`:
@@ -21,11 +21,19 @@ export function confirmedSystemAudioMix(tracks: AudioTrack[] | undefined): boole
   return reporting.some((track) => track.mixSources?.includes('system-audio') === true)
 }
 
-/** A system-audio health event, reduced to the one fact the UI shows. */
-export function systemAudioIssueFromHealthEvent(
-  event: Pick<HealthEvent, 'code'>
-): SystemAudioIssue | null {
-  if (event.code === SYSTEM_AUDIO_LOST_CODE) return 'lost'
-  if (event.code === SYSTEM_AUDIO_UNAVAILABLE_CODE) return 'unavailable'
-  return null
+/**
+ * A system-audio health event, reduced to the one fact the UI shows. The
+ * Windows bypass (plan 069 S8: the mic fell back to a direct input, so the
+ * session cannot mix system audio) is inlined to keep the eager chunk small.
+ */
+export function systemAudioIssueFromHealthEvent({
+  code
+}: Pick<HealthEvent, 'code'>): SystemAudioIssue | null {
+  // Every code is `system-audio-<suffix>`; the suffix lookup keeps this small.
+  const suffix = code.startsWith('system-audio-') ? code.slice(13) : ''
+  return suffix === 'mic-fallback-bypass'
+    ? 'bypassed'
+    : suffix === 'lost' || suffix === 'unavailable'
+      ? suffix
+      : null
 }

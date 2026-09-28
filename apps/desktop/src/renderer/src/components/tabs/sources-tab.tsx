@@ -654,7 +654,7 @@ export function SystemAudioSettings({
         value={gainDb}
         onChange={onGainChange}
       />
-      {view.permissionRequired || view.issue === 'unavailable' ? (
+      {view.permissionRequired || (view.issue === 'unavailable' && macOS) ? (
         <div className="flex items-center justify-between gap-2 text-xs text-warning">
           <span className="min-w-0">
             {view.permissionRequired
@@ -665,8 +665,8 @@ export function SystemAudioSettings({
             Open Settings
           </Button>
         </div>
-      ) : view.issue === 'lost' ? (
-        <span className="text-xs text-warning">{systemAudioIssueCopy('lost')}</span>
+      ) : view.issue ? (
+        <span className="text-xs text-warning">{systemAudioIssueCopy(view.issue)}</span>
       ) : null}
     </div>
   )

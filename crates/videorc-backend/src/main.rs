@@ -98,8 +98,11 @@ mod storage;
 mod streaming;
 mod support_bundle;
 mod synthetic_diagnostic;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod system_audio_capture;
+// Windows-only at runtime; its pure helpers are also unit-tested on macOS.
+#[cfg(any(windows, all(test, target_os = "macos")))]
+mod system_audio_capture_windows;
 mod system_audio_session;
 mod twitch;
 mod twitch_chat;
