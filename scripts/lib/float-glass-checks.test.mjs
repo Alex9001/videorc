@@ -40,6 +40,20 @@ test('the old near-opaque popover coat fails as a black slab on the window glass
   assert.ok(result.metrics.liftMin < FLOAT_GLASS_THRESHOLDS.lift.dark[0])
 })
 
+test('an obscured or translucent surface capture fails closed', () => {
+  // The five-window run where a backdrop stacked over the Stream Manager:
+  // the surface read L 0.406 over red but 0.274 over white.
+  const result = evaluateFloatPatch({
+    theme: 'dark',
+    windowMeans: allBackdrops(grey(0x2b)),
+    surfaceMeans: { ...allBackdrops({ r: 0x33, g: 0x33, b: 0x36 }), red: grey(0x4f) },
+    text: DARK_TEXT
+  })
+  assert.equal(result.checks.opaque, false)
+  assert.equal(result.pass, false)
+  assert.ok(result.metrics.surfaceSpread > FLOAT_GLASS_THRESHOLDS.maxSurfaceSpread)
+})
+
 test('a surface too light for its text fails on contrast, not lift', () => {
   const result = evaluateFloatPatch({
     theme: 'dark',

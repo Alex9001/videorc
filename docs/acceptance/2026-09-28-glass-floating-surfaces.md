@@ -72,6 +72,10 @@ scores it with `scripts/lib/float-glass-checks.mjs`:
   sheen band, whose 8-bit gradient steps read as detail. The text is the
   sidebar rows (main) and the chat filter labels (Stream Manager).
 
+- **opaque**: the surface's lightness spreads ≤ 0.01 across the five
+  backdrops (measured 0.000 on every window and theme). This fails closed on a
+  capture something else obscured, and on a coat that turns translucent.
+
 Two ungated controls show what the gate catches. The old popover coat is the
 lift control; a 97% `glass-float` coat is the bleed control.
 

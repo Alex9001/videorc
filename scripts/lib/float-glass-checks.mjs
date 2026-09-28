@@ -11,6 +11,10 @@
 //                measured about -0.1 in dark (a black slab on grey glass).
 //   contrast     the text tokens against the surface over white and black
 //                backdrops (the plan 050 thresholds)
+//   opaque       the surface reads the same over every backdrop. It fails
+//                closed on a capture something else obscured (a backdrop
+//                stacked over the window washed the whole frame once) and on
+//                a coat that went translucent.
 //   bleed        app text under the surface must not read through it:
 //                sharpness with the surface stays under the window glass
 //                ceiling, while the same rect without it proves there was
@@ -21,6 +25,7 @@ import { contrastRatio, oklchLightness } from './image-stats.mjs'
 
 export const FLOAT_GLASS_THRESHOLDS = Object.freeze({
   lift: Object.freeze({ dark: Object.freeze([-0.02, 0.12]), light: Object.freeze([-0.04, 0.06]) }),
+  maxSurfaceSpread: 0.01,
   minTextUnder: 20,
   maxSharpnessThrough: 0.5,
   minPrimaryContrast: 7,
@@ -72,9 +77,11 @@ export function belowSheen(rect, surface) {
 export function evaluateFloatPatch({ theme, windowMeans, surfaceMeans, text }) {
   const variants = Object.keys(surfaceMeans).filter((variant) => windowMeans[variant])
   if (!variants.length) throw new Error('No backdrop variant was measured in both states.')
+  const surfaceLightness = variants.map((variant) => oklchLightness(surfaceMeans[variant]))
   const lifts = variants.map(
-    (variant) => oklchLightness(surfaceMeans[variant]) - oklchLightness(windowMeans[variant])
+    (variant, index) => surfaceLightness[index] - oklchLightness(windowMeans[variant])
   )
+  const surfaceSpread = Math.max(...surfaceLightness) - Math.min(...surfaceLightness)
   const contrastBackdrops = ['white', 'black'].filter((variant) => surfaceMeans[variant])
   if (!contrastBackdrops.length) throw new Error('Contrast needs the white or black backdrop.')
   const primaryContrast = Math.min(
@@ -88,6 +95,7 @@ export function evaluateFloatPatch({ theme, windowMeans, surfaceMeans, text }) {
   const liftMax = Math.max(...lifts)
   const checks = {
     lift: liftMin >= minLift && liftMax <= maxLift,
+    opaque: surfaceSpread <= FLOAT_GLASS_THRESHOLDS.maxSurfaceSpread,
     primaryContrast: primaryContrast >= FLOAT_GLASS_THRESHOLDS.minPrimaryContrast,
     secondaryContrast: secondaryContrast >= FLOAT_GLASS_THRESHOLDS.minSecondaryContrast
   }
@@ -95,6 +103,7 @@ export function evaluateFloatPatch({ theme, windowMeans, surfaceMeans, text }) {
     metrics: {
       liftMin: round(liftMin),
       liftMax: round(liftMax),
+      surfaceSpread: round(surfaceSpread),
       primaryContrast: round(primaryContrast, 2),
       secondaryContrast: round(secondaryContrast, 2)
     },
