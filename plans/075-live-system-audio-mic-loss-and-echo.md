@@ -1,7 +1,10 @@
 # Plan 075: live stream with System audio — a stalled output kills the mic for good, and your own stream loops back as an echo
 
-Status: investigated 2026-09-28; **not implemented**. Two owner live streams on
-0.9.120 (macOS), both with System audio. Priority **P0** for part A, since a
+Status: investigated 2026-09-28; **IMPLEMENTED 2026-09-29** on
+`fix/075-live-mic-loss-and-echo` (all slices; see
+[Implementation record](#implementation-record-2026-09-29)). Owner acceptance
+on a packaged candidate and a quiet-machine `smoke:system-audio` are owed.
+Two owner live streams on 0.9.120 (macOS), both with System audio. Priority **P0** for part A, since a
 healthy microphone went silent for the rest of a live stream, and **P1** for
 part B, since viewers heard the streamer's voice repeated.
 
@@ -469,3 +472,130 @@ Stop and report to the owner if:
 - Any existing A/V sync measurement moves by more than its gate.
 - The detector cannot reach zero false positives on the negative fixtures
   without missing the positive 3.16 s case. Then ship warn-only and ask.
+
+## Implementation record (2026-09-29)
+
+Branch `fix/075-live-mic-loss-and-echo`, from main `febb5ca8`. The owner said
+"execute the entire plan"; decision 3 took the recommended default (auto-pause
+with Resume).
+
+### A. The bus never retires a healthy microphone
+
+- `AudioTimeline::push_outcome` says why a packet was refused. An
+  ahead-of-cap packet whose end is within the ahead limit of the wall-clock
+  cursor was on time (`BusLosses::dropped_output_behind`).
+- `OutputStall` (session_audio.rs): a bus that has kept pace and then falls
+  250 ms or more behind is in a stall episode, which excuses on-time packets
+  for up to 15 s. A bus that never kept pace (plan 070's old epoch) excuses
+  nothing, so plan 070's regression and its "rejected, not stopped" test are
+  unchanged.
+- `TimelineFault`: a placement loss (`TimelineRejected`) is reported once,
+  re-anchors the source clock at most every 10 s, never retires the producer,
+  and reports its recovery (`SourceRecovery`, `SystemAudioRecovery`). Only a
+  stopped capture (EOF, no arrivals, platform failure) retires a source. The
+  system slot follows the same rule; `SlotHealth` carries the edges out of a
+  blocked write.
+- Health events: `audio-output-stalled` (warn, only when an episode cost
+  audio; the owner's normal sessions, including the 59-minute stream, drop
+  zero frames), `microphone-timeline-recovered` and `system-audio-recovered`
+  (info). The quality gate's audio-loss codes are unchanged.
+
+### B. The echo guard
+
+- `echo_guard.rs`: `BandEnergy` (one ~300 Hz–4 kHz envelope value per 10 ms
+  chunk, on the bus thread) and `EchoDetector` (on its own thread, fed by
+  `EchoWatch`). Every second it correlates the last 4 s of system audio
+  against 34 s of microphone history at 0.3–30 s lags. It fires when one lag
+  wins four evaluations in a row with r >= 0.25 and 1.8x the 99th percentile
+  of the other lags.
+- Tuning (synthetic speech, strictly periodic music, recursive loops through a
+  codec-like low-pass, numpy then Rust): the log-onset feature was masked by
+  music, so the detector uses the linear envelope. Every loop from 2.5 to 20 s
+  at -10 dB or louder is found at the exact lag within about 7-10 s of System
+  audio coming on. 150 minutes of negatives (another voice, music, speaker
+  pickup, and mixes) never fire: single evaluations reach 2.3x, and lag
+  stability is what separates them. A -12 dB loop is not always caught, and
+  that is accepted. This is slower than the plan's "within 5 s": the price of
+  zero false positives.
+- The bus ramps the system slot out on a detection (`SlotExit::EchoPaused`)
+  and reports `system-audio-echo-paused` with the lag. The microphone output
+  is untouched: the real-bus test checks it matches the microphone alone.
+  `AudioSettings.systemAudioEchoGuard` (default on, live through
+  `audio.processing.update`) turns the guard off; then a loop is only logged.
+  The plan's "Keep on for this session" became this persistent switch in
+  Sources.
+- UI: Paused plus Resume in the mixer row, the Sources panel, and the Studio
+  inputs, and a persistent toast with Resume. Resume re-sends System audio On
+  (the same path as a shortcut) through a window event, so the lazy chunks
+  stay out of the eager bundle. The shortcut and remote `toggle` while paused
+  turns it Off, as for a loss; `on` resumes. The Sources helper text no longer
+  implies headphones stop the loop.
+
+### Evidence
+
+- FFmpeg coupling (A0), bundled ffmpeg 8.1.1, the session's input layout (an
+  f32le FIFO plus a live MPEG-TS FIFO, copy video, AAC, MKV):
+  - Pausing the video producer for 2.0 s at t=4.0 blocked the audio writer
+    for 1.709 s from t=4.29, with max lateness 1.70 s. Stream 1 logged
+    1,742 ms.
+  - Control run without the pause: worst block 37 ms, lateness 0.05 s.
+- Real-bus regressions (session_audio): a stalled reader keeps the
+  microphone at 50 and 150 ms playout, and with system audio mixed. A +5 s
+  device clock jump re-anchors and recovers. The echo guard pauses a 3.16 s
+  loop at the right lag. The mic-only golden SHA is unchanged.
+- `smoke:output-stall` (new; debug seam `VIDEORC_TEST_VT_FIFO_PAUSE_REPEAT`,
+  3 x 1.5 s recording video pauses, one access unit apart, synthetic 440 Hz
+  microphone):
+  - PASS on this branch: `audio-output-stalled` reported 4.3 s behind and
+    4.5 s of silence; the tone was back at 8.5 s and continued to the end; no
+    microphone loss.
+  - A single 3 s pause trips the encoder bridge's own 2 s no-progress
+    watchdog instead, which is a different failure.
+  - The same smoke on main, with only the seam added, FAILS the way the
+    owner's stream did: `microphone-timeline-lost` ("… Videorc replaced the
+    missing input with silence"), and the tone is silent from 4.5 s to the
+    end of the file.
+
+### Gates
+
+Run on the owner's Mac from the worktree, 2026-09-29, while the owner used
+the machine (Chrome playing through the built-in speakers).
+
+- Rust:
+  - `cargo test -p videorc-backend`: 2,699 passed, 0 failed.
+  - `cargo fmt --check --all` and
+    `cargo clippy -p videorc-backend -- -D warnings`: clean.
+- TypeScript:
+  - `pnpm test:scripts`: 1,685 of 1,685.
+  - `pnpm --filter @videorc/desktop test`: 2,400 passed (1 skipped).
+  - `pnpm typecheck`, `pnpm lint` and `pnpm format:check`: clean.
+- `pnpm build` and `pnpm check:renderer-assets`: eager JS 1,999,763 raw of
+  2,000,000, and 386,251 gzip of 390,000. That leaves 237 raw bytes of
+  headroom; the new toasts and copy live in lazy chunks.
+- `pnpm smoke:output-stall`: PASS on this branch; FAIL on main, as described
+  above.
+- `pnpm smoke:record-latency:gate`: PASS in enforce mode. Warm
+  click-to-recording p95 was 84 ms, and click-to-idle p95 was 90 ms.
+- `pnpm smoke:live-source-switch`:
+  - Record mode passed.
+  - Stream mode fails one check, "received/source-loss: Intentional silence
+    contains audible source PCM", **identically on unmodified main**
+    (verified in a clean main worktree). It is pre-existing, not from this
+    branch.
+  - Likely cause: the 150 ms system-audio playout (plan 069) plus the
+    stream leg's 130 ms audio advance puts about 280 ms of the old tone past
+    the loss, and the smoke's silence window starts 250 ms after it.
+- Not run:
+  - `smoke:system-audio` and `measure:av-sync --system-audio`: Chrome audio
+    contaminates their tone verdicts.
+  - The pointer-driving stages of `smoke:recording-studio`: the owner was
+    using the Mac.
+
+### Still owed
+
+- Owner acceptance on a packaged candidate (the three steps above).
+- `pnpm smoke:system-audio` on a quiet machine. Chrome was playing audio
+  through the speakers during this run (`pmset -g assertions`), which
+  contaminates its tone verdicts, so it was not run.
+- An end-to-end echo smoke that plays the stream back through the speakers
+  is not implemented. The real-bus test and the owner's step 2 cover it.
