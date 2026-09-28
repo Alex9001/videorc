@@ -332,3 +332,145 @@ deletes old autobuild releases, so the pin 404s over time. Re-pin by picking a
 current `ffmpeg-n8.x-*-win64-lgpl-8.x.zip` from
 https://github.com/BtbN/FFmpeg-Builds/releases, downloading it, and recording
 its sha256 in the pin (LGPL-only assets — repo policy).
+
+## Startup incident diagnostics (Plan 067)
+
+These commands collect diagnostic evidence. They do not qualify an installed
+candidate, prove sustained hardware support, or replace physical/provider acceptance.
+The protected stream performance command without `--incident` retains its existing
+installed-candidate requirements and budgets.
+
+Build a debug backend, fetch the pinned Windows output FFmpeg, and run from PowerShell 7:
+
+```powershell
+cargo build -p videorc-backend
+pnpm ffmpeg:fetch:windows
+pnpm smoke:windows-mf-probe -- --output "$env:TEMP/mf-probe-evidence"
+pnpm smoke:windows-stream-performance -- --incident --list
+pnpm smoke:windows-stream-performance -- --incident --audio controlled --output "$env:TEMP/incident-controlled-new"
+```
+
+The MF command invokes `videorc-backend --windows-mf-probe-matrix` and defaults
+to 1920×1080 and 1280×720 at 30 fps and 6000/5500/5000 kbps. Custom arguments
+are pairs, for example `1280x720@30 5200` (which also probes 5000). Each hardware
+activation is identified separately. Six exact variants cover system-memory
+I420/NV12 and NV12 D3D11 uploads with both VIDEO_SUPPORT and multithread flags
+independently on/off. Diagnostic overrides do not change shipping selection.
+Each owned child announces readiness and has a 20-second deadline plus a
+five-second kill/reap deadline. A Windows kill-on-close Job Object also contains
+children if the supervisor exits. Completed rows are atomically persisted next
+to the selected database as `windows-mf-probe.json`; support bundles include
+this bounded, validated, redacted report. Invalid optional probe evidence is
+explicitly marked without dropping other bundle sections. No encoder is a
+completed measurement, never a hardware support claim. Driver/version fields
+are null when DXGI cannot supply them; the backend crate version is not the
+Electron app version. The direct MF probe does not use FFmpeg.
+
+The Windows workflow also uploads `videorc-windows-diagnostic-backend`: the
+already-built debug `videorc-backend.exe` and an `identity.json` containing its
+SHA256, workflow run ID, and the checkout commit actually used to build it. This
+is a standalone diagnostic executable, not an installer, signed candidate, or
+hardware qualification. A tester can download it, check out that workflow's
+repository commit for the maintained scripts, fetch the pinned FFmpeg with
+`pnpm ffmpeg:fetch:windows`, and pass `--backend <downloaded-executable>` to either
+diagnostic command without compiling Rust. Physical worker cases additionally
+need the matching capture worker described below.
+
+The incident matrix crosses both profiles with local recording, one receiver,
+two receivers, and recording plus two receivers; native PCM controlled tone,
+an additional independent FFmpeg tone control, real capture
+worker, and an injected worker-open failure into real DirectShow fallback;
+three same-process attempts versus three backend restarts. Its fixed preview
+state is the backend compositor without a presenter. Controlled audio selects the
+existing portable debug native PCM fixture: continuous 440 Hz tone, with
+runner-owned fixture flags. Its CoreAudio-prefixed synthetic device ID does not
+represent a physical CoreAudio device on Windows. The fixture keeps an anchored
+sample clock after delayed scheduling, catches up at most one second, and reports
+any skipped expired samples. `--audio ffmpeg-control` selects a separate debug and
+smoke gated lavfi 880 Hz source, requires no selected microphone, and bypasses the
+native PCM bus. Both modes keep the same strict artifact gates and retain separate
+reports; the FFmpeg control does not replace failed native PCM evidence.
+An absent microphone would
+produce intentional silence and is not used as tone evidence. A named case can be run:
+
+```powershell
+pnpm smoke:windows-stream-performance -- --incident --scenario 1080p30-record-dual-controlled-same-process --output "$env:TEMP/incident-one-new"
+pnpm smoke:windows-stream-performance -- --incident --audio worker --microphone "<exact device ID>" --output "$env:TEMP/incident-worker-new"
+pnpm smoke:windows-stream-performance -- --incident --audio direct-fallback --microphone "<exact device ID>" --output "$env:TEMP/incident-fallback-new"
+```
+
+Real microphone cases require a present sibling `ffmpeg-capture.exe`, an
+available selected microphone, and actual worker/fallback evidence. The report
+records the worker file SHA256; presence is not protocol or signature verification,
+and injected fallback deliberately bypasses worker open. Missing
+prerequisites are BLOCKED, not replaced with tone. Injected open failure exists
+only in Windows debug builds with both smoke RPC and the runner-owned injection
+flag; release binaries cannot enable it. The standalone harness verifies the
+backend debug-build capability, uses its private admin bootstrap, and never uses
+real provider URLs or keys.
+Receiver listening ownership is verified against each exact spawned PID on
+127.0.0.1 before publication. Both dual-destination artifacts must be analyzed.
+
+Keep speech or a steady test tone audible during real microphone runs. The
+incident gate requires more than 10% audible measured interior above the
+analyzer's -50 dB silence threshold; a quiet-room failure alone does not establish
+a capture-device fault. Controlled tone rejects 20 ms or more total interior
+silence. Both checks clip silence across the 500 ms lead-in and 300 ms tail, so
+a wholly silent artifact cannot pass by touching those boundaries. Every artifact
+also enforces the maintained recording-matrix 100 ms A/V stop-tail bound. A bounded
+ffprobe packet pass measures terminal video and audio PTS plus packet duration,
+including FLV receivers whose stream durations are absent. Missing terminal timing
+fails closed; a null container duration cannot bypass the stop-tail check.
+
+Use a new empty output directory for every invocation. Every failed start and
+cleanup outcome is retained before the next attempt. Reports include OS/adapter
+identity, actual executable hashes, process-instance identity, session-owned
+logs/diagnostics, observed or explicitly unknown startup milestones, encoder
+path, and final artifact cadence, motion, audio gaps/digital zeroes, and A/V
+stream timestamp skew. Perceptual microphone offset remains unmeasured without
+a physical flash/click reference. A nonzero runner exit means a failed or
+blocked diagnostic case, not a reason to relax the existing analyzer limits.
+The hosted Windows diagnostic job runs both synthetic audio controls; it cannot close
+the affected Intel/DirectShow incident or physical/provider acceptance.
+
+### Isolate OpenH264 frame skipping
+
+```powershell
+pnpm probe:windows-openh264 -- --output "$env:TEMP/openh264-comparison-new"
+```
+
+This bounded standalone comparison runs before backend compilation in Windows CI.
+It encodes the same finite, hashed 1080p30/720p30 raw video and stereo PCM inputs
+with `allow_skip_frames=1` and `0`. It uses both moving test content and a
+seeded noise burst during the final 500 ms to expose terminal-frame dropping.
+The encoder options match the Windows software path: OpenH264 bitrate control,
+6000 kbps maximum rate, 12000 kbit buffer, two-second GOP, AAC, `apad`, and
+`-shortest`. It records complete arguments, tool hashes/version, encoded frame
+count, packet end times, bytes, two-second bitrate, and encoding throughput.
+The finite file input deliberately removes capture pacing and native audio.
+
+Encoded outputs and reports are retained; large raw inputs are deleted after
+measurement. A successful command means the comparison completed, not that
+either skip setting meets release quality or bandwidth requirements. The report
+keeps the strict 100 ms packet-tail result and exposes any extra bandwidth used
+when frame skipping is disabled. No shipping encoder option is changed by this
+probe, and neither result replaces the full incident matrices.
+
+The comparison also exercises owned PCM shutdown over runner-owned loopback TCP
+using the production raw-video/PCM queue sizes and default probing. It retains
+an early-PCM-EOF baseline, then ends captured input at three seconds while timed
+zeros continue until four seconds of video finish and FFmpeg exits. Normal and
+600 ms delayed/queued startup cases retain frame accounting, A/V start skew,
+packet tail, first-output time and video-EOF-to-exit time, plus their differences
+from the matching baseline. The 1500 ms diagnostic deadline bounds this probe;
+application click-to-idle acceptance still uses the existing latency budget.
+
+`--eof-stability-passes 25` repeats each candidate case 25 times on hosted
+Windows; the early-EOF baseline pair runs once. Every candidate must preserve the
+video timeline, keep PCM open through video EOF, close all owned processes and
+sockets, and satisfy the unchanged 100 ms start-skew/tail limits. No `arealtime`,
+input pacing, frame-skipping or codec policy changes are used by this comparison.
+The candidate aggregate also enforces the existing 1000 ms cold-start budget on
+first-output p95 and the existing 300 ms stop budget on EOF-to-exit p95 for each
+startup case. These component measurements do not replace the full application
+latency gate. Per-attempt baseline deltas remain in the report.

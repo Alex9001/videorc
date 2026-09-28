@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  freeformLiveSurfaceReady,
+  createFreeformMouseSequence,
   evaluateFreeformArtifact,
   evaluateFreeformChrome,
   evaluateFreeformGesture,
@@ -250,7 +252,11 @@ function liveGesture() {
       ghost: { ...rounded, x: 0.3127 }
     },
     wireDrafts: [
-      { transform: draftRect, afterRelease: false, chrome: { guides: [{ axis: 'x', position: 0.5 }] } },
+      {
+        transform: draftRect,
+        afterRelease: false,
+        chrome: { guides: [{ axis: 'x', position: 0.5 }] }
+      },
       { transform: rounded, afterRelease: true, chrome: { guides: [] } }
     ],
     wireClears: [],
@@ -349,10 +355,16 @@ describe('live canvas draft gate', () => {
   it('never lets a hold stand in for the gesture drafts', () => {
     const onlyHolds = liveGesture()
     onlyHolds.wireDrafts = [{ sourceId: hold.sourceId, afterRelease: false }]
-    assert.match(evaluateLiveDraftGesture(onlyHolds).failures.join(), /no scene.editor.draft.set with a rect/)
+    assert.match(
+      evaluateLiveDraftGesture(onlyHolds).failures.join(),
+      /no scene.editor.draft.set with a rect/
+    )
     const chromeFinal = liveGesture()
     chromeFinal.final.draft = hold
-    assert.match(evaluateLiveDraftGesture(chromeFinal).failures.join(), /final draft is chrome-only/)
+    assert.match(
+      evaluateLiveDraftGesture(chromeFinal).failures.join(),
+      /final draft is chrome-only/
+    )
     const holdApplied = liveGesture()
     holdApplied.applied = [hold]
     assert.match(evaluateLiveDraftGesture(holdApplied).failures.join(), /reported as an applied/)
@@ -366,7 +378,10 @@ describe('live canvas draft gate', () => {
       { sourceId: hold.sourceId, transform: rounded },
       { sourceId: hold.sourceId, transform: { ...rounded, x: 0.4 }, releaseAtRevision: 12 }
     ]
-    assert.match(evaluateLiveDraftGesture(drifted).failures.join(), /differs from the committed transform/)
+    assert.match(
+      evaluateLiveDraftGesture(drifted).failures.join(),
+      /differs from the committed transform/
+    )
     const stamped = liveGesture()
     stamped.applied = [{ sourceId: hold.sourceId, transform: rounded, releaseAtRevision: 11 }]
     assert.match(evaluateLiveDraftGesture(stamped).failures.join(), /stamped for revision 11/)
@@ -375,19 +390,28 @@ describe('live canvas draft gate', () => {
     assert.match(evaluateLiveDraftGesture(settledRect).failures.join(), /carries a transform/)
     const settledOther = liveGesture()
     settledOther.settled = { sourceId: 'source:camera' }
-    assert.match(evaluateLiveDraftGesture(settledOther).failures.join(), /idle hold names source:camera/)
+    assert.match(
+      evaluateLiveDraftGesture(settledOther).failures.join(),
+      /idle hold names source:camera/
+    )
     const noHoldAfter = liveGesture()
     noHoldAfter.holdAfter = null
-    assert.match(evaluateLiveDraftGesture(noHoldAfter).failures.join(), /after the gesture, no chrome-only hold/)
+    assert.match(
+      evaluateLiveDraftGesture(noHoldAfter).failures.join(),
+      /after the gesture, no chrome-only hold/
+    )
   })
 })
 
 describe('idle selection hold gate', () => {
   it('accepts a chrome-only draft naming the selection', () => {
-    assert.deepEqual(evaluateIdleHold({ sourceId: 'source:camera', draft: { sourceId: 'source:camera' } }), {
-      ok: true,
-      failures: []
-    })
+    assert.deepEqual(
+      evaluateIdleHold({ sourceId: 'source:camera', draft: { sourceId: 'source:camera' } }),
+      {
+        ok: true,
+        failures: []
+      }
+    )
     assert.equal(
       evaluateIdleHold({
         sourceId: 'source:camera',
@@ -397,10 +421,19 @@ describe('idle selection hold gate', () => {
     )
   })
   it('rejects nothing, another source, and a draft with a rect', () => {
-    assert.match(evaluateIdleHold({ sourceId: 'source:camera', draft: null }).failures.join(), /no chrome-only hold/)
-    assert.equal(evaluateIdleHold({ sourceId: 'source:camera', draft: null, allowNone: true }).ok, true)
     assert.match(
-      evaluateIdleHold({ sourceId: 'source:camera', draft: { sourceId: 'source:screen' } }).failures.join(),
+      evaluateIdleHold({ sourceId: 'source:camera', draft: null }).failures.join(),
+      /no chrome-only hold/
+    )
+    assert.equal(
+      evaluateIdleHold({ sourceId: 'source:camera', draft: null, allowNone: true }).ok,
+      true
+    )
+    assert.match(
+      evaluateIdleHold({
+        sourceId: 'source:camera',
+        draft: { sourceId: 'source:screen' }
+      }).failures.join(),
       /names source:screen/
     )
     assert.match(
@@ -475,18 +508,92 @@ describe('preview cadence gate', () => {
   })
   it('counts a stall that is still running at the end of sampling', () => {
     const samples = steady(100, 30)
-    for (let index = 70; index < 100; index++) samples[index].framesRendered = samples[69].framesRendered
+    for (let index = 70; index < 100; index++)
+      samples[index].framesRendered = samples[69].framesRendered
     const result = evaluatePreviewCadence({ samples, fps: 30 })
     assert.equal(result.ok, false)
     assert.ok(result.provenStallMs >= 280)
   })
   it('rejects a counter that never advances, goes backwards, missing fps, and too few samples', () => {
     const frozen = Array.from({ length: 50 }, (_, index) => ({ at: index * 10, framesRendered: 7 }))
-    assert.match(evaluatePreviewCadence({ samples: frozen, fps: 30 }).failures.join(), /never advanced/)
+    assert.match(
+      evaluatePreviewCadence({ samples: frozen, fps: 30 }).failures.join(),
+      /never advanced/
+    )
     const backwards = steady(50)
     backwards[20].framesRendered = 0
-    assert.match(evaluatePreviewCadence({ samples: backwards, fps: 30 }).failures.join(), /backwards/)
+    assert.match(
+      evaluatePreviewCadence({ samples: backwards, fps: 30 }).failures.join(),
+      /backwards/
+    )
     assert.equal(evaluatePreviewCadence({ samples: frozen, fps: 0 }).ok, false)
     assert.equal(evaluatePreviewCadence({ samples: frozen.slice(0, 2), fps: 30 }).ok, false)
+  })
+})
+
+describe('Freeform initial native surface readiness', () => {
+  it('requires a presented, attached, visible surface in the stable docked generation', () => {
+    const window = {
+      open: true,
+      visible: true,
+      mode: 'docked',
+      dockHiddenReason: null,
+      dockEpoch: 2,
+      supervisor: { generation: 4, lifecycleState: 'surface-live' },
+      contentBounds: { x: 10, y: 20, width: 300, height: 200 }
+    }
+    const surface = {
+      state: 'live',
+      transport: 'native-surface',
+      backing: 'cametal-layer',
+      nativePreviewHostAttached: true,
+      presentedFrameId: 1,
+      bounds: { visible: true, screenX: 10, screenY: 20, width: 300, height: 200 }
+    }
+    const ready = { before: window, after: window, surface }
+    assert.equal(freeformLiveSurfaceReady(ready), true)
+    for (const patch of [
+      { presentedFrameId: 0 },
+      { nativePreviewHostAttached: false },
+      { transport: 'electron-proof-surface' },
+      { bounds: { ...surface.bounds, visible: false } },
+      { bounds: { ...surface.bounds, screenX: 100 } }
+    ])
+      assert.equal(freeformLiveSurfaceReady({ ...ready, surface: { ...surface, ...patch } }), false)
+    for (const patch of [
+      { mode: 'floating' },
+      { dockEpoch: 3 },
+      { supervisor: { ...window.supervisor, generation: 5 } },
+      { supervisor: { ...window.supervisor, lifecycleState: 'starting-surface' } }
+    ])
+      assert.equal(freeformLiveSurfaceReady({ ...ready, after: { ...window, ...patch } }), false)
+  })
+})
+
+describe('Freeform trusted pointer input sequence', () => {
+  it('hovers with no button, holds left through drag, and resets before the next gesture', () => {
+    const mouse = createFreeformMouseSequence()
+    for (let gesture = 0; gesture < 2; gesture++) {
+      const sequence = [
+        'mouseMoved',
+        'mousePressed',
+        'mouseMoved',
+        'mouseReleased',
+        'mouseMoved'
+      ].map((type) => mouse(type, { x: 10, y: 20 }, 8))
+      assert.deepEqual(
+        sequence.map(({ button, buttons }) => [button, buttons]),
+        [
+          ['none', 0],
+          ['left', 1],
+          ['left', 1],
+          ['left', 0],
+          ['none', 0]
+        ]
+      )
+      assert.ok(
+        sequence.every((event) => event.x === 10 && event.y === 20 && event.modifiers === 8)
+      )
+    }
   })
 })
