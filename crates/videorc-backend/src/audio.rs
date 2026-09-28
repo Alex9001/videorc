@@ -77,7 +77,9 @@ pub struct AudioFrame {
 
 /// Authoritative lifecycle of the native microphone input feeding FFmpeg.
 ///
-/// `SourceLost` is reserved for producer EOF or a confirmed callback stall.
+/// `SourceLost` means the selected input can no longer supply usable audio.
+/// The session bus retains the distinction between producer EOF/callback stall
+/// and arriving samples rejected by the timeline in `SourceLossReason`.
 /// FIFO write failures are downstream failures, never microphone loss, and a
 /// user/application stop remains distinguishable from both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

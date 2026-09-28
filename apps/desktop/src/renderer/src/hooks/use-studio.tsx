@@ -3207,7 +3207,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     }
     const smokeWindow = window as Window & {
       __videorcSmokeSelectFirstCamera?: () => string | null
-      __videorcSmokeSelectFirstScreen?: () => { id: string; kind: 'screen' | 'window' } | null
+      __videorcSmokeSelectFirstScreen?: (
+        sourceId?: string
+      ) => { id: string; kind: 'screen' | 'window' } | null
     }
     smokeWindow.__videorcSmokeSelectFirstCamera = (): string | null => {
       const camera = deviceList.devices.find(
@@ -3222,12 +3224,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       }))
       return camera.id
     }
-    smokeWindow.__videorcSmokeSelectFirstScreen = () => {
+    // An explicit source ID pins a display, e.g. one held static by a fixture.
+    smokeWindow.__videorcSmokeSelectFirstScreen = (sourceId) => {
       const source = deviceList.devices.find(
         (device) =>
           (device.kind === 'screen' || device.kind === 'window') &&
           device.status === 'available' &&
-          device.id.includes('screencapturekit')
+          device.id.includes('screencapturekit') &&
+          (!sourceId || device.id === sourceId)
       )
       if (!source || (source.kind !== 'screen' && source.kind !== 'window')) {
         return null
@@ -3730,6 +3734,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           ? { lastSessionId: lastRecordingSessionIdRef.current }
           : {}),
         lastActivity: lastSessionActivityRef.current,
+        currentNotice: sessionRuntimeNoticeRef.current,
         currentDedupeKey: microphoneInputLostSessionRef.current
       })
       if (!presentation) return
@@ -6129,7 +6134,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (event.code === 'captions-srt-written' && event.sessionId) {
           transcriptWrittenSessionIdsRef.current.add(event.sessionId)
         }
-        if (event.code === 'microphone-input-lost') {
+        if (
+          ['microphone-input-lost', 'microphone-timeline-lost', 'system-audio-lost'].includes(
+            event.code
+          )
+        ) {
           void publishMicrophoneInputLost(event)
         } else {
           const qualityDedupeKey = event.sessionId ?? event.message

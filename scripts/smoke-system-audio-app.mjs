@@ -53,13 +53,20 @@
 //
 //   node scripts/smoke-system-audio-app.mjs [--cases on,toggle-off,...] [--debug]
 
+import { randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { parseArgs } from 'node:util'
+import { createInterface } from 'node:readline'
 
+import {
+  launchScreenMotionStimulus,
+  stopScreenMotionStimulus,
+  stimulusWindowOptionsForSource
+} from './lib/screen-motion-stimulus.mjs'
 import { launchDevApp, repoRoot } from './lib/app-launcher.mjs'
 import { resolveExistingSiblingFfprobe } from './lib/ffmpeg-sibling-paths.mjs'
 import {
@@ -81,6 +88,9 @@ import {
   evaluateToggleOffCase,
   evaluateToggleOnCase,
   evaluateToneCapturedCase,
+  evaluateMixedToneCapturedCase,
+  evaluateStaticScreenEpoch,
+  parseRecordingEpochLine,
   mixSourcesIncludeSystemAudio,
   parseSystemAudioMixCutover,
   reportDbfs,
@@ -95,6 +105,11 @@ const { values: args } = parseArgs({
   options: {
     cases: { type: 'string', default: ALL_CASES.join(',') },
     report: { type: 'string' },
+    'static-screen-id': { type: 'string' },
+    'app-executable': { type: 'string' },
+    microphone: { type: 'boolean', default: false },
+    moving: { type: 'boolean', default: false },
+    camera: { type: 'boolean', default: false },
     debug: { type: 'boolean', default: false }
   },
   strict: true
@@ -103,6 +118,17 @@ const { values: args } = parseArgs({
 const selectedCases = args.cases.split(',').map((name) => name.trim())
 for (const name of selectedCases) {
   if (!ALL_CASES.includes(name)) fail(`unknown case "${name}" (known: ${ALL_CASES.join(', ')})`)
+}
+const staticScreenId = args['static-screen-id']
+const appExecutable = args['app-executable']
+const packagedCapability = appExecutable ? randomBytes(32).toString('base64url') : undefined
+if (
+  appExecutable &&
+  (!staticScreenId || selectedCases.some((name) => ['self', 'stream'].includes(name)))
+) {
+  fail(
+    '--app-executable requires --static-screen-id and --cases on,toggle-off,toggle-on,off; packaged setup uses the Studio UI, without eval-js'
+  )
 }
 const debug = args.debug || process.env.VIDEORC_SYSTEM_AUDIO_SMOKE_DEBUG === '1'
 const timeoutMs = Number(process.env.VIDEORC_SMOKE_TIMEOUT_MS ?? 120000)
@@ -240,8 +266,28 @@ class RemoteAcks {
 /** Mix cutovers the backend logs, with their receive time. */
 const cutovers = []
 const exclusionWarnings = []
+const startupEpochs = []
+const audioSummaries = []
+const microphoneSummaries = []
 
 function onAppLine(line) {
+  const epoch = parseRecordingEpochLine(line)
+  if (epoch) startupEpochs.push({ at: performance.now(), ...epoch })
+  const mic =
+    /Native microphone capture ended for (.+): state=([^,]+), sourceLossAfterMs=([^,]+), (\d+) frames captured, (\d+) frames dropped/.exec(
+      line
+    )
+  if (mic)
+    microphoneSummaries.push({
+      at: performance.now(),
+      device: mic[1],
+      state: mic[2],
+      sourceLoss: mic[3],
+      capturedFrames: Number(mic[4]),
+      droppedFrames: Number(mic[5])
+    })
+  const dropped = /ahead-of-cap=(\d+)/.exec(line)
+  if (dropped) audioSummaries.push({ at: performance.now(), aheadCapDrops: Number(dropped[1]) })
   const cutover = parseSystemAudioMixCutover(line)
   if (cutover) cutovers.push({ ...cutover, at: performance.now() })
   if (/could not find the Videorc app to exclude|without excluding the Electron main/.test(line)) {
@@ -420,7 +466,7 @@ async function waitForBackendState(ws, method, predicate, label) {
   fail(`timed out waiting for ${label}; last ${method}: ${JSON.stringify(last)}`)
 }
 
-async function seedRenderer(smoke) {
+async function seedRenderer(smoke, sources) {
   await requestSmokeCommand(
     smoke,
     'eval-js',
@@ -433,15 +479,24 @@ async function seedRenderer(smoke) {
         // grant), record only, System audio Off until a case turns it on.
         const layout = { ...(current.layout ?? {}), layoutPreset: 'screen-only' };
         const audio = { ...(current.audio ?? {}), systemAudioEnabled: false, systemAudioGainDb: -6 };
-        localStorage.setItem(key, JSON.stringify({ ...current, video: params.video, layout, audio, recordEnabled: true, streamEnabled: false }));
+        localStorage.setItem(key, JSON.stringify({ ...current, video: params.video, sources: params.sources ?? current.sources, layout, audio, recordEnabled: true, streamEnabled: false }));
         setTimeout(() => location.reload(), 50);
         return true;
       `,
+      sources,
       video: { preset: 'tutorial-1080p30', width: 1920, height: 1080, fps: 30, bitrateKbps: 6000 }
     },
     { timeoutMs }
   )
   await sleep(2500)
+  await requestSmokeCommand(
+    smoke,
+    'eval-js',
+    {
+      code: `await waitFor('[data-videorc-tab-trigger="studio"]', 60000); return true;`
+    },
+    { timeoutMs }
+  )
 }
 
 /**
@@ -520,6 +575,25 @@ async function setSystemAudio(ctx, enabled) {
 async function recordRendererSession(ctx, { name, systemAudioAtStart, timeline }) {
   const { recorder, remote, acks, renderer } = ctx
   await setSystemAudio(ctx, systemAudioAtStart)
+  if (ctx.microphone) {
+    await request(renderer, timeoutMs, 'audio.mic.arm', {
+      microphoneId: ctx.microphone.id,
+      microphoneGainDb: 0,
+      microphoneMuted: false
+    })
+  }
+  if (staticScreenId && !args.moving) {
+    const ready = await waitForBackendState(
+      renderer,
+      'diagnostics.stats',
+      (stats) =>
+        stats.previewScreenFrameAgeMs >= 10000 && stats.previewScreenCaptureCallbackAgeMs < 500,
+      'a real static screen held for 10s with live capture callbacks'
+    )
+    log(
+      `static screen ready: content age ${ready.previewScreenFrameAgeMs}ms, callback age ${ready.previewScreenCaptureCallbackAgeMs}ms`
+    )
+  }
   const recordingPromise = recorder.waitFor(
     `${name} recording.status(recording)`,
     (record) =>
@@ -610,7 +684,9 @@ function sessionWindow(recorder, session) {
         session.endAt,
         (record) =>
           record.event === 'health.event' &&
-          String(record.payload?.code ?? '').startsWith('system-audio') &&
+          /^(system-audio|microphone-input-lost|microphone-timeline-lost)/.test(
+            String(record.payload?.code ?? '')
+          ) &&
           inSession(record)
       )
       .map((record) => record.payload.code),
@@ -670,7 +746,7 @@ const cases = {
     const analysis = await analyzeArtifact(session.mp4Path, 'on')
     const anchor = { wallMs: session.epochAt }
     const start = wallToFileSeconds(playAt, anchor)
-    const result = evaluateToneCapturedCase({
+    const result = (args.microphone ? evaluateMixedToneCapturedCase : evaluateToneCapturedCase)({
       envelope: analysis.envelope,
       regions: analysis.regions,
       expectedPlay: { start, end: start + 3 }
@@ -679,6 +755,35 @@ const cases = {
     const window = sessionWindow(ctx.recorder, session)
     if (window.mixedStatusCount === 0) result.failures.push('on: no status listed system-audio')
     if (window.health.length) result.failures.push(`on: health ${window.health.join(', ')}`)
+    const epochs = startupEpochs.filter(
+      (entry) => entry.at >= session.clickAt && entry.at <= session.endAt
+    )
+    const summaries = audioSummaries.filter(
+      (entry) => entry.at >= session.clickAt && entry.at <= session.endAt
+    )
+    window.startupEpochs = epochs.map(({ at, ...entry }) => entry)
+    window.microphones = microphoneSummaries
+      .filter((entry) => entry.at >= session.clickAt && entry.at <= session.endAt)
+      .map(({ at, ...entry }) => entry)
+    if (
+      ctx.microphone &&
+      !window.microphones.some(
+        (entry) =>
+          entry.device === ctx.microphone.name &&
+          entry.capturedFrames > 48000 &&
+          entry.sourceLoss === 'none'
+      )
+    )
+      result.failures.push('on: expected native microphone did not deliver usable captured audio')
+    window.aheadCapDrops = summaries.reduce((sum, entry) => sum + entry.aheadCapDrops, 0)
+    if (staticScreenId && !args.moving && !args.camera) {
+      const epochResult = evaluateStaticScreenEpoch({
+        ...epochs[0],
+        aheadCapDrops: window.aheadCapDrops
+      })
+      result.failures.push(...epochResult.failures)
+    }
+    if (window.aheadCapDrops > 0) result.failures.push('on: ahead-of-cap audio drops')
     return finish(result, { artifact: artifactEvidence(analysis, session.mp4Path), ...window })
   },
 
@@ -863,7 +968,7 @@ const cases = {
       )
       const clickAt = performance.now()
       started = await request(renderer, timeoutMs, 'session.start', {
-        sources: { testPattern: true },
+        sources: ctx.realSources ?? { testPattern: true },
         layout: {
           layoutPreset: 'screen-only',
           cameraTransformMode: 'preset',
@@ -1050,6 +1155,7 @@ function printCase(name, result) {
 }
 
 let stopApp = async () => {}
+let staticStimulus
 const userDataDir = mkdtempSync(join(tmpdir(), 'videorc-system-audio-user-data-'))
 try {
   if (process.platform !== 'darwin') {
@@ -1061,13 +1167,23 @@ try {
     const launch = await launchDevApp({
       env: {
         VIDEORC_SMOKE_COMMAND_SERVER: '1',
-        VIDEORC_SMOKE_PREVIEW_MOTION: '1',
+        VIDEORC_SMOKE_PREVIEW_MOTION: staticScreenId ? '0' : '1',
         VIDEORC_SMOKE_STATE_DIR: outputDirectory,
         VIDEORC_USER_DATA_DIR: userDataDir,
         // No microphone: the bus writes paced silence for the mic slot, so
         // the file carries only what System audio mixes in.
-        VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: '1'
+        VIDEORC_SMOKE_DISABLE_NATIVE_MICROPHONE: args.microphone ? '0' : '1',
+        ...(appExecutable
+          ? {
+              VIDEORC_SMOKE_PACKAGED_APP: '1',
+              VIDEORC_PACKAGED_SMOKE_TEST: '1',
+              VIDEORC_SMOKE_COMMAND_CAPABILITY: packagedCapability,
+              VIDEORC_SMOKE_PRINT_BACKEND_READY: '1'
+            }
+          : {})
       },
+      packagedSmokeCommandCapability: packagedCapability,
+      spawnSpec: appExecutable ? { command: resolve(appExecutable), args: [] } : undefined,
       timeoutMs,
       requiredMarkers: ['backend-ready', 'preview-motion-ready'],
       onLine: onAppLine
@@ -1092,37 +1208,116 @@ try {
       fail(reason)
     }
 
-    await seedRenderer(smoke)
-    const compositorBefore = await request(renderer, timeoutMs, 'compositor.status')
-    await requestSmokeCommand(smoke, 'enable-synthetic-source', { settleMs: 500 }, { timeoutMs })
-    await waitForBackendState(
-      renderer,
-      'compositor.status',
-      (compositor) => syntheticCompositorReady(compositor, compositorBefore),
-      'synthetic compositor readiness'
-    )
-    // The seeded screen-only layout does not always survive the reload: with a
-    // camera attached (the owner's iPhone Continuity camera comes and goes) the
-    // scene kept a visible camera the dev app cannot open (no camera grant),
-    // and the start preflight refused Record ("camera preview source(s)
-    // produced no frames"). Select screen-only through the UI, then prove the
-    // scene has no visible camera before any case runs.
-    await requestSmokeCommand(
-      smoke,
-      'select-layout-preset',
-      { preset: 'screen-only', settleMs: 600 },
-      { timeoutMs }
-    )
+    const microphone = args.microphone
+      ? devices.devices.find(
+          (entry) =>
+            entry.kind === 'microphone' &&
+            entry.status === 'available' &&
+            /MacBook.*Microphone/.test(entry.name)
+        )
+      : null
+    if (args.microphone && !microphone) fail('No native microphone available')
+    const realSources = staticScreenId
+      ? {
+          screenId: staticScreenId,
+          ...(microphone ? { microphoneId: microphone.id } : {}),
+          testPattern: false
+        }
+      : undefined
+    if (appExecutable) {
+      log(
+        `Packaged candidate ready for Studio setup: select screen ${staticScreenId}, Screen only, Record enabled, Stream disabled${args.microphone ? ', and the built-in microphone' : ''}. Waiting for the confirmed native scene.`
+      )
+      log(
+        'After Studio setup and the automatic performance check finish, enter ready on stdin to start the acceptance run.'
+      )
+      const input = createInterface({ input: process.stdin })
+      try {
+        await new Promise((resolveReady, rejectReady) => {
+          const timer = setTimeout(
+            () => rejectReady(new Error('Packaged Studio setup was not confirmed')),
+            timeoutMs
+          )
+          input.once('line', (line) => {
+            clearTimeout(timer)
+            line.trim() === 'ready'
+              ? resolveReady()
+              : rejectReady(new Error('Expected ready after Studio setup'))
+          })
+          input.once('close', () => {
+            clearTimeout(timer)
+            rejectReady(new Error('Packaged setup requires interactive stdin'))
+          })
+        })
+      } finally {
+        input.close()
+      }
+    } else {
+      await seedRenderer(smoke, realSources)
+      if (!staticScreenId)
+        await requestSmokeCommand(
+          smoke,
+          'enable-synthetic-source',
+          { settleMs: 500 },
+          { timeoutMs }
+        )
+      await requestSmokeCommand(
+        smoke,
+        'select-layout-preset',
+        { preset: 'screen-only', settleMs: 600 },
+        { timeoutMs }
+      )
+      // A seeded source does not survive the device refresh; pin the display.
+      if (staticScreenId)
+        await requestSmokeCommand(
+          smoke,
+          'select-screen-device',
+          { sourceId: staticScreenId, settleMs: 1000 },
+          { timeoutMs }
+        )
+    }
     await waitForBackendState(
       renderer,
       'compositor.status',
       (compositor) =>
-        syntheticCompositorReady(compositor) &&
-        !(compositor.sceneSources ?? []).some(
-          (source) => source?.visible && source?.kind === 'camera'
-        ),
+        (staticScreenId
+          ? compositor.state === 'live' &&
+            (compositor.sources ?? []).some(
+              (source) => source.sourceId === staticScreenId && source.state === 'live'
+            )
+          : syntheticCompositorReady(compositor)) &&
+        (args.camera ||
+          !(compositor.sceneSources ?? []).some(
+            (source) => source?.visible && source?.kind === 'camera'
+          )),
       'a screen-only scene with no visible camera'
     )
+    if (microphone) {
+      await request(renderer, timeoutMs, 'audio.mic.arm', {
+        microphoneId: microphone.id,
+        microphoneGainDb: 0,
+        microphoneMuted: false
+      })
+      log(`Native microphone warmed: ${microphone.name}`)
+    }
+    if (staticScreenId) {
+      const source = devices.devices.find((entry) => entry.id === staticScreenId)
+      if (!source) fail(`Native screen ${staticScreenId} is unavailable`)
+      const bounds = stimulusWindowOptionsForSource(source)
+      if (!bounds) fail(`Cannot locate display ${staticScreenId}`)
+      staticStimulus = await launchScreenMotionStimulus({
+        screenSource: source,
+        freeze: !args.moving,
+        driver: 'native',
+        x: bounds.x - 16,
+        y: bounds.y - 16,
+        width: bounds.width + 32,
+        height: bounds.height + 32
+      })
+      log(
+        `${args.moving ? 'Moving' : 'Static'} fixture covers the selected display until the run finishes.`
+      )
+    }
     const { discovery } = await enableRemoteControl(renderer, { timeoutMs })
     const remote = await connectRemote(discovery.host, discovery.port, discovery.token, {
       timeoutMs
@@ -1134,18 +1329,19 @@ try {
     }
     log(`app ready; running ${selectedCases.join(', ')} (ffmpeg ${ffmpegPath})`)
 
-    const ctx = { renderer, smoke, recorder, remote, acks, tones }
+    const ctx = { renderer, smoke, recorder, remote, acks, tones, realSources, microphone }
     const results = {}
     for (const [index, name] of selectedCases.entries()) {
+      const caseKey = results[name] ? `${name}-${index + 1}` : name
       if (index > 0) await sleep(idleGapMs)
       try {
-        results[name] = await cases[name](ctx)
+        results[caseKey] = await cases[name](ctx)
       } catch (error) {
-        results[name] = { pass: false, failures: [error.message], evidence: {} }
+        results[caseKey] = { pass: false, failures: [error.message], evidence: {} }
       } finally {
         stopPlayers()
       }
-      printCase(name, results[name])
+      printCase(name, results[caseKey])
     }
 
     const pass = Object.values(results).every((result) => result.pass)
@@ -1177,6 +1373,7 @@ try {
 } finally {
   stopPlayers()
   stopKeepAlive()
+  if (staticStimulus) await stopScreenMotionStimulus(staticStimulus)
   try {
     await stopApp()
   } finally {

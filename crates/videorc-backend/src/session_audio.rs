@@ -918,8 +918,20 @@ pub struct AudioCommitReceipt {
     pub output_observed: bool,
 }
 
+/// Why a mixed input left the session. A source whose buffers kept arriving
+/// but could not be placed on the timeline did not stop; saying it did sends
+/// the user to check a working device (plan 070).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceLossReason {
+    /// EOF, a callback stall, or a platform-reported capture failure.
+    CaptureStopped,
+    /// Buffers arrived, but none could be placed for the loss deadline.
+    TimelineRejected,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceLoss {
+    pub reason: SourceLossReason,
     pub generation: u64,
     pub device_name: String,
     pub after_ms: u64,
@@ -1814,6 +1826,21 @@ fn valid_system_frame(frame: &AudioFrame, arrived_at: Instant) -> bool {
 /// out unseen. A startup burst trims for well under a second.
 const SYSTEM_UNPLAYABLE_LOSS_AFTER: Duration = Duration::from_secs(2);
 
+fn microphone_loss_reason(
+    disconnected: bool,
+    since_arrival: Duration,
+    since_placement: Duration,
+    timeout: Duration,
+) -> Option<SourceLossReason> {
+    if disconnected || since_arrival >= timeout {
+        Some(SourceLossReason::CaptureStopped)
+    } else if since_placement >= timeout {
+        Some(SourceLossReason::TimelineRejected)
+    } else {
+        None
+    }
+}
+
 /// Drains every pending producer frame into the timeline. Returns `true` when
 /// the producer channel is disconnected. Called from the pacing loop and from
 /// inside a blocked FIFO write, so a bursty reader never starves ingestion.
@@ -1827,11 +1854,13 @@ fn ingest_pending(
     delay_frames: u64,
     stats: &AudioCaptureStats,
     last_source_frame: &mut Instant,
+    last_source_arrival: &mut Instant,
 ) -> bool {
     loop {
         match receiver.try_recv() {
             Ok(frame) => {
                 let now = Instant::now();
+                *last_source_arrival = now;
                 if !valid_fresh_frame(&frame, now) {
                     let frames = frame.frame_count() as u64;
                     timeline.counters.discarded_frames += frames;
@@ -1845,7 +1874,14 @@ fn ingest_pending(
                     continue;
                 };
                 let clock = clock.get_or_insert_with(|| {
-                    SourceClock::new(&frame, epoch).with_delay(delay_frames)
+                    let clock = SourceClock::new(&frame, epoch).with_delay(delay_frames);
+                    tracing::info!(
+                        epoch_age_ms = now.saturating_duration_since(epoch).as_millis() as u64,
+                        mapped_start = clock.mapped_end.round() as u64 + delay_frames,
+                        cursor = timeline.cursor(),
+                        "Microphone timeline initialized"
+                    );
+                    clock
                 });
                 let Some((start, frames)) = clock.interval(&frame) else {
                     let frames = frame.frame_count() as u64;
@@ -2003,6 +2039,94 @@ impl SourceClock {
             start.saturating_add(self.delay_frames),
             end.saturating_sub(start) as usize,
         ))
+    }
+}
+
+/// What one second of current, nonzero input produced on a bus mapped against
+/// `epoch` (plan 070 regression harness).
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct EpochAudioEvidence {
+    pub counters: AudioBusCounters,
+    pub dropped_ahead_of_cap: u64,
+    /// Output position of the first audible mixed frame, if any.
+    pub first_audible_frame: Option<u64>,
+    pub audible_frames: u64,
+    pub rendered_frames: u64,
+}
+
+/// Feeds a second of current audio captured from `started` through the real
+/// timeline, clock and system slot, rendering behind a 150 ms playout delay.
+#[cfg(test)]
+pub(crate) fn test_current_audio_on_epoch(
+    epoch: Instant,
+    started: Instant,
+    packet_frames: usize,
+    microphone_enabled: bool,
+    system_enabled: bool,
+) -> EpochAudioEvidence {
+    let mut timeline = AudioTimeline::new();
+    let mut clock = None;
+    let (mut system, _sender, _failure) = mix_tests::test_slot(0);
+    let mut next_frame = 0;
+    let mut first_audible_frame = None;
+    let mut audible_frames = 0;
+    let mut rendered_frames = 0;
+    for tick in 0..100 {
+        let end_frames = (tick + 1) * CHUNK_FRAMES;
+        while next_frame + packet_frames <= end_frames {
+            let captured_at =
+                started + Duration::from_secs_f64((next_frame + packet_frames) as f64 / 48_000.0);
+            let frame = AudioFrame {
+                timestamp_micros: next_frame as u64 * 1_000_000 / 48_000,
+                captured_at,
+                sample_rate: NATIVE_AUDIO_SAMPLE_RATE,
+                channels: NATIVE_AUDIO_CHANNELS,
+                samples: vec![0.25; packet_frames * 2],
+            };
+            if microphone_enabled {
+                let clock = clock.get_or_insert_with(|| SourceClock::new(&frame, epoch));
+                let (start, _) = clock.interval(&frame).unwrap();
+                timeline.push(0, start, frame.clone());
+            }
+            if system_enabled {
+                system.place(frame, epoch, captured_at);
+            }
+            next_frame += packet_frames;
+        }
+        if tick >= 15 {
+            let mic = timeline.render_with_provenance();
+            let sys = system.render();
+            let mixed = mix_chunk(
+                &mic.samples,
+                AudioProcessingSettings::default(),
+                &sys.samples,
+                AudioProcessingSettings::default(),
+                PeakLimiter::default(),
+            );
+            for (index, frame) in mixed.output.chunks_exact(2).enumerate() {
+                if frame.iter().any(|value| *value > 0.1) {
+                    first_audible_frame.get_or_insert(rendered_frames + index as u64);
+                    audible_frames += 1;
+                }
+            }
+            rendered_frames += CHUNK_FRAMES as u64;
+        }
+    }
+    let mic = timeline.counters();
+    let sys = system.timeline.counters();
+    EpochAudioEvidence {
+        counters: AudioBusCounters {
+            captured_frames: mic.captured_frames + sys.captured_frames,
+            dropped_frames: mic.dropped_frames + sys.dropped_frames,
+            generated_frames: mic.generated_frames + sys.generated_frames,
+            discarded_frames: mic.discarded_frames + sys.discarded_frames,
+        },
+        dropped_ahead_of_cap: timeline.losses().dropped_ahead_of_cap
+            + system.timeline.losses().dropped_ahead_of_cap,
+        first_audible_frame,
+        audible_frames,
+        rendered_frames,
     }
 }
 
@@ -2449,6 +2573,7 @@ pub struct SystemAudioObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemAudioLoss {
     pub device_name: String,
+    pub kind: SourceLossReason,
     pub reason: String,
     pub at_sample: u64,
 }
@@ -2619,12 +2744,11 @@ enum SlotExit {
     },
     Lost {
         cutover_sample: u64,
+        kind: SourceLossReason,
         reason: String,
     },
     /// A silent drain ended capture: a deliberate stop, never a loss.
-    Drained {
-        cutover_sample: u64,
-    },
+    Drained { cutover_sample: u64 },
 }
 
 /// A mixed source beside the microphone. It has its own timeline, clock,
@@ -2701,6 +2825,20 @@ impl SourceSlot {
 
     /// [`Self::ingest`] with every drained buffer arriving at `now`.
     fn ingest_at(&mut self, epoch: Instant, now: Instant) -> Option<String> {
+        self.ingest_loss_at(epoch, now).map(|(_, reason)| reason)
+    }
+
+    /// [`Self::ingest`], keeping whether capture stopped or the timeline
+    /// rejected buffers that did arrive.
+    fn ingest_loss(&mut self, epoch: Instant) -> Option<(SourceLossReason, String)> {
+        self.ingest_loss_at(epoch, Instant::now())
+    }
+
+    fn ingest_loss_at(
+        &mut self,
+        epoch: Instant,
+        now: Instant,
+    ) -> Option<(SourceLossReason, String)> {
         let mut disconnected = false;
         loop {
             match self.receiver.try_recv() {
@@ -2726,15 +2864,25 @@ impl SourceSlot {
             .as_ref()
             .and_then(|failure| failure.lock().unwrap_or_else(|p| p.into_inner()).clone());
         failure
+            .map(|reason| (SourceLossReason::CaptureStopped, reason))
             .or_else(|| {
-                disconnected.then(|| format!("{} stopped delivering audio.", self.role.label()))
+                disconnected.then(|| {
+                    (
+                        SourceLossReason::CaptureStopped,
+                        format!("{} stopped delivering audio.", self.role.label()),
+                    )
+                })
             })
             .or_else(|| {
+                // Buffers kept arriving; the timeline refused every one.
                 self.unplayable_lost.then(|| {
-                    format!(
-                        "{} timestamps drifted out of range; no buffer could be placed for {}s.",
-                        self.role.label(),
-                        SYSTEM_UNPLAYABLE_LOSS_AFTER.as_secs()
+                    (
+                        SourceLossReason::TimelineRejected,
+                        format!(
+                            "{} timestamps drifted out of range; no buffer could be placed for {}s.",
+                            self.role.label(),
+                            SYSTEM_UNPLAYABLE_LOSS_AFTER.as_secs()
+                        ),
                     )
                 })
             })
@@ -2902,11 +3050,13 @@ fn retire_system_slot(
         shared.system.cutover_sample = None;
         if let Some(SlotExit::Lost {
             cutover_sample,
+            kind,
             reason,
         }) = &exit
         {
             shared.system.losses.push_back(SystemAudioLoss {
                 device_name,
+                kind: *kind,
                 reason: reason.clone(),
                 at_sample: *cutover_sample,
             });
@@ -3198,6 +3348,7 @@ fn run_bus_owned(
     let mut pending: Option<PendingHandoff> = None;
     let mut observe: Option<OutputObservation> = None;
     let mut last_source_frame = Instant::now();
+    let mut last_source_arrival = last_source_frame;
     let mut clock = None;
     let mut accounted = AudioBusCounters::default();
     let mut diagnostics = BusDiagnostics::default();
@@ -3269,6 +3420,7 @@ fn run_bus_owned(
             previous_producer_drops = drops;
         }
         let mut source_lost = false;
+        let mut loss_reason = None;
         if let Some(receiver) = receiver.as_ref() {
             source_lost = ingest_pending(
                 receiver,
@@ -3279,8 +3431,15 @@ fn run_bus_owned(
                 timing.microphone_delay_frames,
                 &stats,
                 &mut last_source_frame,
+                &mut last_source_arrival,
             );
-            source_lost |= last_source_frame.elapsed() >= source_stall_timeout;
+            loss_reason = microphone_loss_reason(
+                source_lost,
+                last_source_arrival.elapsed(),
+                last_source_frame.elapsed(),
+                source_stall_timeout,
+            );
+            source_lost = loss_reason.is_some();
         }
         if source_lost {
             receiver = None;
@@ -3302,6 +3461,7 @@ fn run_bus_owned(
                 // Admission backpressure bounds losses without dropping an
                 // unreported generation's event during rapid replacement.
                 shared.losses.push_back(SourceLoss {
+                    reason: loss_reason.expect("lost microphone has a reason"),
                     generation,
                     device_name,
                     after_ms,
@@ -3312,15 +3472,16 @@ fn run_bus_owned(
             slot.account_producer_drops();
             // No stall rule here (decision 11): only the platform's failure
             // signal or the end of the stream retires a system source.
-            if let Some(reason) = slot.ingest(epoch)
+            if let Some((kind, reason)) = slot.ingest_loss(epoch)
                 && slot.exit.is_none()
             {
                 let cutover_sample = timeline.cursor();
                 tracing::warn!(
-                    "System audio source lost at sample {cutover_sample}; the session continues on the microphone: {reason}"
+                    "System audio source lost at sample {cutover_sample} ({kind:?}); the session continues on the microphone: {reason}"
                 );
                 slot.begin_exit(SlotExit::Lost {
                     cutover_sample,
+                    kind,
                     reason,
                 });
             }
@@ -3455,6 +3616,7 @@ fn run_bus_owned(
                             .map_or(0, |stats| stats.dropped_frames());
                         clock = handoff.clock.take();
                         last_source_frame = Instant::now();
+                        last_source_arrival = last_source_frame;
                         stats = Arc::new(AudioCaptureStats::default());
                         stats.reset_recording_window();
                         if producer.is_none() {
@@ -3591,6 +3753,7 @@ fn run_bus_owned(
                     timing.microphone_delay_frames,
                     &stats,
                     &mut last_source_frame,
+                    &mut last_source_arrival,
                 );
             }
             if let Some(slot) = system.as_mut() {
@@ -3969,6 +4132,72 @@ fn write_rendered_chunk(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arriving_microphone_frames_rejected_by_timeline_are_not_callback_loss() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(3);
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(AudioFrame {
+                timestamp_micros: 1,
+                captured_at: now,
+                sample_rate: 48000,
+                channels: 2,
+                samples: vec![0.25; 960],
+            })
+            .unwrap();
+        let mut timeline = AudioTimeline::new();
+        let mut clock = None;
+        let stats = AudioCaptureStats::default();
+        let mut placed = old;
+        let mut arrived = old;
+        assert!(!ingest_pending(
+            &receiver,
+            &mut timeline,
+            &mut clock,
+            0,
+            now - Duration::from_secs(9),
+            0,
+            &stats,
+            &mut placed,
+            &mut arrived
+        ));
+        assert_eq!(timeline.losses().dropped_ahead_of_cap, 480);
+        assert_eq!(placed, old);
+        assert!(arrived >= now);
+        assert_eq!(
+            microphone_loss_reason(
+                false,
+                Duration::ZERO,
+                Duration::from_secs(3),
+                Duration::from_secs(2)
+            ),
+            Some(SourceLossReason::TimelineRejected)
+        );
+        assert_eq!(
+            microphone_loss_reason(true, Duration::ZERO, Duration::ZERO, Duration::from_secs(2)),
+            Some(SourceLossReason::CaptureStopped)
+        );
+        assert_eq!(
+            microphone_loss_reason(
+                false,
+                Duration::from_secs(3),
+                Duration::from_secs(3),
+                Duration::from_secs(2)
+            ),
+            Some(SourceLossReason::CaptureStopped)
+        );
+        assert_eq!(
+            microphone_loss_reason(
+                false,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::from_secs(2)
+            ),
+            None
+        );
+    }
+
     #[test]
     fn incident_worker_failure_requires_debug_build_and_both_opt_ins() {
         assert!(!super::incident_worker_open_failure_enabled(
@@ -7213,10 +7442,19 @@ mod mix_tests {
         let reason = feed(&mut slot, restart + Duration::from_secs(2), far)
             .expect("2 s of unplaceable buffers is a loss");
         assert!(reason.contains("drifted out of range"), "{reason}");
-        assert!(
-            slot.ingest_at(epoch, restart + Duration::from_secs(3))
-                .is_some(),
+        // The buffers kept arriving: a placement loss, never a stopped capture.
+        assert_eq!(
+            slot.ingest_loss_at(epoch, restart + Duration::from_secs(3))
+                .map(|(kind, _)| kind),
+            Some(SourceLossReason::TimelineRejected),
             "sticky"
+        );
+        drop(sender);
+        assert_eq!(
+            slot.ingest_loss_at(epoch, restart + Duration::from_secs(4))
+                .map(|(kind, _)| kind),
+            Some(SourceLossReason::CaptureStopped),
+            "an ended stream outranks placement"
         );
     }
 
@@ -7525,7 +7763,9 @@ mod mix_tests {
         assert!(steps <= 0.8 / 240.0 + 1.0e-6);
     }
 
-    fn test_slot(delay_frames: u64) -> (SourceSlot, mpsc::Sender<AudioFrame>, ProducerFailure) {
+    pub(super) fn test_slot(
+        delay_frames: u64,
+    ) -> (SourceSlot, mpsc::Sender<AudioFrame>, ProducerFailure) {
         let (sender, receiver) = mpsc::channel();
         let (completion_guard, completion) = completion_channel();
         drop(completion_guard);

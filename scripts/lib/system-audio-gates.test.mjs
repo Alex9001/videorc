@@ -369,3 +369,50 @@ describe('o_sys end to end', () => {
     assert.equal(mixed.spreadMs, 38)
   })
 })
+
+describe('static-screen startup evidence', () => {
+  it('requires held source pixels, a fresh presentation epoch, and zero ahead-cap loss', async () => {
+    const { evaluateStaticScreenEpoch } = await import('./system-audio-gates.mjs')
+    const evidence = {
+      sourceAgeMs: 10000,
+      presentationAgeMs: 20,
+      // Measured on a 10 s-static display: 33-37 ms.
+      epochAgeMs: 37,
+      aheadCapDrops: 0
+    }
+    assert.equal(evaluateStaticScreenEpoch(evidence).pass, true)
+    for (const patch of [
+      { sourceAgeMs: 20 },
+      { presentationAgeMs: 9000 },
+      // The 0.9.119 incident: epoch taken from 8.8 s-old screen pixels.
+      { epochAgeMs: 8849 },
+      // Audio would sit about 100 ms late once the screen moves.
+      { epochAgeMs: 120 },
+      { epochAgeMs: undefined },
+      { aheadCapDrops: 480 },
+      { presentationAgeMs: undefined }
+    ]) {
+      assert.equal(evaluateStaticScreenEpoch({ ...evidence, ...patch }).pass, false)
+    }
+  })
+  it('reads the startup epoch record with or without ANSI field colours', async () => {
+    const { parseRecordingEpochLine } = await import('./system-audio-gates.mjs')
+    const plain =
+      'INFO videorc_backend::encoder_bridge: Recording audio epoch established from first video presentation source_age_ms=10231 presentation_age_ms=4 epoch_age_ms=104'
+    const expected = { sourceAgeMs: 10231, presentationAgeMs: 4, epochAgeMs: 104 }
+    assert.deepEqual(parseRecordingEpochLine(plain), expected)
+    const colored = plain.replace(
+      /(\w+_ms)=(\d+)/g,
+      (_, name, value) => `\u001b[3m${name}\u001b[0m\u001b[2m=\u001b[0m${value}`
+    )
+    assert.deepEqual(parseRecordingEpochLine(colored), expected)
+    assert.equal(parseRecordingEpochLine('System audio joined the session mix at sample 1'), null)
+  })
+  it('cannot accept silence as a mixed-input test tone', async () => {
+    const { evaluateMixedToneCapturedCase } = await import('./system-audio-gates.mjs')
+    assert.equal(
+      evaluateMixedToneCapturedCase({ envelope: [], expectedPlay: { start: 3, end: 6 } }).pass,
+      false
+    )
+  })
+})

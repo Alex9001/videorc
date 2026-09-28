@@ -98,7 +98,8 @@ export async function launchScreenMotionStimulus(options = {}) {
       verifyVisible,
       outputDirectory: options.outputDirectory,
       ffmpegPath: options.ffmpegPath,
-      teardownOptions: options.teardownOptions
+      teardownOptions: options.teardownOptions,
+      freeze: options.freeze === true
     })
   }
 
@@ -230,11 +231,12 @@ async function launchNativeScreenMotionStimulus({
   verifyVisible,
   outputDirectory,
   ffmpegPath,
-  teardownOptions
+  teardownOptions,
+  freeze = false
 }) {
   const dir = mkdtempSync(join(tmpdir(), 'videorc-screen-motion-'))
   const swiftPath = join(dir, 'stimulus.swift')
-  writeFileSync(swiftPath, nativeStimulusSwift(), 'utf8')
+  writeFileSync(swiftPath, nativeStimulusSwift(freeze), 'utf8')
 
   const child = spawn('swift', [swiftPath, String(x), String(y), String(width), String(height)], {
     detached: true,
@@ -866,7 +868,7 @@ end tell`
   }
 }
 
-function nativeStimulusSwift() {
+function nativeStimulusSwift(freeze = false) {
   return `import Cocoa
 
 let title = "Videorc Motion Stimulus"
@@ -878,6 +880,7 @@ final class StimulusView: NSView {
   override var isFlipped: Bool { true }
 
   func start() {
+    ${freeze ? 'if true { needsDisplay = true; return }' : ''}
     timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
       guard let self = self else { return }
       self.frameNumber += 1

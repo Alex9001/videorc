@@ -6085,6 +6085,12 @@ impl Database {
             "permission_pane",
             "permission_pane TEXT",
         )?;
+        ensure_column(
+            &conn,
+            "repair_jobs",
+            "pipeline_reported_audio_loss",
+            "pipeline_reported_audio_loss INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -6097,8 +6103,8 @@ impl Database {
         };
         conn.execute(
             "INSERT OR REPLACE INTO repair_jobs
-                (id, file_path, status, intended_fps, expect_audio, outcome_json, reason, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (id, file_path, status, intended_fps, expect_audio, outcome_json, reason, created_at, updated_at, pipeline_reported_audio_loss)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 job.id,
                 job.file_path,
@@ -6109,6 +6115,7 @@ impl Database {
                 job.reason,
                 job.created_at,
                 job.updated_at,
+                job.pipeline_reported_audio_loss as i64,
             ],
         )?;
         Ok(())
@@ -6555,7 +6562,7 @@ fn query_one_noise_cleanup_job<P: rusqlite::Params>(
 
 fn query_repair_jobs(conn: &Connection, filter: &str) -> Result<Vec<RepairJob>> {
     let sql = format!(
-        "SELECT id, file_path, status, intended_fps, expect_audio, outcome_json, reason, created_at, updated_at
+        "SELECT id, file_path, status, intended_fps, expect_audio, outcome_json, reason, created_at, updated_at, pipeline_reported_audio_loss
          FROM repair_jobs {filter} ORDER BY created_at DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -6569,6 +6576,7 @@ fn query_repair_jobs(conn: &Connection, filter: &str) -> Result<Vec<RepairJob>> 
             status: RepairJobStatus::from_db(&status),
             intended_fps: row.get(3)?,
             expect_audio: expect_audio != 0,
+            pipeline_reported_audio_loss: row.get::<_, i64>(9)? != 0,
             outcome: outcome_json
                 .as_deref()
                 .and_then(|value| serde_json::from_str(value).ok()),
@@ -6869,6 +6877,25 @@ fn title_case_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::session_scene_label;
+
+    #[test]
+    fn audio_loss_expectation_survives_repair_job_database_resume() {
+        let database = test_database();
+        let expected = crate::repair::QualityExpectations {
+            pipeline_reported_audio_loss: true,
+            ..Default::default()
+        };
+        let job = RepairJob::pending(
+            "audio-loss".into(),
+            "/recording.mp4".into(),
+            &expected,
+            "t0".into(),
+        );
+        database.upsert_repair_job(&job).unwrap();
+        let restored = database.incomplete_repair_jobs().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(restored[0].expectations().pipeline_reported_audio_loss);
+    }
 
     #[test]
     fn unknown_container_degrades_to_one_row_not_a_dead_list() {
@@ -10324,6 +10351,7 @@ mod tests {
             intended_fps: Some(30.0),
             expect_audio: true,
             pipeline_reported_freezes: false,
+            pipeline_reported_audio_loss: false,
         };
         let mut older_output_job = RepairJob::pending(
             "job-output-ready".to_string(),
@@ -11570,6 +11598,7 @@ mod tests {
             intended_fps: Some(30.0),
             expect_audio: true,
             pipeline_reported_freezes: false,
+            pipeline_reported_audio_loss: false,
         };
 
         let pending = RepairJob::pending(

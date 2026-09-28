@@ -7,9 +7,11 @@ const toastSpies = vi.hoisted(() => ({
 }))
 vi.mock('sonner', () => ({ toast: { ...toastSpies, dismiss: vi.fn() } }))
 
-import type { SessionSummary } from '@/lib/backend'
+import type { HealthEvent, SessionSummary } from '@/lib/backend'
+import { sessionRuntimeNoticeTitle } from '@/lib/session-runtime-notice'
 import {
   completeSessionRuntimeRecovery,
+  microphoneLossPresentation,
   sessionRuntimeContinuationIsCurrent,
   sessionRuntimeRecoveryPlan,
   showOAuthCallbackResult,
@@ -135,4 +137,96 @@ describe('session runtime recovery', () => {
       description: 'Authorization was declined.'
     })
   })
+})
+
+describe('audio-loss provenance', () => {
+  const event = (code: string, message: string): HealthEvent => ({
+    id: code,
+    code,
+    message,
+    sessionId: 'take',
+    level: 'warn',
+    createdAt: '2026-09-28T09:34:41Z'
+  })
+  it('keeps system and microphone timeline failures in one persistent notice', () => {
+    const base = {
+      recording: { state: 'recording' as const, sessionId: 'take' },
+      lastActivity: 'recording' as const,
+      currentDedupeKey: null
+    }
+    const system = microphoneLossPresentation({
+      ...base,
+      event: event('system-audio-lost', 'System samples were lost.')
+    })!
+    const mixed = microphoneLossPresentation({
+      ...base,
+      currentDedupeKey: system.dedupeKey,
+      currentNotice: system.notice,
+      event: event('microphone-timeline-lost', 'Microphone samples could not be placed.')
+    })!
+    expect(mixed.notice.audioIssues).toHaveLength(2)
+    expect(mixed.notice.message).toContain('System samples')
+    expect(mixed.notice.message).toContain('Microphone samples')
+    expect(sessionRuntimeNoticeTitle(mixed.notice)).toBe('Microphone and system audio lost')
+    expect(
+      microphoneLossPresentation({
+        ...base,
+        currentDedupeKey: mixed.dedupeKey,
+        currentNotice: mixed.notice,
+        event: event('system-audio-lost', 'duplicate')
+      })
+    ).toBeNull()
+  })
+  it('does not describe arriving but rejected microphone samples as a device stopping', () => {
+    const result = microphoneLossPresentation({
+      event: event('microphone-timeline-lost', 'Could not place samples.'),
+      recording: { state: 'idle' },
+      lastSessionId: 'take',
+      lastActivity: 'recording',
+      currentDedupeKey: null
+    })!
+    expect(sessionRuntimeNoticeTitle(result.notice)).toBe(
+      'Microphone audio could not be recorded: saved session has missing audio'
+    )
+  })
+})
+
+it('recovers both audio sources after reconnect without dropping either explanation', () => {
+  const event = (code: string, message: string): HealthEvent => ({
+    id: code,
+    code,
+    message,
+    sessionId: 'take',
+    level: 'warn',
+    createdAt: '2026-09-28T09:34:41Z'
+  })
+  const recovery = completeSessionRuntimeRecovery({
+    plan: { healthSessionId: 'take' },
+    recording: { state: 'recording', sessionId: 'take' },
+    priorSessionState: 'recording',
+    events: [
+      event('system-audio-lost', 'System samples lost.'),
+      event('microphone-timeline-lost', 'Microphone placement failed.')
+    ]
+  })
+  expect(recovery?.kind).toBe('microphone-input-lost')
+  if (recovery?.kind !== 'microphone-input-lost') throw new Error('Missing recovered audio notice')
+  const presentation = microphoneLossPresentation({
+    event: recovery.event,
+    recording: { state: 'recording', sessionId: 'take' },
+    lastActivity: 'recording',
+    currentDedupeKey: null
+  })!
+  expect(sessionRuntimeNoticeTitle(presentation.notice)).toBe('Microphone and system audio lost')
+  expect(presentation.notice.message).toContain('System samples lost.')
+  expect(presentation.notice.message).toContain('Microphone placement failed.')
+  expect(
+    microphoneLossPresentation({
+      event: event('system-audio-lost', 'Duplicate'),
+      recording: { state: 'recording', sessionId: 'take' },
+      lastActivity: 'recording',
+      currentDedupeKey: presentation.dedupeKey,
+      currentNotice: presentation.notice
+    })
+  ).toBeNull()
 })

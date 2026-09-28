@@ -131,13 +131,15 @@ export function microphoneLossPresentation({
   recording,
   lastSessionId,
   lastActivity,
-  currentDedupeKey
+  currentDedupeKey,
+  currentNotice
 }: {
   event: HealthEvent
   recording: RecordingStatus
   lastSessionId?: string
   lastActivity: SessionRuntimeActivity
   currentDedupeKey: string | null
+  currentNotice?: SessionRuntimeNotice | null
 }): MicrophoneLossPresentation | null {
   const active = ['recording', 'streaming'].includes(recording.state)
   const correlatedActive = active && (!event.sessionId || event.sessionId === recording.sessionId)
@@ -148,7 +150,21 @@ export function microphoneLossPresentation({
   if (!correlatedActive && !correlatedTerminal) return null
 
   const dedupeKey = event.sessionId ?? lastSessionId ?? 'active-session'
-  if (currentDedupeKey === dedupeKey) return null
+  const previousIssues =
+    currentNotice?.kind === 'microphone-input-lost' && currentNotice.sessionId === event.sessionId
+      ? (currentNotice.audioIssues ?? [
+          { code: 'microphone-input-lost', message: currentNotice.message }
+        ])
+      : []
+  if (
+    previousIssues.some(
+      (issue) => issue.code === event.code || issue.code === 'audio-inputs-lost'
+    ) ||
+    (currentDedupeKey === dedupeKey && !currentNotice)
+  )
+    return null
+  const audioIssues = [...previousIssues, { code: event.code, message: event.message }]
+
   const activity: SessionRuntimeActivity =
     recording.state === 'streaming'
       ? 'live-stream'
@@ -162,7 +178,8 @@ export function microphoneLossPresentation({
       kind: 'microphone-input-lost',
       activity,
       phase: active ? 'active' : recording.state === 'stopping' ? 'ending' : 'ended',
-      message: event.message,
+      message: audioIssues.map((issue) => issue.message).join(' '),
+      audioIssues,
       ...(event.sessionId ? { sessionId: event.sessionId } : {}),
       at: Date.now()
     }
@@ -170,6 +187,8 @@ export function microphoneLossPresentation({
 }
 
 export function showMicrophoneLoss({ notice }: MicrophoneLossPresentation): void {
+  // System-only failures already have a persistent mixer state; keep the existing no-toast policy.
+  if (notice.audioIssues?.every((issue) => issue.code === 'system-audio-lost')) return
   toast.warning(sessionRuntimeNoticeTitle(notice), {
     id: MICROPHONE_INPUT_LOST_TOAST_ID,
     description: notice.message,
@@ -448,11 +467,25 @@ export function completeSessionRuntimeRecovery({
     }
   }
 
-  const microphoneLoss = latestMatchingEvent(
-    events,
-    (event) => event.code === 'microphone-input-lost'
+  const microphoneLoss = latestMatchingEvent(events, (event) => isSessionAudioLossCode(event.code))
+  if (!microphoneLoss) return null
+  const losses = events.filter(
+    (event) => event.sessionId === microphoneLoss.sessionId && isSessionAudioLossCode(event.code)
   )
-  return microphoneLoss ? { kind: 'microphone-input-lost', event: microphoneLoss } : null
+  const bySource = new Map(
+    losses.map((event) => [event.code.startsWith('microphone-') ? 'microphone' : 'system', event])
+  )
+  return {
+    kind: 'microphone-input-lost',
+    event:
+      bySource.size > 1
+        ? {
+            ...microphoneLoss,
+            code: 'audio-inputs-lost',
+            message: [...bySource.values()].map((event) => event.message).join(' ')
+          }
+        : microphoneLoss
+  }
 }
 
 export async function recoverSessionRuntime({
@@ -478,4 +511,8 @@ export async function recoverSessionRuntime({
     ? await loadHealthEvents(plan.healthSessionId).catch(() => [])
     : []
   return completeSessionRuntimeRecovery({ plan, recording, events, priorSessionState })
+}
+
+export function isSessionAudioLossCode(code: string): boolean {
+  return ['microphone-input-lost', 'microphone-timeline-lost', 'system-audio-lost'].includes(code)
 }
