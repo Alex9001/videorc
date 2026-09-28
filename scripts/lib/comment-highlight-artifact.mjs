@@ -40,7 +40,11 @@ export const DEFAULT_COMMENT_HIGHLIGHT_ANCHOR = 'bottom-left'
  * adds transparent shadow padding before the glass plate, so the scan starts
  * 8% in from the anchored edges and runs to 62% of each axis (a card is at
  * most 60% of the canvas wide). The far side of the frame is deliberately NOT
- * scanned: a card that ignored the anchor must fail this gate. */
+ * scanned: a card that ignored the anchor must fail this gate.
+ *
+ * On a portrait canvas (the vertical simulcast leg) the card is only ~10% of
+ * the height and sits ~5% from the edge, so the vertical span hugs the
+ * anchored edge (3%..22%) instead of diluting the card in half the frame. */
 export function commentHighlightCardRegion(
   anchor = DEFAULT_COMMENT_HIGHLIGHT_ANCHOR,
   { width, height }
@@ -48,14 +52,16 @@ export function commentHighlightCardRegion(
   if (!COMMENT_HIGHLIGHT_ANCHORS.includes(anchor)) {
     throw new Error(`Unknown comment highlight anchor: ${anchor}`)
   }
-  const span = (size, fromStart) => {
-    const near = Math.round(size * 0.08)
-    const far = Math.round(size * 0.62)
+  const portrait = height > width
+  const span = (size, fromStart, vertical = false) => {
+    const [nearFraction, farFraction] = portrait && vertical ? [0.03, 0.22] : [0.08, 0.62]
+    const near = Math.round(size * nearFraction)
+    const far = Math.round(size * farFraction)
     const start = fromStart ? near : size - far
     const end = fromStart ? far : size - near
     return [Math.max(0, Math.min(size - 1, start)), Math.max(1, Math.min(size, end))]
   }
-  const [yStart, yEnd] = span(height, anchor.startsWith('top-'))
+  const [yStart, yEnd] = span(height, anchor.startsWith('top-'), true)
   const [xStart, xEnd] = span(width, anchor.endsWith('-left'))
   return { xStart, xEnd, yStart, yEnd, top: anchor.startsWith('top-') }
 }

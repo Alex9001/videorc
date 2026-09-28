@@ -210,6 +210,26 @@ describe('comment highlight artifact gate', () => {
     assert.throws(() => commentHighlightCardRegion('top', size), /Unknown comment highlight anchor/)
   })
 
+  it('hugs the anchored edge vertically on a portrait (vertical leg) canvas', () => {
+    const portrait = { width: 100, height: 200 }
+    // Horizontal span is unchanged; the vertical span is 3%..22% of the height
+    // from the anchored edge, where a ~10%-tall portrait card actually sits.
+    assert.deepEqual(commentHighlightCardRegion('bottom-left', portrait), {
+      xStart: 8,
+      xEnd: 62,
+      yStart: 156,
+      yEnd: 194,
+      top: false
+    })
+    assert.deepEqual(commentHighlightCardRegion('top-right', portrait), {
+      xStart: 38,
+      xEnd: 92,
+      yStart: 6,
+      yEnd: 44,
+      top: true
+    })
+  })
+
   it('accepts explicit legacy unavailability when stream frames were decoded', () => {
     const rgb = Buffer.concat([markerFrame(), markerFrame()])
     const metrics = measureCommentHighlightArtifactRgb(rgb, { width, height, anchor: 'top-left' })

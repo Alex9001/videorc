@@ -339,8 +339,10 @@ async function runScenario(ws, smoke, scenario, index) {
         highlightDisposition: highlight.disposition,
         requireCaption: false,
         anchor: scenario.anchor,
-        sampleWidth: 360,
-        sampleHeight: 640
+        // Native portrait size: the card's ~27 px text blurs out of the text
+        // classifier when downscaled.
+        sampleWidth: scenario.verticalLeg.width,
+        sampleHeight: scenario.verticalLeg.height
       })
       const verticalArtifactPath = join(
         scenarioDirectory,
