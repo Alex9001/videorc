@@ -439,11 +439,6 @@ import {
   deviceListWithoutProtectedOverlayWindows,
   protectedOverlayWindowIdsFromOverlayWindows
 } from '@/lib/protected-overlay-windows'
-import {
-  configureWindowsLiveAudioSmokeCapture,
-  WINDOWS_LIVE_AUDIO_SMOKE_BURST,
-  windowsLiveAudioSmokeState
-} from '@/lib/windows-live-audio-smoke-harness'
 
 export type { GoLivePartialSetup, GoLiveSetupFailure } from '@/lib/go-live-flow'
 
@@ -12909,13 +12904,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       return
     }
 
-    const snapshot = (): WindowsLiveAudioSmokeState =>
-      windowsLiveAudioSmokeState({
-        recording: recordingRef.current,
-        lastError: lastErrorRef.current,
-        captureConfig: captureConfigRef.current,
-        telemetry: windowsLiveAudioSmokeTelemetryRef.current
-      })
     const applyAudio = (microphoneGainDb: number, microphoneMuted: boolean): void => {
       const next = {
         ...captureConfigRef.current,
@@ -12931,9 +12919,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     const harness = async (
       request: WindowsLiveAudioSmokeRequest
     ): Promise<WindowsLiveAudioSmokeState> => {
+      // Smoke-only code: loaded on first use so it never ships in the eager bundle.
+      const smoke = await import('@/lib/windows-live-audio-smoke-harness')
+      const snapshot = (): WindowsLiveAudioSmokeState =>
+        smoke.windowsLiveAudioSmokeState({
+          recording: recordingRef.current,
+          lastError: lastErrorRef.current,
+          captureConfig: captureConfigRef.current,
+          telemetry: windowsLiveAudioSmokeTelemetryRef.current
+        })
       switch (request.action) {
         case 'configure': {
-          const next = configureWindowsLiveAudioSmokeCapture(
+          const next = smoke.configureWindowsLiveAudioSmokeCapture(
             captureConfigRef.current,
             deviceList.devices,
             request
@@ -12963,7 +12960,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           applyAudio(request.microphoneGainDb, request.microphoneMuted)
           return snapshot()
         case 'rapid-burst':
-          for (const update of WINDOWS_LIVE_AUDIO_SMOKE_BURST) {
+          for (const update of smoke.WINDOWS_LIVE_AUDIO_SMOKE_BURST) {
             applyAudio(update.microphoneGainDb, update.microphoneMuted)
             await new Promise<void>((resolveDelay) => window.setTimeout(resolveDelay, 20))
           }
