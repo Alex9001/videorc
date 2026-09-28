@@ -39,7 +39,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1,
+    CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice,
+    IDXGIFactory1,
 };
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMeanBitRate,
@@ -286,6 +287,8 @@ struct D3D11CpuUploadInput {
     width: u32,
     height: u32,
     surfaces: Vec<D3D11CpuUploadSlot>,
+    actual_video_support: bool,
+    actual_multithread_protected: bool,
 }
 
 struct D3D11SurfaceInput {
@@ -450,7 +453,7 @@ impl MediaFoundationH264Encoder {
     /// Creates and configures the highest-merit hardware H.264 MFT. Call this
     /// only from the dedicated encoder thread that will own the session.
     pub fn new(config: MediaFoundationEncoderConfig) -> Result<Self> {
-        Self::new_with_optional_d3d11_texture(config, None)
+        Self::new_with_optional_d3d11_texture(config, None, None)
     }
 
     /// Creates a hardware H.264 MFT configured to accept NV12 surfaces owned by
@@ -459,12 +462,13 @@ impl MediaFoundationH264Encoder {
         config: MediaFoundationEncoderConfig,
         source_texture: &RetainedD3D11Texture,
     ) -> Result<Self> {
-        Self::new_with_optional_d3d11_texture(config, Some(source_texture))
+        Self::new_with_optional_d3d11_texture(config, Some(source_texture), None)
     }
 
     fn new_with_optional_d3d11_texture(
         config: MediaFoundationEncoderConfig,
         source_texture: Option<&RetainedD3D11Texture>,
+        diagnostic: Option<&crate::windows_mf_probe::ProbeAttempt>,
     ) -> Result<Self> {
         config.validate()?;
         let profile = config.profile_label();
@@ -491,7 +495,8 @@ impl MediaFoundationH264Encoder {
             }
         }
 
-        let result = Self::create_after_startup(config.clone(), source_texture, true, true);
+        let result =
+            Self::create_after_startup(config.clone(), source_texture, true, true, diagnostic);
         if result.is_err() {
             unsafe {
                 let _ = MFShutdown();
@@ -506,18 +511,39 @@ impl MediaFoundationH264Encoder {
         source_texture: Option<&RetainedD3D11Texture>,
         com_started: bool,
         mf_started: bool,
+        diagnostic: Option<&crate::windows_mf_probe::ProbeAttempt>,
     ) -> Result<Self> {
         let profile = config.profile_label();
         let activations = enumerate_hardware_h264_activations(&profile)?;
         let mut failures = Vec::new();
-        for activation in activations {
+        for (activation_index, activation) in activations.into_iter().enumerate() {
+            if diagnostic.is_some_and(|attempt| {
+                attempt
+                    .encoder
+                    .as_ref()
+                    .is_none_or(|encoder| encoder.index != activation_index)
+            }) {
+                continue;
+            }
             let identity = activation_name(&activation)
                 .unwrap_or_else(|_| "<unnamed hardware H.264 MFT>".to_string());
+            if let Some(expected) = diagnostic.and_then(|attempt| attempt.encoder.as_ref()) {
+                ensure!(
+                    identity == expected.name,
+                    "Diagnostic encoder inventory changed before activation"
+                );
+            }
             let adapter_luid = activation_adapter_luid(&activation).map_err(|error| {
                 anyhow!(
                     "Media Foundation probe stage=activation-adapter encoder={identity:?} input=<unset> profile={profile}: {error}"
                 )
             })?;
+            if let Some(expected) = diagnostic.and_then(|attempt| attempt.encoder.as_ref()) {
+                ensure!(
+                    adapter_luid.map(|luid| format!("{luid:016x}")) == expected.adapter_luid,
+                    "Diagnostic encoder adapter changed before activation"
+                );
+            }
             match unsafe { activation.ActivateObject::<IMFTransform>() } {
                 Ok(transform) => {
                     match Self::configure_transform(
@@ -529,6 +555,7 @@ impl MediaFoundationH264Encoder {
                         source_texture,
                         com_started,
                         mf_started,
+                        diagnostic,
                     ) {
                         Ok(encoder) => return Ok(encoder),
                         Err(error) => failures.push(error.to_string()),
@@ -555,6 +582,7 @@ impl MediaFoundationH264Encoder {
         source_texture: Option<&RetainedD3D11Texture>,
         com_started: bool,
         mf_started: bool,
+        diagnostic: Option<&crate::windows_mf_probe::ProbeAttempt>,
     ) -> Result<Self> {
         let profile = config.profile_label();
         let attributes = unsafe {
@@ -603,7 +631,7 @@ impl MediaFoundationH264Encoder {
             && config.input_topology == MediaFoundationInputTopology::Auto
         {
             Some(
-                D3D11CpuUploadInput::new(&config, adapter_luid).map_err(|error| {
+                D3D11CpuUploadInput::new(&config, adapter_luid, diagnostic.map(|attempt| &attempt.case)).map_err(|error| {
                 anyhow!(
                     "Media Foundation probe stage=d3d11-cpu-upload-setup encoder={identity:?} input=NV12-D3D11 profile={profile}: {error}"
                 )
@@ -612,6 +640,12 @@ impl MediaFoundationH264Encoder {
         } else {
             None
         };
+        if let Some(attempt) = diagnostic {
+            ensure!(
+                d3d11_cpu_upload.is_some() == attempt.case.d3d11_upload,
+                "Diagnostic topology unavailable; implicit topology fallback refused"
+            );
+        }
         let device_manager = d3d11_input
             .as_ref()
             .map(|input| &input.device_manager)
@@ -658,7 +692,9 @@ impl MediaFoundationH264Encoder {
         let mut selected = None;
         let mut input_failures = Vec::new();
         let input_candidates: &[(MediaFoundationInputSubtype, windows::core::GUID)] =
-            if d3d11_input.is_some() {
+            if diagnostic.is_some_and(|attempt| attempt.case.subtype == "I420") {
+                &[(MediaFoundationInputSubtype::I420, MFVideoFormat_I420)]
+            } else if diagnostic.is_some() || d3d11_input.is_some() {
                 &[(MediaFoundationInputSubtype::Nv12, MFVideoFormat_NV12)]
             } else {
                 &[
@@ -1375,7 +1411,11 @@ const CPU_UPLOAD_DEVICE_FLAGS: D3D11_CREATE_DEVICE_FLAG = D3D11_CREATE_DEVICE_FL
 );
 
 impl D3D11CpuUploadInput {
-    fn new(config: &MediaFoundationEncoderConfig, adapter_luid: Option<u64>) -> Result<Self> {
+    fn new(
+        config: &MediaFoundationEncoderConfig,
+        adapter_luid: Option<u64>,
+        diagnostic: Option<&crate::windows_mf_probe::ProbeCase>,
+    ) -> Result<Self> {
         let adapter = adapter_luid.map(dxgi_adapter_for_luid).transpose()?;
         let adapter: Option<IDXGIAdapter> = adapter
             .as_ref()
@@ -1394,7 +1434,16 @@ impl D3D11CpuUploadInput {
                 adapter.as_ref(),
                 driver_type,
                 HMODULE::default(),
-                CPU_UPLOAD_DEVICE_FLAGS,
+                diagnostic.map_or(CPU_UPLOAD_DEVICE_FLAGS, |case| {
+                    D3D11_CREATE_DEVICE_FLAG(
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT.0
+                            | if case.video_support {
+                                D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0
+                            } else {
+                                0
+                            },
+                    )
+                }),
                 Some(&feature_levels),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
@@ -1412,7 +1461,8 @@ impl D3D11CpuUploadInput {
             .cast()
             .context("the CPU upload D3D11 context has no ID3D11Multithread")?;
         unsafe {
-            let _ = multithread.SetMultithreadProtected(true);
+            let _ = multithread
+                .SetMultithreadProtected(diagnostic.is_none_or(|case| case.multithread_protected));
         }
 
         let mut reset_token = 0_u32;
@@ -1469,6 +1519,11 @@ impl D3D11CpuUploadInput {
             width: config.width,
             height: config.height,
             surfaces,
+            actual_video_support: unsafe { device.GetCreationFlags() }
+                & D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0
+                != 0,
+            actual_multithread_protected: unsafe { multithread.GetMultithreadProtected() }
+                .as_bool(),
         })
     }
 
@@ -3127,6 +3182,158 @@ impl Drop for MediaFoundationD3d11H264Encoder {
     }
 }
 
+/// Diagnostic inventory only; no activation or cache/selection side effects.
+pub fn diagnostic_inventory() -> Result<Vec<crate::windows_mf_probe::EncoderIdentity>> {
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+    }
+    if let Err(error) = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) } {
+        unsafe {
+            CoUninitialize();
+        }
+        return Err(error.into());
+    }
+    let result = (|| {
+        let activations =
+            enumerate_hardware_h264_activations_allow_empty("diagnostic inventory", true)?;
+        ensure!(
+            activations.len() <= 8,
+            "MF diagnostic inventory exceeds eight encoder limit"
+        );
+        activations
+            .iter()
+            .enumerate()
+            .map(|(index, activation)| {
+                let luid = activation_adapter_luid(activation)?;
+                let adapter = luid.and_then(|luid| dxgi_adapter_for_luid(luid).ok());
+                let description = adapter
+                    .as_ref()
+                    .and_then(|adapter| unsafe { adapter.GetDesc1() }.ok())
+                    .map(|desc| {
+                        String::from_utf16_lossy(&desc.Description)
+                            .trim_end_matches('\0')
+                            .to_string()
+                    });
+                let driver_version = adapter
+                    .as_ref()
+                    .and_then(|adapter| {
+                        unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID) }.ok()
+                    })
+                    .map(|version| {
+                        format!(
+                            "{}.{}.{}.{}",
+                            (version >> 48) & 0xffff,
+                            (version >> 32) & 0xffff,
+                            (version >> 16) & 0xffff,
+                            version & 0xffff
+                        )
+                    });
+                Ok(crate::windows_mf_probe::EncoderIdentity {
+                    index,
+                    name: activation_name(activation)?,
+                    adapter_luid: luid.map(|luid| format!("{luid:016x}")),
+                    adapter_description: description,
+                    driver_version,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    })();
+    unsafe {
+        let _ = MFShutdown();
+        CoUninitialize();
+    }
+    result
+}
+
+/// Exact one-activation, one-subtype experiment. Shipping constructors pass no
+/// diagnostic override and keep their existing selection behavior.
+pub fn diagnostic_attempt(
+    mut attempt: crate::windows_mf_probe::ProbeAttempt,
+) -> crate::windows_mf_probe::ProbeAttempt {
+    let measured = (|| -> Result<()> {
+        let case = &attempt.case;
+        let config = MediaFoundationEncoderConfig {
+            width: case.width,
+            height: case.height,
+            fps: case.fps,
+            bitrate_kbps: case.bitrate_kbps,
+            low_latency: true,
+            input_topology: if case.d3d11_upload {
+                MediaFoundationInputTopology::Auto
+            } else {
+                MediaFoundationInputTopology::SystemMemory
+            },
+        };
+        let mut encoder = MediaFoundationH264Encoder::new_with_optional_d3d11_texture(
+            config.clone(),
+            None,
+            Some(&attempt),
+        )?;
+        attempt.actual_subtype = Some(encoder.input_subtype().label().into());
+        attempt.actual_d3d11_upload = Some(encoder.d3d11_cpu_upload.is_some());
+        attempt.actual_video_support = encoder
+            .d3d11_cpu_upload
+            .as_ref()
+            .map(|input| input.actual_video_support);
+        attempt.actual_multithread_protected = encoder
+            .d3d11_cpu_upload
+            .as_ref()
+            .map(|input| input.actual_multithread_protected);
+        ensure!(
+            attempt.actual_subtype.as_deref() == Some(case.subtype.as_str()),
+            "Diagnostic input subtype changed"
+        );
+        if case.d3d11_upload {
+            ensure!(
+                attempt.actual_video_support == Some(case.video_support)
+                    && attempt.actual_multithread_protected == Some(case.multithread_protected),
+                "Diagnostic device flags did not match requested flags"
+            );
+        }
+        let frame_len = config.i420_len()?;
+        let y_len = config.width as usize * config.height as usize;
+        let mut frames = Vec::new();
+        for index in 0..6 {
+            let mut frame = vec![128; frame_len];
+            frame[..y_len].fill(16 + index as u8);
+            frames.extend(encoder.encode_frame(&frame, index)?);
+        }
+        frames.extend(encoder.drain(DRAIN_TIMEOUT)?);
+        attempt.encoded_frames = frames.len() as u64;
+        attempt.idr = frames
+            .iter()
+            .any(|frame| annex_b_contains_nal_type(&frame.bytes, 5));
+        ensure!(
+            attempt.idr && !frames.is_empty(),
+            "stage=probe-output no IDR output"
+        );
+        Ok(())
+    })();
+    match measured {
+        Ok(()) => {
+            attempt.state = "encoded-idr".into();
+            attempt.stage = "complete".into();
+        }
+        Err(error) => {
+            let reason = format!("{error:#}");
+            attempt.state = "rejected".into();
+            attempt.stage = reason
+                .split("stage=")
+                .nth(1)
+                .and_then(|tail| tail.split_whitespace().next())
+                .unwrap_or("unknown")
+                .to_string();
+            attempt.hresult = reason
+                .split("HRESULT=")
+                .nth(1)
+                .and_then(|tail| tail.split_whitespace().next())
+                .map(str::to_owned);
+            attempt.reason = Some(reason.chars().take(2048).collect());
+        }
+    }
+    attempt
+}
+
 /// Probes the hardware H.264 MFT for `config`, walking the input topology
 /// ladder (plan 065, B2) and, inside each topology, the Intel bitrate ladder.
 /// The first combination that produces an IDR wins; its topology and bitrate
@@ -3279,6 +3486,13 @@ fn try_probe_once(config: MediaFoundationEncoderConfig) -> Result<MediaFoundatio
 }
 
 fn enumerate_hardware_h264_activations(profile: &str) -> Result<Vec<IMFActivate>> {
+    enumerate_hardware_h264_activations_allow_empty(profile, false)
+}
+
+fn enumerate_hardware_h264_activations_allow_empty(
+    profile: &str,
+    allow_empty: bool,
+) -> Result<Vec<IMFActivate>> {
     let output = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: MFVideoFormat_H264,
@@ -3296,6 +3510,12 @@ fn enumerate_hardware_h264_activations(profile: &str) -> Result<Vec<IMFActivate>
             &mut count,
         )
         .map_err(|error| stage_windows_error("enumerate", &error, "<none>", None, profile))?;
+    }
+    if count == 0 && allow_empty {
+        unsafe {
+            CoTaskMemFree(Some(raw.cast()));
+        }
+        return Ok(Vec::new());
     }
     ensure!(
         count > 0 && !raw.is_null(),

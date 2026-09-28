@@ -21,6 +21,8 @@ import { join } from 'node:path'
 import { launchDevApp } from './lib/app-launcher.mjs'
 import { requestSmokeCommand } from './lib/smoke-command-client.mjs'
 import {
+  freeformLiveSurfaceReady,
+  createFreeformMouseSequence,
   evaluateFreeformArtifact,
   evaluateFreeformChrome,
   evaluateFreeformGesture,
@@ -105,7 +107,7 @@ const report = {
   live: {
     supported: platform() === 'darwin',
     trackingDefinition:
-      'matchMs: last trusted mousemove dispatch to the first compositor.status read whose editorDraft equals the DOM ghost within 1e-3 (an upper bound: it includes the smoke\'s own frame waits and RPC round trips).',
+      "matchMs: last trusted mousemove dispatch to the first compositor.status read whose editorDraft equals the DOM ghost within 1e-3 (an upper bound: it includes the smoke's own frame waits and RPC round trips).",
     cadenceDefinition:
       'compositor.status.framesRendered read ~every 15 ms from the smoke socket during the 20 move + 20 resize matrix, each reading stamped with its request and reply times. Gate: the longest stall between two counter advances, taken as the PROVEN lower bound from the readings around it, must stay within 2 frames at targetFps; the upper bound, slow status round trips (> 30 ms, a backend hitch), and the worst 1 s window (steady under-rate, not gated) are recorded. The presenter counters and present metrics come from native-preview-surface-status and are recorded, not gated. VIDEORC_FREEFORM_LIVE_CONTROL=1 runs the same matrix with the preview floating (no drafts) for an A/B against the same machine.',
     cadence: {},
@@ -140,6 +142,7 @@ const launched = await launchDevApp({
     if (endpoint) devtoolsUrl = endpoint[1]
   }
 })
+const mouseEvent = createFreeformMouseSequence()
 const smoke = launched.connections['preview-motion-ready']
 const command = (name, params = {}) => requestSmokeCommand(smoke, name, params, { timeoutMs })
 try {
@@ -535,10 +538,7 @@ async function gesture({
   // A released draft ends when the commit's revision installs (the smoke
   // delays that commit by delayMs); a cancelled or unchanged one is cleared.
   const liveEnd = live
-    ? await waitForDraftGone(
-        endedAt,
-        cancellation || noop ? 500 + 250 : delayMs + 1000 + 500
-      )
+    ? await waitForDraftGone(endedAt, cancellation || noop ? 500 + 250 : delayMs + 1000 + 500)
     : null
   if (quickEdits) {
     await frames(1)
@@ -669,8 +669,36 @@ async function ensureLiveSurface(orientation) {
       `Live canvas never became the docked surface (${orientation}): ${error.message}; preview-window-state ${JSON.stringify(state)}`
     )
   }
-  report.live.surface = await command('native-preview-surface-status')
-  await frames(3)
+  const deadline = performance.now() + 10000
+  let readiness
+  const read = (name) =>
+    requestSmokeCommand(
+      smoke,
+      name,
+      {},
+      { timeoutMs: Math.max(1, Math.min(1000, deadline - performance.now())) }
+    )
+  do {
+    readiness = {
+      before: await read('preview-window-state'),
+      surface: await read('native-preview-surface-status'),
+      after: await read('preview-window-state')
+    }
+    if (freeformLiveSurfaceReady(readiness)) break
+    await frames(1)
+  } while (performance.now() < deadline)
+  report.live.readiness ??= []
+  report.live.readiness.push({ orientation, ...readiness })
+  assert.ok(
+    freeformLiveSurfaceReady(readiness),
+    `Native docked surface was not ready before ${orientation} gestures`
+  )
+  report.live.surface = readiness.surface
+  // Establish focus once before this matrix. Later blur/capture loss remains
+  // a measured failure; never refocus or retry an interrupted gesture.
+  await cdp.send('Page.bringToFront')
+  await waitUntil('document.hasFocus()')
+  await frames(2)
 }
 
 /** A/B control: the preview open in its own window, the canvas schematic. */
@@ -790,7 +818,9 @@ async function gatePreviewCadence(orientation, sampled) {
 
 /** The DOM ghost, normalized to the canvas, and the backend draft right after it. */
 async function liveDraftSample(sourceId) {
-  const ghost = await cdp.eval(`window.__freeformSmoke.normalizedBounds(${JSON.stringify(sourceId)})`)
+  const ghost = await cdp.eval(
+    `window.__freeformSmoke.normalizedBounds(${JSON.stringify(sourceId)})`
+  )
   const status = await request(backend, timeoutMs, 'compositor.status')
   return { at: performance.now(), ghost, draft: status.editorDraft ?? null }
 }
@@ -887,7 +917,9 @@ async function staleDraftExpires() {
   }
   const carriesRawRect = (draft) =>
     Boolean(draft?.transform) &&
-    ['x', 'y', 'width', 'height'].every((key) => Math.abs(draft.transform[key] - transform[key]) < 1e-9)
+    ['x', 'y', 'width', 'height'].every(
+      (key) => Math.abs(draft.transform[key] - transform[key]) < 1e-9
+    )
   const ack = await request(backend, timeoutMs, 'scene.editor.draft.set', params)
   assert.equal(ack.active, true, 'a direct draft must be accepted while idle')
   assert.ok(carriesRawRect(ack.editorDraft), `raw draft not acknowledged: ${JSON.stringify(ack)}`)
@@ -897,7 +929,11 @@ async function staleDraftExpires() {
   const ttl = {
     checkedAfterMs: performance.now() - setAt,
     editorDraft: later.editorDraft ?? null,
-    endedBy: !later.editorDraft ? 'ttl' : later.editorDraft.transform ? 'other-rect' : 'hold-heartbeat'
+    endedBy: !later.editorDraft
+      ? 'ttl'
+      : later.editorDraft.transform
+        ? 'other-rect'
+        : 'hold-heartbeat'
   }
   report.live.ttl = ttl
   assert.ok(
@@ -1114,15 +1150,9 @@ async function selectSource(sourceId) {
 }
 
 function mouse(type, point, modifiers = 0) {
-  return cdp.send('Input.dispatchMouseEvent', {
-    type,
-    ...point,
-    modifiers,
-    button: 'left',
-    buttons: type === 'mouseReleased' ? 0 : 1,
-    clickCount: type === 'mouseMoved' ? 0 : 1
-  })
+  return cdp.send('Input.dispatchMouseEvent', mouseEvent(type, point, modifiers))
 }
+
 function frames(count) {
   return cdp.eval(
     `new Promise(resolve=>{let n=${count};const tick=()=>--n<=0?resolve():requestAnimationFrame(tick);requestAnimationFrame(tick)})`

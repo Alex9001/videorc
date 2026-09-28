@@ -425,7 +425,8 @@ export function evaluatePreviewCadence({
   if (valid.length < 3) return { ok: false, failures: ['fewer than three cadence samples'] }
   const frameMs = 1000 / fps
   for (let i = 1; i < valid.length; i++) {
-    if (valid[i].at < valid[i - 1].at) return { ok: false, failures: ['cadence samples out of order'] }
+    if (valid[i].at < valid[i - 1].at)
+      return { ok: false, failures: ['cadence samples out of order'] }
     if (valid[i].framesRendered < valid[i - 1].framesRendered)
       return { ok: false, failures: ['framesRendered went backwards'] }
   }
@@ -500,4 +501,68 @@ function sameRect(a, b) {
 }
 function describeMs(value) {
   return Number.isFinite(value) ? `${value.toFixed(0)}ms` : 'indefinitely'
+}
+
+/** First gesture must start after the current docked native surface is presented. */
+export function freeformLiveSurfaceReady({ before, after, surface }) {
+  if (
+    ![before, after].every(
+      (window) =>
+        window?.open === true &&
+        window.visible === true &&
+        window.mode === 'docked' &&
+        window.dockHiddenReason === null &&
+        window.supervisor?.lifecycleState === 'surface-live'
+    )
+  )
+    return false
+  if (
+    !Number.isInteger(before.dockEpoch) ||
+    !Number.isInteger(before.supervisor.generation) ||
+    before.supervisor.generation !== after.supervisor.generation ||
+    before.dockEpoch !== after.dockEpoch
+  )
+    return false
+  if (
+    surface?.state !== 'live' ||
+    surface.transport !== 'native-surface' ||
+    surface.backing !== 'cametal-layer' ||
+    surface.nativePreviewHostAttached !== true ||
+    !Number.isFinite(surface.presentedFrameId) ||
+    !(surface.presentedFrameId > 0) ||
+    surface.bounds?.visible !== true
+  )
+    return false
+  return [before, after].every(
+    (window) =>
+      ['x', 'y', 'width', 'height'].every((key) => {
+        const surfaceKey = key === 'x' ? 'screenX' : key === 'y' ? 'screenY' : key
+        return (
+          Number.isFinite(window.contentBounds?.[key]) &&
+          Number.isFinite(surface.bounds[surfaceKey]) &&
+          Math.abs(window.contentBounds[key] - surface.bounds[surfaceKey]) <= 1
+        )
+      }) &&
+      window.contentBounds.width > 0 &&
+      window.contentBounds.height > 0
+  )
+}
+
+/** CDP moves describe the actual pressed-button state, including initial hover. */
+export function createFreeformMouseSequence() {
+  let pressed = false
+  return (type, point, modifiers = 0) => {
+    if (!['mouseMoved', 'mousePressed', 'mouseReleased'].includes(type))
+      throw new Error('Unsupported freeform pointer input')
+    if (type === 'mousePressed') pressed = true
+    if (type === 'mouseReleased') pressed = false
+    return {
+      type,
+      ...point,
+      modifiers,
+      button: type === 'mouseMoved' && !pressed ? 'none' : 'left',
+      buttons: pressed ? 1 : 0,
+      clickCount: type === 'mouseMoved' ? 0 : 1
+    }
+  }
 }

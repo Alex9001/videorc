@@ -164,3 +164,105 @@ jobs:
             apps/desktop/release/latest.yml
           if-no-files-found: error
           retention-days: 30
+
+  incident:
+    name: Windows startup incident diagnostics
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.0.9
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.6.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - id: ffmpeg-fetch
+        run: pnpm ffmpeg:fetch:windows
+      - name: Compare OpenH264 frame skipping on identical finite inputs
+        shell: pwsh
+        run: pnpm probe:windows-openh264 -- --output "$env:RUNNER_TEMP/openh264-comparison" --eof-stability-passes 25
+      - name: Retain standalone OpenH264 comparison before backend compilation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-openh264-comparison
+          path: ${{ runner.temp }}/openh264-comparison
+          if-no-files-found: warn
+          retention-days: 14
+      - id: backend-build
+        if: ${{ !cancelled() && steps.ffmpeg-fetch.outcome == 'success' }}
+        run: cargo build -p videorc-backend
+      - name: Prepare standalone diagnostic backend artifact
+        if: ${{ !cancelled() && steps.backend-build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $diagnosticDirectory = Join-Path $env:RUNNER_TEMP 'windows-diagnostic-backend'
+          New-Item -ItemType Directory -Path $diagnosticDirectory -Force | Out-Null
+          $binary = Join-Path $diagnosticDirectory 'videorc-backend.exe'
+          Copy-Item 'target/debug/videorc-backend.exe' $binary
+          @{
+            schemaVersion = 1
+            kind = 'videorc.windows-diagnostic-backend'
+            qualification = 'debug diagnostic binary; not an installer or release candidate'
+            sourceCommit = $env:GITHUB_SHA
+            sourceCommitProvenance = 'workflow checkout used for this cargo build; not inferred from a tester checkout'
+            workflowRunId = $env:GITHUB_RUN_ID
+            backendSha256 = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
+          } | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $diagnosticDirectory 'identity.json')
+      - name: Upload standalone diagnostic backend
+        if: ${{ !cancelled() && steps.backend-build.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: videorc-windows-diagnostic-backend
+          path: ${{ runner.temp }}/windows-diagnostic-backend
+          if-no-files-found: error
+          retention-days: 14
+      - name: Bounded Media Foundation diagnostic matrix
+        if: ${{ !cancelled() && steps.backend-build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          pnpm smoke:windows-mf-probe -- --output "$env:RUNNER_TEMP/mf-probe"
+          exit $LASTEXITCODE
+        env:
+          VIDEORC_DATABASE_PATH: ${{ runner.temp }}/mf-probe-state/videorc.sqlite3
+
+      - name: Retain Media Foundation measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mf-probe
+          path: ${{ runner.temp }}/mf-probe
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Controlled-audio incident matrix (three repetitions per case)
+        if: ${{ !cancelled() && steps.backend-build.outcome == 'success' && steps.ffmpeg-fetch.outcome == 'success' }}
+        shell: pwsh
+        run: pnpm smoke:windows-stream-performance -- --incident --audio controlled --output "$env:RUNNER_TEMP/incident"
+      - name: Retain every incident attempt including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-startup-incident
+          path: ${{ runner.temp }}/incident
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Independent FFmpeg-tone incident control (three repetitions per case)
+        if: ${{ !cancelled() && steps.backend-build.outcome == 'success' && steps.ffmpeg-fetch.outcome == 'success' }}
+        shell: pwsh
+        run: pnpm smoke:windows-stream-performance -- --incident --audio ffmpeg-control --output "$env:RUNNER_TEMP/incident-ffmpeg-control"
+      - name: Retain independent FFmpeg-tone control including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-startup-incident-ffmpeg-control
+          path: ${{ runner.temp }}/incident-ffmpeg-control
+          if-no-files-found: warn
+          retention-days: 14
