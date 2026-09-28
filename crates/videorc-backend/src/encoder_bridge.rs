@@ -10889,7 +10889,7 @@ mod tests {
         ] {
             let pause =
                 parse_video_toolbox_fifo_test_pause(role, Some(" 60 "), Some(" 350 "), None)
-                .expect("valid recording pressure hook");
+                    .expect("valid recording pressure hook");
             assert_eq!(pause.after_frames, 60);
             assert_eq!(pause.duration, Duration::from_millis(350));
         }

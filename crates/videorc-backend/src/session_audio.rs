@@ -2085,13 +2085,19 @@ fn output_stall_losses(losses: &BusLosses) -> u64 {
     losses.dropped_output_behind + losses.discarded_behind_cap + losses.stale_written
 }
 
-/// Logs one stall episode; one that cost audio is queued for a health event.
+/// A stall that silenced less audio than this is logged only: a 10-30 ms
+/// stale chunk under ordinary pressure is not news for the streamer.
+const OUTPUT_STALL_REPORT_MS: u64 = 250;
+
+/// Logs one stall episode; one that cost audible audio is queued for a
+/// health event.
 fn publish_output_stall(shared: &std::sync::Mutex<AudioShared>, report: OutputStallReport) {
-    if report.lost_ms == 0 {
+    if report.lost_ms < OUTPUT_STALL_REPORT_MS {
         tracing::info!(
             duration_ms = report.duration_ms,
             max_lag_ms = report.max_lag_ms,
-            "Session audio output fell behind and caught up without losing audio."
+            lost_ms = report.lost_ms,
+            "Session audio output fell behind and caught up without an audible gap."
         );
         return;
     }

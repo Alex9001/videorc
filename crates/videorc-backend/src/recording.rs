@@ -5727,7 +5727,8 @@ fn system_audio_lost_message(kind: crate::session_audio::SourceLossReason) -> &'
 }
 
 const SYSTEM_AUDIO_LOST_MESSAGE: &str = "System audio stopped during this session. The session continues without it; turn System audio off and on to try again.";
-const SYSTEM_AUDIO_TIMELINE_LOST_MESSAGE: &str = "System audio kept arriving, but Videorc could not place it on the session timeline. The session continues without it; turn System audio off and on to try again.";
+/// Plan 075: a placement loss keeps the source; the bus realigns it.
+const SYSTEM_AUDIO_TIMELINE_LOST_MESSAGE: &str = "System audio kept arriving, but Videorc could not place it on the session timeline. Videorc is realigning it; until then the gap is silent.";
 
 /// Marks a freshly-created session row failed if session startup bails before
 /// the pipeline takes ownership (F-017 — phantom "running" Library rows).
@@ -8336,7 +8337,7 @@ fn microphone_input_lost_message(device_name: &str, source_loss_after_ms: u64) -
 /// The microphone kept delivering; the session timeline refused its samples.
 fn microphone_timeline_lost_message(device_name: &str, source_loss_after_ms: u64) -> String {
     format!(
-        "Microphone \"{device_name}\" kept delivering audio, but Videorc could not place it on the session timeline after {:.1} seconds. Videorc replaced the missing input with silence.",
+        "Microphone \"{device_name}\" kept delivering audio, but Videorc could not place it on the session timeline after {:.1} seconds. Videorc is realigning it; until then the gap is silent.",
         source_loss_after_ms as f64 / 1_000.0
     )
 }
@@ -21365,9 +21366,12 @@ mod tests {
         let microphone = microphone_timeline_lost_message("MacBook Pro Microphone", 2_100);
         assert!(microphone.contains("kept delivering audio"), "{microphone}");
         assert!(!microphone.contains("stopped"), "{microphone}");
+        // Plan 075: the source stays and is realigned, never retired.
+        assert!(microphone.contains("realigning"), "{microphone}");
         let system =
             system_audio_lost_message(crate::session_audio::SourceLossReason::TimelineRejected);
         assert!(!system.contains("stopped"), "{system}");
+        assert!(system.contains("realigning"), "{system}");
         // No device words: the health row must not link a permission pane.
         assert!(!system.to_lowercase().contains("microphone"), "{system}");
         assert!(!system.to_lowercase().contains("screen"), "{system}");
