@@ -154,6 +154,12 @@ export interface VideorcAccountSnapshot {
   avatarUrl?: string
 }
 
+/** Main defers product-account maintenance while capture is active. Deferral is
+ * an expected answer, not a failure: the caller keeps its current snapshot. */
+export type VideorcAccountRefreshResult =
+  | { outcome: 'refreshed'; snapshot: VideorcAccountSnapshot }
+  | { outcome: 'deferred' }
+
 export type DeviceKind = 'screen' | 'window' | 'camera' | 'microphone' | 'system-audio'
 export type DeviceStatus = 'available' | 'unavailable' | 'permission-required'
 
@@ -3868,8 +3874,9 @@ export interface VideorcApi {
   getBundledBackgroundAssets: () => Promise<BackgroundImportResult[]>
   beginAccountSignIn: (authorizeUrl: string) => Promise<void>
   /** Best-effort product-account identity refresh owned by Electron Main's
-   * independent admin socket. Never shares the renderer's live-control lane. */
-  refreshAccount: () => Promise<VideorcAccountSnapshot>
+   * independent admin socket. Never shares the renderer's live-control lane.
+   * Resolves `deferred` while a recording or stream is active. */
+  refreshAccount: () => Promise<VideorcAccountRefreshResult>
   signOutAccount: () => Promise<VideorcAccountSnapshot>
   getPendingAccountCallbacks: () => Promise<AccountCallbackEnvelope[]>
   acknowledgeAccountCallback: (callbackId: string) => Promise<boolean>

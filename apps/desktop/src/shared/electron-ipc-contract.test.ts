@@ -83,19 +83,39 @@ describe('Electron IPC contract', () => {
     expect(validateElectronInvokeArgs('account:refresh', [])).toEqual([])
     expect(
       validateElectronInvokeResult('account:refresh', {
+        outcome: 'refreshed',
+        snapshot: {
+          status: 'signed-in',
+          username: 'orc',
+          avatarUrl: 'https://example.com/avatar.png'
+        }
+      })
+    ).toEqual({
+      outcome: 'refreshed',
+      snapshot: {
         status: 'signed-in',
         username: 'orc',
         avatarUrl: 'https://example.com/avatar.png'
-      })
-    ).toEqual({
-      status: 'signed-in',
-      username: 'orc',
-      avatarUrl: 'https://example.com/avatar.png'
+      }
+    })
+    expect(validateElectronInvokeResult('account:refresh', { outcome: 'deferred' })).toEqual({
+      outcome: 'deferred'
     })
     expect(() =>
       validateElectronInvokeResult('account:refresh', {
-        status: 'signed-in',
-        adminToken: 'must-not-cross-ipc'
+        outcome: 'refreshed',
+        snapshot: { status: 'signed-in', adminToken: 'must-not-cross-ipc' }
+      })
+    ).toThrow('account:refresh.result')
+    // A bare snapshot (the pre-073 wire shape) and a deferral carrying data
+    // are both rejected rather than guessed at.
+    expect(() =>
+      validateElectronInvokeResult('account:refresh', { status: 'signed-in', username: 'orc' })
+    ).toThrow('account:refresh.result')
+    expect(() =>
+      validateElectronInvokeResult('account:refresh', {
+        outcome: 'deferred',
+        snapshot: { status: 'signed-out' }
       })
     ).toThrow('account:refresh.result')
     expect(

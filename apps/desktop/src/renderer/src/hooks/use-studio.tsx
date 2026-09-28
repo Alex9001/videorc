@@ -153,6 +153,7 @@ import {
   type RecordLatencyOrigin,
   type RecordLatencySample
 } from '@/lib/record-latency'
+import { ipcErrorMessage } from '@/lib/ipc-error-message'
 import {
   INITIAL_ACCOUNT_READY_REFRESH_STATE,
   reduceAccountReadyRefresh,
@@ -319,6 +320,7 @@ import type {
   PreparedKickBroadcast,
   VideoPreset,
   VideoSettings,
+  VideorcAccountRefreshResult,
   VideorcAccountSnapshot,
   WarmMicrophoneStatus,
   XNativeLiveCapability,
@@ -437,11 +439,6 @@ import {
   deviceListWithoutProtectedOverlayWindows,
   protectedOverlayWindowIdsFromOverlayWindows
 } from '@/lib/protected-overlay-windows'
-import {
-  configureWindowsLiveAudioSmokeCapture,
-  WINDOWS_LIVE_AUDIO_SMOKE_BURST,
-  windowsLiveAudioSmokeState
-} from '@/lib/windows-live-audio-smoke-harness'
 
 export type { GoLivePartialSetup, GoLiveSetupFailure } from '@/lib/go-live-flow'
 
@@ -508,6 +505,9 @@ function loadCaptionOverlay() {
 // still commit immediately via the significant-change fast path.
 const TELEMETRY_UI_COMMIT_INTERVAL_MS = 1000
 const SIGNED_IN_ENTITLEMENT_REFRESH_INTERVAL_MS = 5 * 60_000
+// Main and the renderer hear the idle status on separate sockets. A short settle
+// keeps the post-capture replay from racing Main into a second deferral.
+const ACCOUNT_REFRESH_IDLE_REPLAY_DELAY_MS = 1_000
 const LIVE_CHAT_RECOVERY_RETRY_DELAY_MS = 250
 /// Scene-motion duration: content motion on-air sits just above the UI's
 /// 100-150ms tier; >=500ms reads as a broadcast wipe.
@@ -1982,8 +1982,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const accountSnapshotCoordinatorRef = useRef(new AccountSnapshotCommitCoordinator())
   const accountRefreshInFlightRef = useRef<{
     client: BackendClient
-    promise: Promise<VideorcAccountSnapshot>
+    promise: Promise<VideorcAccountRefreshResult>
   } | null>(null)
+  // Main deferred an account refresh because capture was active. The session
+  // going idle owes exactly one replay, so "deferred until idle" stays true.
+  const accountRefreshDeferredRef = useRef(false)
   const [aiCapabilities, setAiCapabilities] = useState<AiCapabilities | null>(null)
   const [aiQuota, setAiQuota] = useState<AiQuotaStatus | null>(null)
   const [aiReadinessError, setAiReadinessError] = useState<string | null>(null)
@@ -3558,7 +3561,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   )
 
   const reportError = useCallback((error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = ipcErrorMessage(error)
     // Always keep the diagnostic record, even for suppressed transients.
     setLastError(message)
     if (isPremiumUpgradeMessage(message)) {
@@ -4168,19 +4171,31 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         const refreshAccount = window.videorc?.refreshAccount
         inFlight = {
           client: activeClient,
-          promise: refreshAccount ? refreshAccount() : activeClient.requestTyped('account.get')
+          promise: refreshAccount
+            ? refreshAccount()
+            : activeClient
+                .requestTyped('account.get')
+                .then((snapshot) => ({ outcome: 'refreshed' as const, snapshot }))
         }
         accountRefreshInFlightRef.current = inFlight
       }
 
-      let snapshot: VideorcAccountSnapshot
+      let result: VideorcAccountRefreshResult
       try {
-        snapshot = await inFlight.promise
+        result = await inFlight.promise
       } finally {
         if (accountRefreshInFlightRef.current === inFlight) {
           accountRefreshInFlightRef.current = null
         }
       }
+      // Deferral is Main's designed answer during capture, not a failure: keep
+      // the current snapshot and replay once the session is idle.
+      if (result.outcome === 'deferred') {
+        accountRefreshDeferredRef.current = true
+        return null
+      }
+      accountRefreshDeferredRef.current = false
+      const snapshot = result.snapshot
       if (
         !snapshot ||
         !coordinator.canCommit(token) ||
@@ -7142,6 +7157,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           sessionListGenerationRef.current += 1
           sessionListMoreSingleFlightRef.current.invalidate('next-page')
           setSessionsLoadingMore(false)
+          let accountFailure: { error: unknown } | null = null
           try {
             setLastError(null)
             const [
@@ -7181,11 +7197,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             // Fetch identity after the maintenance batch and through the same
             // Main-owned refresh path as the provider-focus listener. An early
             // account.get snapshot must not land after a newer provider refresh.
-            const accountCommit = await refreshAccountSnapshotForClient(activeClient)
-            if (accountCommit) {
-              await refreshAiReadinessForClient(activeClient, accountCommit.snapshot, () =>
-                Boolean(refreshIsCurrent() && accountCommit.isCurrent())
-              )
+            // Identity is best-effort: a failure keeps the current snapshot and
+            // must never discard the devices, sessions and accounts fetched
+            // above (a live Sources Refresh did nothing but toast, plan 073).
+            try {
+              const accountCommit = await refreshAccountSnapshotForClient(activeClient)
+              if (accountCommit) {
+                await refreshAiReadinessForClient(activeClient, accountCommit.snapshot, () =>
+                  Boolean(refreshIsCurrent() && accountCommit.isCurrent())
+                )
+              }
+            } catch (error) {
+              accountFailure = { error }
             }
             if (!refreshIsCurrent()) {
               return
@@ -7217,6 +7240,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             setNoiseCleanupJobs((current) =>
               nextNoiseCleanupJobs.reduce((jobs, job) => upsertNoiseCleanupJob(jobs, job), current)
             )
+            if (accountFailure) {
+              reportError(accountFailure.error)
+            }
           } catch (error) {
             if (refreshIsCurrent()) {
               reportError(error)
@@ -7307,6 +7333,36 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     refreshAccountSnapshotForClient,
     refreshAiReadinessForClient,
     refreshEntitlementsForClient,
+    wsStatus
+  ])
+
+  // Main defers account maintenance while capture is active. When the session
+  // goes idle, replay exactly one deferred refresh so a purchase or avatar
+  // change made mid-stream lands now instead of at the next focus or timer.
+  const captureActive = isActiveRecordingState(recording.state)
+  const accountSignedIn = account?.status === 'signed-in'
+  useEffect(() => {
+    if (captureActive || !accountSignedIn || !client || wsStatus !== 'connected') return
+    if (!accountRefreshDeferredRef.current) return
+    const timer = window.setTimeout(() => {
+      if (!accountRefreshDeferredRef.current) return
+      accountRefreshDeferredRef.current = false
+      void refreshAccountSnapshotForClient(client)
+        .then(async (commit) => {
+          if (!commit) return
+          await refreshAiReadinessForClient(client, commit.snapshot, commit.isCurrent)
+        })
+        .catch(() => {
+          // Keep the last committed identity on provider/network failure.
+        })
+    }, ACCOUNT_REFRESH_IDLE_REPLAY_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [
+    accountSignedIn,
+    captureActive,
+    client,
+    refreshAccountSnapshotForClient,
+    refreshAiReadinessForClient,
     wsStatus
   ])
 
@@ -12848,13 +12904,6 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       return
     }
 
-    const snapshot = (): WindowsLiveAudioSmokeState =>
-      windowsLiveAudioSmokeState({
-        recording: recordingRef.current,
-        lastError: lastErrorRef.current,
-        captureConfig: captureConfigRef.current,
-        telemetry: windowsLiveAudioSmokeTelemetryRef.current
-      })
     const applyAudio = (microphoneGainDb: number, microphoneMuted: boolean): void => {
       const next = {
         ...captureConfigRef.current,
@@ -12870,9 +12919,18 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     const harness = async (
       request: WindowsLiveAudioSmokeRequest
     ): Promise<WindowsLiveAudioSmokeState> => {
+      // Smoke-only code: loaded on first use so it never ships in the eager bundle.
+      const smoke = await import('@/lib/windows-live-audio-smoke-harness')
+      const snapshot = (): WindowsLiveAudioSmokeState =>
+        smoke.windowsLiveAudioSmokeState({
+          recording: recordingRef.current,
+          lastError: lastErrorRef.current,
+          captureConfig: captureConfigRef.current,
+          telemetry: windowsLiveAudioSmokeTelemetryRef.current
+        })
       switch (request.action) {
         case 'configure': {
-          const next = configureWindowsLiveAudioSmokeCapture(
+          const next = smoke.configureWindowsLiveAudioSmokeCapture(
             captureConfigRef.current,
             deviceList.devices,
             request
@@ -12902,7 +12960,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           applyAudio(request.microphoneGainDb, request.microphoneMuted)
           return snapshot()
         case 'rapid-burst':
-          for (const update of WINDOWS_LIVE_AUDIO_SMOKE_BURST) {
+          for (const update of smoke.WINDOWS_LIVE_AUDIO_SMOKE_BURST) {
             applyAudio(update.microphoneGainDb, update.microphoneMuted)
             await new Promise<void>((resolveDelay) => window.setTimeout(resolveDelay, 20))
           }
