@@ -11,6 +11,9 @@ export const HIGHLIGHT_AUTO_DISMISS_MS = 10_000
 export const HIGHLIGHT_MAX_TEXT_LINES = 3
 /** The card never exceeds this fraction of the video width. */
 const MAX_CARD_WIDTH_FRACTION = 0.6
+/** A portrait canvas (the vertical simulcast leg, a vertical scene) is narrow
+ * and watched on a phone: the card may span most of its width. */
+const MAX_PORTRAIT_CARD_WIDTH_FRACTION = 0.85
 
 export function commentHighlightExpiryDelay(
   state: CommentHighlightState,
@@ -53,12 +56,19 @@ export interface HighlightMetrics {
   maxNameWidthPx: number
 }
 
-export function highlightMetrics(canvasWidth: number): HighlightMetrics {
-  const textFontPx = Math.max(20, Math.round(canvasWidth / 48))
+/** Text scales off the canvas's LONG edge, so a 1080x1920 vertical leg gets
+ * the same type size as its 1920x1080 horizontal twin instead of shrinking to
+ * a width-based size that is unreadable on a phone. `canvasHeight` omitted
+ * means landscape. */
+export function highlightMetrics(canvasWidth: number, canvasHeight?: number): HighlightMetrics {
+  const portrait = canvasHeight !== undefined && canvasHeight > canvasWidth
+  const longEdge = portrait ? canvasHeight : canvasWidth
+  const textFontPx = Math.max(20, Math.round(longEdge / 48))
   const paddingPx = Math.round(textFontPx * 0.8)
   const avatarPx = Math.round(textFontPx * 1.5)
   const identityGapPx = Math.round(textFontPx * 0.5)
-  const maxTextWidthPx = Math.floor(canvasWidth * MAX_CARD_WIDTH_FRACTION) - paddingPx * 2
+  const widthFraction = portrait ? MAX_PORTRAIT_CARD_WIDTH_FRACTION : MAX_CARD_WIDTH_FRACTION
+  const maxTextWidthPx = Math.floor(canvasWidth * widthFraction) - paddingPx * 2
   return {
     nameFontPx: Math.round(textFontPx * 0.95),
     textFontPx,
@@ -172,10 +182,11 @@ export function layoutCommentHighlight(params: {
   authorName: string
   text: string
   canvasWidth: number
+  canvasHeight?: number
   platform?: StreamPlatform
   measure: HighlightTextMeasurer
 }): HighlightLayout | null {
-  const metrics = highlightMetrics(params.canvasWidth)
+  const metrics = highlightMetrics(params.canvasWidth, params.canvasHeight)
   if (metrics.maxTextWidthPx <= 0) {
     return null
   }

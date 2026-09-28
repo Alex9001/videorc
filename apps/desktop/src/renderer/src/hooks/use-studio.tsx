@@ -207,6 +207,7 @@ import type {
   CohostState,
   CohostWindowState,
   CommentHighlightAnchor,
+  CommentHighlightCanvases,
   CommentHighlightCommand,
   CommentHighlightState,
   CommentsClearCommand,
@@ -2567,28 +2568,30 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           captureConfig.video,
           captureConfig.streamEnabled ? captureConfig.streaming : undefined
         )
-        const avatarUrl = message.authorAvatarUrl
-          ? await window.videorc?.cacheChatAvatar?.(message.authorAvatarUrl).catch(() => null)
-          : null
+        const [avatarUrl, canvases] = await Promise.all([
+          message.authorAvatarUrl
+            ? window.videorc?.cacheChatAvatar?.(message.authorAvatarUrl).catch(() => null)
+            : null,
+          client.request<CommentHighlightCanvases>('comments.highlight.canvases').catch(() => null)
+        ])
         if (commentHighlightIntentRef.current !== intent) return null
-        const { renderCommentHighlightPng, commentHighlightCardText } = await loadCaptionOverlay()
+        const { renderCommentHighlightCards } = await loadCaptionOverlay()
         if (commentHighlightIntentRef.current !== intent) return null
-        const pngBase64 = await renderCommentHighlightPng({
-          authorName: message.authorName,
-          text: commentHighlightCardText(message),
-          avatarUrl: avatarUrl ?? null,
-          canvasWidth: streamVideo.width,
-          platform: message.platform
-        })
-        if (!pngBase64) throw new Error('Could not render this message for the stream.')
+        const cards = await renderCommentHighlightCards(
+          message,
+          avatarUrl ?? null,
+          streamVideo,
+          canvases?.vertical
+        )
+        if (!cards) throw new Error('Could not render this message for the stream.')
         if (commentHighlightIntentRef.current !== intent) return null
         let state: CommentHighlightState
         try {
           state = await client.request<CommentHighlightState>('comments.highlight.set', {
             sessionId,
             messageId: message.id,
-            pngBase64,
-            anchor: commentHighlightAnchorRef.current
+            anchor: commentHighlightAnchorRef.current,
+            ...cards
           } satisfies SetCommentHighlightParams)
         } catch (error) {
           const failurePolicy = await loadCommandFailurePolicy()

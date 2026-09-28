@@ -576,25 +576,39 @@ pub fn caption_overlay_leg_plan(
     }
 }
 
+/// What a session's auxiliary compositor leg carries, as far as the
+/// comment-highlight card is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HighlightAuxLeg {
+    /// One leg: the primary carries every output.
+    None,
+    /// A split horizontal stream leg beside a clean recording.
+    Stream,
+    /// The dual-orientation vertical leg. Horizontal viewers ride the primary
+    /// leg with the recording, so the primary burns the card too.
+    VerticalSimulcast,
+}
+
 /// Per-leg plan for the comment-highlight overlay (Comments upgrade S2). The
-/// highlight is a STREAM-facing feature: it burns on whichever leg viewers
-/// watch — the aux leg when the session runs a split stream leg, else the
-/// primary leg when that leg carries the stream. Record-only sessions never
-/// burn a highlight. (When record+stream share one leg, viewers and the
-/// recording share pixels; the highlight lands on both — stated in the UI.)
+/// highlight is a STREAM-facing feature: it burns on every leg viewers watch —
+/// the aux leg when the session runs a split stream leg, the primary leg when
+/// that leg carries the (horizontal) stream, and BOTH with a vertical
+/// simulcast leg. Record-only sessions never burn a highlight. (When
+/// record+stream share one leg, viewers and the recording share pixels; the
+/// highlight lands on both — stated in the UI.)
 pub fn highlight_overlay_leg_plan(
     record_enabled: bool,
     stream_enabled: bool,
-    has_split_stream_leg: bool,
+    aux_leg: HighlightAuxLeg,
 ) -> (bool, bool) {
     if !stream_enabled {
         return (false, false);
     }
-    if has_split_stream_leg {
-        (false, true)
-    } else {
-        let _ = record_enabled;
-        (true, false)
+    let _ = record_enabled;
+    match aux_leg {
+        HighlightAuxLeg::None => (true, false),
+        HighlightAuxLeg::Stream => (false, true),
+        HighlightAuxLeg::VerticalSimulcast => (true, true),
     }
 }
 
@@ -2418,6 +2432,14 @@ pub(crate) fn prepare_caption_overlay(png_base64: &str) -> Result<PreparedCaptio
     decode_caption_overlay(png_base64)
 }
 
+/// Revisions for single-slot overlays are process-wide and never reused. The
+/// Metal compositor caches an overlay texture per source index keyed on
+/// (namespace, revision, size); a per-slot counter restarted at 1 after every
+/// clear, so a new card the same size as an expired one could replay the old
+/// card's pixels.
+static SINGLE_SLOT_OVERLAY_REVISION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) fn install_prepared_caption_overlay(
     slot: &CaptionOverlaySlot,
     prepared: PreparedCaptionOverlay,
@@ -2425,7 +2447,7 @@ pub(crate) fn install_prepared_caption_overlay(
 ) -> CaptionOverlayInfo {
     let placement = placement.into();
     let mut guard = slot.lock().expect("caption overlay lock");
-    let revision = guard.as_ref().map_or(1, |overlay| overlay.revision + 1);
+    let revision = SINGLE_SLOT_OVERLAY_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     *guard = Some(CaptionOverlay {
         rgba: prepared.rgba,
         bgra: prepared.bgra,
@@ -7129,21 +7151,50 @@ mod tests {
     fn highlight_leg_plan_follows_the_stream_leg() {
         // Record-only: no viewers, no highlight.
         assert_eq!(
-            highlight_overlay_leg_plan(true, false, false),
+            highlight_overlay_leg_plan(true, false, HighlightAuxLeg::None),
             (false, false)
         );
         // Stream-only: the primary leg IS the stream.
         assert_eq!(
-            highlight_overlay_leg_plan(false, true, false),
+            highlight_overlay_leg_plan(false, true, HighlightAuxLeg::None),
             (true, false)
         );
         // Record + split stream leg: highlight rides the aux (stream) leg only.
-        assert_eq!(highlight_overlay_leg_plan(true, true, true), (false, true));
+        assert_eq!(
+            highlight_overlay_leg_plan(true, true, HighlightAuxLeg::Stream),
+            (false, true)
+        );
         // Record + stream sharing one leg: viewers and recording share pixels.
-        assert_eq!(highlight_overlay_leg_plan(true, true, false), (true, false));
+        assert_eq!(
+            highlight_overlay_leg_plan(true, true, HighlightAuxLeg::None),
+            (true, false)
+        );
         // Idle sessions never burn.
         assert_eq!(
-            highlight_overlay_leg_plan(false, false, false),
+            highlight_overlay_leg_plan(false, false, HighlightAuxLeg::None),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn highlight_leg_plan_burns_both_orientations_with_a_vertical_leg() {
+        // Regression (owner live stream 2026-09-28): the vertical simulcast
+        // leg owns the aux, so horizontal viewers watch the PRIMARY leg. The
+        // card used to plan aux-only there, and the compositor never draws on
+        // the vertical aux without a portrait raster — it reached no output.
+        for record_enabled in [true, false] {
+            assert_eq!(
+                highlight_overlay_leg_plan(
+                    record_enabled,
+                    true,
+                    HighlightAuxLeg::VerticalSimulcast
+                ),
+                (true, true),
+                "record_enabled={record_enabled}"
+            );
+        }
+        assert_eq!(
+            highlight_overlay_leg_plan(true, false, HighlightAuxLeg::VerticalSimulcast),
             (false, false)
         );
     }
@@ -8849,7 +8900,7 @@ mod tests {
         .expect("valid overlay installs");
         assert!(info.active);
         assert_eq!((info.width, info.height), (4, 2));
-        assert_eq!(info.revision, 1);
+        assert!(info.revision >= 1);
 
         let overlay = current_caption_overlay(&slot).expect("overlay present");
         assert_eq!(overlay.rgba.len(), 4 * 2 * 4);
@@ -8866,13 +8917,22 @@ mod tests {
         let second =
             install_caption_overlay(&slot, &encode_test_png(6, 2), CaptionOverlayPosition::Top)
                 .expect("replacement installs");
-        assert_eq!(second.revision, 2);
+        assert!(second.revision > info.revision);
+
+        // A clear must not rewind the revision: the Metal texture cache keys
+        // on it, and a same-size replacement would otherwise replay stale
+        // pixels.
+        clear_caption_overlay(&slot);
+        let after_clear =
+            install_caption_overlay(&slot, &encode_test_png(6, 2), CaptionOverlayPosition::Top)
+                .expect("install after clear");
+        assert!(after_clear.revision > second.revision);
     }
 
     #[test]
     fn overlay_rejects_garbage_and_keeps_previous() {
         let slot = new_caption_overlay_slot();
-        install_caption_overlay(
+        let installed = install_caption_overlay(
             &slot,
             &encode_test_png(4, 2),
             CaptionOverlayPosition::Bottom,
@@ -8895,7 +8955,7 @@ mod tests {
 
         let survivor = current_caption_overlay(&slot).expect("previous overlay kept");
         assert_eq!((survivor.width, survivor.height), (4, 2));
-        assert_eq!(survivor.revision, 1);
+        assert_eq!(survivor.revision, installed.revision);
     }
 
     #[test]

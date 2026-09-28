@@ -428,11 +428,42 @@ export function commentHighlightCardText(message: import('@/lib/backend').LiveCh
   return item.message ? `${item.line}: ${item.message}` : item.line
 }
 
+type HighlightCanvas = { width: number; height: number }
+
+/** The card for the leg horizontal viewers watch and, when the backend reports
+ * a vertical simulcast leg (`comments.highlight.canvases`), a second card
+ * sized for its portrait canvas (plan 074). Null when the main card fails;
+ * a failed vertical card still lets the horizontal one go on stream. */
+export async function renderCommentHighlightCards(
+  message: import('@/lib/backend').LiveChatMessage,
+  avatarUrl: string | null,
+  stream: HighlightCanvas,
+  vertical?: HighlightCanvas
+): Promise<{ pngBase64: string; verticalPngBase64?: string } | null> {
+  const render = (canvas: HighlightCanvas): Promise<string | null> =>
+    renderCommentHighlightPng({
+      authorName: message.authorName,
+      text: commentHighlightCardText(message),
+      avatarUrl,
+      canvasWidth: canvas.width,
+      canvasHeight: canvas.height,
+      platform: message.platform
+    })
+  const [pngBase64, verticalPngBase64] = await Promise.all([
+    render(stream),
+    vertical ? render(vertical) : null
+  ])
+  if (!pngBase64) return null
+  return verticalPngBase64 ? { pngBase64, verticalPngBase64 } : { pngBase64 }
+}
+
 export async function renderCommentHighlightPng(params: {
   authorName: string
   text: string
   avatarUrl: string | null
   canvasWidth: number
+  /** Omitted = landscape. A portrait canvas gets the vertical-leg card. */
+  canvasHeight?: number
   platform?: import('@/lib/backend').StreamPlatform
 }): Promise<string | null> {
   // Q8 (plan 022): use-studio already imports comment-highlight statically, so
