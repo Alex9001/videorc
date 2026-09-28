@@ -5681,13 +5681,23 @@ fn emit_system_audio_lost_health_event(
         Some(session_id),
         HealthLevel::Warn,
         crate::system_audio_session::SYSTEM_AUDIO_LOST_CODE,
-        SYSTEM_AUDIO_LOST_MESSAGE,
+        system_audio_lost_message(loss.kind),
     );
 }
 
 /// Kept free of device words ("microphone", "screen") so the health row
 /// links no unrelated permission pane (`permission_pane_for_log`).
+fn system_audio_lost_message(kind: crate::session_audio::SourceLossReason) -> &'static str {
+    match kind {
+        crate::session_audio::SourceLossReason::CaptureStopped => SYSTEM_AUDIO_LOST_MESSAGE,
+        crate::session_audio::SourceLossReason::TimelineRejected => {
+            SYSTEM_AUDIO_TIMELINE_LOST_MESSAGE
+        }
+    }
+}
+
 const SYSTEM_AUDIO_LOST_MESSAGE: &str = "System audio stopped during this session. The session continues without it; turn System audio off and on to try again.";
+const SYSTEM_AUDIO_TIMELINE_LOST_MESSAGE: &str = "System audio kept arriving, but Videorc could not place it on the session timeline. The session continues without it; turn System audio off and on to try again.";
 
 /// Marks a freshly-created session row failed if session startup bails before
 /// the pipeline takes ownership (F-017 — phantom "running" Library rows).
@@ -8047,6 +8057,7 @@ async fn sample_native_audio_during_recording(state: AppState, session_id: Strin
                 &session_id,
                 &source_loss_after_ms.device_name,
                 source_loss_after_ms.after_ms,
+                source_loss_after_ms.reason,
             );
         }
 
@@ -8126,14 +8137,24 @@ fn emit_microphone_input_lost_health_event(
     session_id: &str,
     device_name: &str,
     source_loss_after_ms: u64,
+    reason: crate::session_audio::SourceLossReason,
 ) {
-    let message = microphone_input_lost_message(device_name, source_loss_after_ms);
+    let timeline_rejected = reason == crate::session_audio::SourceLossReason::TimelineRejected;
+    let message = if timeline_rejected {
+        microphone_timeline_lost_message(device_name, source_loss_after_ms)
+    } else {
+        microphone_input_lost_message(device_name, source_loss_after_ms)
+    };
     state.emit_log("warn", &message);
     let _ = emit_health_event(
         state,
         Some(session_id),
         HealthLevel::Warn,
-        "microphone-input-lost",
+        if timeline_rejected {
+            "microphone-timeline-lost"
+        } else {
+            "microphone-input-lost"
+        },
         &message,
     );
 }
@@ -8141,6 +8162,14 @@ fn emit_microphone_input_lost_health_event(
 fn microphone_input_lost_message(device_name: &str, source_loss_after_ms: u64) -> String {
     format!(
         "Microphone \"{device_name}\" stopped after {:.1} seconds. Videorc replaced the missing input with silence.",
+        source_loss_after_ms as f64 / 1_000.0
+    )
+}
+
+/// The microphone kept delivering; the session timeline refused its samples.
+fn microphone_timeline_lost_message(device_name: &str, source_loss_after_ms: u64) -> String {
+    format!(
+        "Microphone \"{device_name}\" kept delivering audio, but Videorc could not place it on the session timeline after {:.1} seconds. Videorc replaced the missing input with silence.",
         source_loss_after_ms as f64 / 1_000.0
     )
 }
@@ -8732,6 +8761,7 @@ async fn monitor_session(
                 &session_id,
                 &source_loss_after_ms.device_name,
                 source_loss_after_ms.after_ms,
+                source_loss_after_ms.reason,
             );
         }
         state.emit_log(
@@ -9868,7 +9898,27 @@ fn enqueue_post_recording_gate(
 ) {
     tokio::spawn(async move {
         let path_str = final_path.display().to_string();
+        let events = match state.database.list_health_events(&session_id) {
+            Ok(events) => events,
+            Err(error) => {
+                emit_gate_health(
+                    &state,
+                    Some(&session_id),
+                    &GateStatus::Failed {
+                        path: final_path.display().to_string(),
+                        reason: format!("Could not load session audio-loss evidence: {error}"),
+                    },
+                );
+                return;
+            }
+        };
         let expectations = QualityExpectations {
+            pipeline_reported_audio_loss: events.iter().any(|event| {
+                matches!(
+                    event.code.as_str(),
+                    "microphone-input-lost" | "microphone-timeline-lost"
+                ) || event.code == crate::system_audio_session::SYSTEM_AUDIO_LOST_CODE
+            }),
             intended_fps: gate.intended_fps,
             expect_audio: gate.expect_audio,
             pipeline_reported_freezes,
@@ -21084,6 +21134,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn audio_placement_losses_never_claim_the_device_stopped() {
+        let microphone = microphone_timeline_lost_message("MacBook Pro Microphone", 2_100);
+        assert!(microphone.contains("kept delivering audio"), "{microphone}");
+        assert!(!microphone.contains("stopped"), "{microphone}");
+        let system =
+            system_audio_lost_message(crate::session_audio::SourceLossReason::TimelineRejected);
+        assert!(!system.contains("stopped"), "{system}");
+        // No device words: the health row must not link a permission pane.
+        assert!(!system.to_lowercase().contains("microphone"), "{system}");
+        assert!(!system.to_lowercase().contains("screen"), "{system}");
+        assert_eq!(
+            system_audio_lost_message(crate::session_audio::SourceLossReason::CaptureStopped),
+            SYSTEM_AUDIO_LOST_MESSAGE
+        );
+    }
+
     fn starting_test_status() -> RecordingStatus {
         RecordingStatus {
             state: RecordingState::Starting,
@@ -23659,6 +23726,7 @@ mod tests {
                 intended_fps: Some(30.0),
                 expect_audio: true,
                 pipeline_reported_freezes: false,
+                pipeline_reported_audio_loss: false,
             },
             "t0".to_string(),
         )

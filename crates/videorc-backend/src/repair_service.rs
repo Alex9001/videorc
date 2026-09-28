@@ -43,6 +43,7 @@ fn expectations_from(params: &RepairFileParams) -> QualityExpectations {
         expect_audio: params.expect_audio.unwrap_or(true),
         // Manual/batch repair runs have no live session counters.
         pipeline_reported_freezes: false,
+        pipeline_reported_audio_loss: false,
     }
 }
 

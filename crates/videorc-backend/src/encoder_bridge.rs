@@ -3997,11 +3997,23 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
         });
         if let Some((frame_sequence, captured_at, frame_age_ms)) = frame_metadata {
             if last_fed_sequence.is_none() {
-                // First video content of the session: everything the audio writer
-                // captured before the composited frame's timestamp is pre-roll and
-                // must be trimmed. Using the encoder-observed instant here would
-                // bake source-to-encode latency into the finished recording.
-                let _ = video_epoch.set(captured_at);
+                // First video content of the session: audio before the epoch is
+                // pre-roll. A direct D3D11 frame is presented as it is fed.
+                let fed_at = Instant::now();
+                let presented_at = fed
+                    .as_ref()
+                    .and_then(|frame| frame.frame.metadata.presentation_at())
+                    .unwrap_or(fed_at);
+                let epoch = recording_epoch(captured_at, presented_at);
+                if video_epoch.set(epoch).is_ok() {
+                    tracing::info!(
+                        source_age_ms = frame_age_ms,
+                        presentation_age_ms =
+                            fed_at.saturating_duration_since(presented_at).as_millis() as u64,
+                        epoch_age_ms = fed_at.saturating_duration_since(epoch).as_millis() as u64,
+                        "Recording audio epoch established from first video presentation"
+                    );
+                }
                 // No-op for outputs that already signalled at startup.
                 signal_encoder_bridge_startup(&mut startup_ready_tx, Ok(()));
             }
@@ -6889,6 +6901,23 @@ fn parse_video_toolbox_probe_enabled(value: Option<&str>) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// Live sources reach the compositor well inside this: owner sessions show a
+/// 6-72 ms source-to-encode p95. Content older than this when it is presented
+/// is held, not late.
+const RECORDING_EPOCH_MAX_SOURCE_LATENCY: Duration = Duration::from_millis(100);
+
+/// Audio sample zero: the capture time of the content shown at video PTS zero.
+/// Live content keeps its source-to-presentation latency, so A/V alignment is
+/// unchanged. An unchanged screen reuses pixels captured seconds ago, but they
+/// are still current when presented, so their age is bounded, not trusted.
+/// An epoch seconds old maps every current audio sample far ahead of the bus
+/// cursor, where the timeline drops it (plan 070).
+pub(crate) fn recording_epoch(content_captured_at: Instant, presented_at: Instant) -> Instant {
+    presented_at
+        .checked_sub(RECORDING_EPOCH_MAX_SOURCE_LATENCY)
+        .map_or(content_captured_at, |floor| content_captured_at.max(floor))
 }
 
 fn latest_compositor_frame(
@@ -10625,6 +10654,50 @@ mod tests {
             classify_bridge_frame(Some(21), Some(fed.sequence)),
             BridgeFrameSource::Repeated
         );
+    }
+
+    #[test]
+    fn compositor_presentation_time_survives_encoder_frame_handoff() {
+        let store = Arc::new(std::sync::Mutex::new(crate::frame_store::FrameStore::new(
+            2,
+        )));
+        let presentation = Instant::now();
+        let content = presentation - Duration::from_secs(30);
+        store.lock().unwrap().publish_with_metadata(
+            1,
+            4,
+            4,
+            CompositorPixelFormat::yuv420p_cpu_buffer(),
+            crate::compositor::CompositorFrameExportHandle::default()
+                .with_presentation_time(presentation),
+            content,
+            vec![0; 24],
+        );
+        let fed = latest_compositor_frame(Some(&store)).unwrap();
+        assert_eq!(fed.captured_at, content);
+        assert!(fed.age_ms >= 30_000);
+        assert_eq!(fed.frame.metadata.presentation_at(), Some(presentation));
+    }
+
+    #[test]
+    fn recording_epoch_keeps_live_latency_and_bounds_held_content() {
+        let presented = Instant::now();
+        // Live camera/screen content: the calibrated capture-time epoch stands.
+        for latency_ms in [0, 40, 72, 100] {
+            let content = presented - Duration::from_millis(latency_ms);
+            assert_eq!(recording_epoch(content, presented), content);
+        }
+        // Held static pixels: the epoch is never older than the bound.
+        for age_ms in [101, 2_000, 8_849, 30_000] {
+            let content = presented - Duration::from_millis(age_ms);
+            assert_eq!(
+                recording_epoch(content, presented),
+                presented - RECORDING_EPOCH_MAX_SOURCE_LATENCY
+            );
+        }
+        // A frame stamped after its composition start is not moved earlier.
+        let later = presented + Duration::from_millis(3);
+        assert_eq!(recording_epoch(later, presented), later);
     }
 
     #[test]

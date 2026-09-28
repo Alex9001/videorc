@@ -101,17 +101,29 @@ pub type CompositorFrameStore =
 
 #[derive(Clone, Default)]
 pub struct CompositorFrameExportHandle {
+    // Output tick time, independent of how long the source pixels have been held.
+    presentation_at: Option<Instant>,
     #[cfg(target_os = "macos")]
     metal_target: Option<Arc<crate::metal_compositor::MetalCompositorTargetPixelBuffer>>,
     d3d11_texture: Option<WindowsD3d11TextureLeaseTicket>,
 }
 
 impl CompositorFrameExportHandle {
+    pub(crate) fn with_presentation_time(mut self, at: Instant) -> Self {
+        self.presentation_at = Some(at);
+        self
+    }
+
+    pub(crate) fn presentation_at(&self) -> Option<Instant> {
+        self.presentation_at
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn metal_target(
         target: crate::metal_compositor::MetalCompositorTargetPixelBuffer,
     ) -> Self {
         Self {
+            presentation_at: None,
             metal_target: Some(Arc::new(target)),
             d3d11_texture: None,
         }
@@ -122,6 +134,7 @@ impl CompositorFrameExportHandle {
         Self {
             #[cfg(target_os = "macos")]
             metal_target: None,
+            presentation_at: None,
             d3d11_texture: Some(ticket),
         }
     }
@@ -7486,7 +7499,7 @@ async fn publish_compositor_frame(
             width,
             height,
             pixel_format,
-            export_handle,
+            export_handle.with_presentation_time(published_at),
             captured_at,
             bytes,
         );
@@ -7550,6 +7563,7 @@ async fn publish_compositor_frame(
         if let Some(aux_timings) = publish_auxiliary_compositor_frame(
             sequence,
             captured_at,
+            published_at,
             stream_frame_store,
             inputs,
             stream_gpu,
@@ -7677,6 +7691,7 @@ fn compositor_frame_content_captured_at(
 fn publish_auxiliary_compositor_frame(
     sequence: u64,
     captured_at: Instant,
+    published_at: Instant,
     frame_store: CompositorFrameStore,
     inputs: CompositorRenderInputs<'_>,
     mut gpu: Option<&mut GpuCompositor>,
@@ -7716,7 +7731,7 @@ fn publish_auxiliary_compositor_frame(
         width,
         height,
         pixel_format,
-        export_handle,
+        export_handle.with_presentation_time(published_at),
         captured_at,
         bytes,
     );
@@ -12213,6 +12228,8 @@ mod tests {
 
         let recording = recording_latest.expect("recording frame");
         let stream = stream_latest.expect("stream frame");
+        assert!(recording.metadata.presentation_at().is_some());
+        assert!(stream.metadata.presentation_at().is_some());
         assert_eq!((recording.width, recording.height), (640, 360));
         assert_eq!(recording.bytes.len(), raw_yuv420p_len(640, 360));
         assert_eq!((stream.width, stream.height), (320, 180));
@@ -12333,6 +12350,8 @@ mod tests {
         // scene and the simulcast portrait scene, each on its own canvas.
         let recording = recording_latest.expect("recording frame");
         let stream = stream_latest.expect("stream frame");
+        assert!(recording.metadata.presentation_at().is_some());
+        assert!(stream.metadata.presentation_at().is_some());
         assert_eq!((recording.width, recording.height), (640, 360));
         assert_eq!((stream.width, stream.height), (180, 320));
         assert_eq!(stream.bytes.len(), raw_yuv420p_len(180, 320));
@@ -15476,7 +15495,131 @@ mod tests {
             .latest()
             .expect("published compositor frame");
         assert_eq!(latest.captured_at, camera_captured_at);
+        assert!(latest.metadata.presentation_at().unwrap() > camera_captured_at);
         assert!(result.fallback_frame_age_ms >= 77);
+    }
+
+    #[tokio::test]
+    async fn static_screen_recording_epoch_keeps_current_audio() {
+        let state = test_state();
+        let video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 4,
+            height: 4,
+            fps: 30,
+            bitrate_kbps: 2000,
+        };
+        let screen_id = "screen:screencapturekit:2";
+        let layout = LayoutSettings {
+            layout_preset: LayoutPreset::ScreenOnly,
+            ..crate::protocol::default_layout_settings()
+        };
+        let scene = crate::scene::scene_from_capture_config(SceneConfigParams {
+            transition_ms: None,
+            sources: crate::protocol::SourceSelection {
+                screen_id: Some(screen_id.into()),
+                window_id: None,
+                camera_id: None,
+                microphone_id: None,
+                test_pattern: false,
+            },
+            layout: layout.clone(),
+            video: Some(video.clone()),
+            background: None,
+            protected_overlay_window_ids: Vec::new(),
+        });
+        state.compositor.lock().await.scene = Some(CompositorSceneSnapshot {
+            revision: 1,
+            scene: Some(scene),
+            layout,
+            active_screen: None,
+        });
+        crate::preview_screen::test_install_live_screen_generation(&state, screen_id, 1, 1, &video)
+            .await;
+        let mut live_sources = CompositorLiveSources::default();
+        let mut render_cache = CompositorRenderCache::refresh_initial(&state).await;
+        for (index, age_ms) in [0, 500, 2000, 9000, 30000].into_iter().enumerate() {
+            let content_at = Instant::now() - Duration::from_millis(age_ms);
+            crate::preview_screen::test_publish_screen_pixels(
+                &state,
+                index as u64 + 2,
+                [0x20, 0x40, 0x80, 0xff],
+                content_at,
+            )
+            .await;
+            // Repeated sessions reuse the same capture source but get a new output epoch.
+            for take in 0..2 {
+                publish_compositor_frame(
+                    &state,
+                    "test-run",
+                    (index * 2 + take + 1) as u64,
+                    4,
+                    4,
+                    &mut live_sources,
+                    &mut render_cache,
+                    None,
+                    CompositorFrameConsumer::RawYuvEncoder,
+                    None,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+                .await;
+                let store = compositor_frame_store(&state).await;
+                let frame = store.lock().unwrap().latest().unwrap();
+                assert_eq!(
+                    frame.captured_at, content_at,
+                    "content age must stay honest"
+                );
+                let presented_at = frame
+                    .metadata
+                    .presentation_at()
+                    .expect("recording frame carries its presentation time");
+                assert!(presented_at >= content_at);
+                let epoch = crate::encoder_bridge::recording_epoch(frame.captured_at, presented_at);
+                // Both inputs deliver current audio from the moment Record starts.
+                let started = Instant::now();
+                for (microphone, system) in [(true, false), (false, true), (true, true)] {
+                    for packet_frames in [128, 480, 512, 960] {
+                        let case = format!(
+                            "age={age_ms} take={take} mic={microphone} system={system} packet={packet_frames}"
+                        );
+                        let audio = crate::session_audio::test_current_audio_on_epoch(
+                            epoch,
+                            started,
+                            packet_frames,
+                            microphone,
+                            system,
+                        );
+                        assert_eq!(audio.dropped_ahead_of_cap, 0, "{case}: {audio:?}");
+                        assert_eq!(audio.counters.dropped_frames, 0, "{case}: {audio:?}");
+                        let first = audio
+                            .first_audible_frame
+                            .unwrap_or_else(|| panic!("{case}: no audible output {audio:?}"));
+                        // Audible within 150 ms of the file start, then continuous.
+                        assert!(first < 7_200, "{case}: {audio:?}");
+                        assert!(
+                            audio.audible_frames + 480 >= audio.rendered_frames - first,
+                            "{case}: {audio:?}"
+                        );
+                        // The release rule (epoch = held content time) loses it all.
+                        if age_ms >= 2_000 {
+                            let legacy = crate::session_audio::test_current_audio_on_epoch(
+                                frame.captured_at,
+                                started,
+                                packet_frames,
+                                microphone,
+                                system,
+                            );
+                            assert!(legacy.dropped_ahead_of_cap > 0, "{case}: {legacy:?}");
+                            assert_eq!(legacy.first_audible_frame, None, "{case}: {legacy:?}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

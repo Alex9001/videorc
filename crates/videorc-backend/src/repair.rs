@@ -335,6 +335,12 @@ pub struct QualityExpectations {
     /// differently, which is how the 55%-frozen 0.9.71 recording passed as
     /// "ready" (the 2026-08-24 second-session-lag incident).
     pub pipeline_reported_freezes: bool,
+    /// The session reported a microphone or system-audio loss (device stopped,
+    /// or arriving samples the timeline could not place). Unlike quiet or
+    /// muted PCM, the missing audio is unrecoverable, so the file cannot pass
+    /// clean on structure alone: plan 070's 0.9.119 recording was a valid,
+    /// entirely silent AAC track.
+    pub pipeline_reported_audio_loss: bool,
 }
 
 impl Default for QualityExpectations {
@@ -343,6 +349,7 @@ impl Default for QualityExpectations {
             intended_fps: None,
             expect_audio: true,
             pipeline_reported_freezes: false,
+            pipeline_reported_audio_loss: false,
         }
     }
 }
@@ -352,6 +359,7 @@ impl Default for QualityExpectations {
 pub enum QualityIssue {
     MissingVideo,
     MissingAudio,
+    AudioInputLost,
     VariableFrameRate {
         avg_fps: f64,
         nominal_fps: f64,
@@ -460,6 +468,11 @@ pub fn classify_quality(
                 repairable = true;
             }
         }
+    }
+
+    if expectations.pipeline_reported_audio_loss {
+        issues.push(QualityIssue::AudioInputLost);
+        needs_review = true;
     }
 
     // Audio presence + A/V skew.
@@ -1059,7 +1072,7 @@ pub fn has_user_impacting_issue(issues: &[QualityIssue]) -> bool {
     issues.iter().any(|issue| {
         matches!(
             issue,
-            QualityIssue::MissingVideo | QualityIssue::MissingAudio
+            QualityIssue::MissingVideo | QualityIssue::MissingAudio | QualityIssue::AudioInputLost
         )
     })
 }
@@ -1174,6 +1187,7 @@ pub fn select_repair_plan(
             // content (low motion) is not a defect to repair.
             QualityIssue::MissingVideo
             | QualityIssue::MissingAudio
+            | QualityIssue::AudioInputLost
             | QualityIssue::AudioGap { .. }
             | QualityIssue::LowMotionSegments { .. } => {}
         }
@@ -1373,7 +1387,10 @@ fn verdict_for(issues: &[QualityIssue]) -> QualityVerdict {
     let needs_review = significant.iter().any(|issue| {
         matches!(
             issue,
-            QualityIssue::MissingVideo | QualityIssue::MissingAudio | QualityIssue::AudioGap { .. }
+            QualityIssue::MissingVideo
+                | QualityIssue::MissingAudio
+                | QualityIssue::AudioInputLost
+                | QualityIssue::AudioGap { .. }
         )
     });
     if needs_review {
@@ -1865,6 +1882,10 @@ fn verdict_label(verdict: QualityVerdict) -> &'static str {
 fn describe_issue(issue: &QualityIssue) -> String {
     match issue {
         QualityIssue::MissingVideo => "missing video stream".to_string(),
+        QualityIssue::AudioInputLost => {
+            "an audio input was lost during the session; the missing audio cannot be restored"
+                .to_string()
+        }
         QualityIssue::MissingAudio => "missing audio stream".to_string(),
         QualityIssue::VariableFrameRate {
             avg_fps,
@@ -2152,6 +2173,8 @@ pub struct RepairJob {
     pub status: RepairJobStatus,
     pub intended_fps: Option<f64>,
     pub expect_audio: bool,
+    #[serde(default)]
+    pub pipeline_reported_audio_loss: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2174,6 +2197,7 @@ impl RepairJob {
             status: RepairJobStatus::Pending,
             intended_fps: expectations.intended_fps,
             expect_audio: expectations.expect_audio,
+            pipeline_reported_audio_loss: expectations.pipeline_reported_audio_loss,
             outcome: None,
             reason: None,
             created_at: now.clone(),
@@ -2189,6 +2213,7 @@ impl RepairJob {
             // Resumed/interrupted jobs lose the session's live pipeline
             // counters; fall back to exact-repeat corroboration only.
             pipeline_reported_freezes: false,
+            pipeline_reported_audio_loss: self.pipeline_reported_audio_loss,
         }
     }
 
@@ -2278,6 +2303,31 @@ mod tests {
             STRICT_MAX_REPEATED_FRAME_RUN
         );
         assert_eq!(thresholds.min_freeze_seconds, STRICT_MAX_FREEZE_SECONDS);
+    }
+
+    #[test]
+    fn confirmed_audio_loss_cannot_pass_or_be_repaired_as_a_valid_silent_track() {
+        let probe = parse_ffprobe_json(CLEAN_JSON).unwrap();
+        let mut expectations = QualityExpectations::default();
+        assert_eq!(
+            classify_quality(&probe, &thresholds(), &expectations).verdict,
+            QualityVerdict::Clean
+        );
+        expectations.pipeline_reported_audio_loss = true;
+        let report = classify_quality(&probe, &thresholds(), &expectations);
+        assert_eq!(report.verdict, QualityVerdict::NeedsReview);
+        assert_eq!(report.issues, vec![QualityIssue::AudioInputLost]);
+        assert!(has_user_impacting_issue(&report.issues));
+        assert!(!needs_transcode_repair(&report.issues));
+        let job = RepairJob::pending(
+            "loss".into(),
+            "/recording.mp4".into(),
+            &expectations,
+            "now".into(),
+        );
+        let restored: RepairJob =
+            serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        assert!(restored.expectations().pipeline_reported_audio_loss);
     }
 
     #[test]
@@ -3495,6 +3545,7 @@ mod tests {
                 intended_fps: None,
                 expect_audio: true,
                 pipeline_reported_freezes: false,
+                pipeline_reported_audio_loss: false,
             },
         );
         assert!(
@@ -3546,6 +3597,7 @@ mod tests {
                 intended_fps: Some(30.0),
                 expect_audio: true,
                 pipeline_reported_freezes: false,
+                pipeline_reported_audio_loss: false,
             },
         );
         assert!(matches!(status, GateStatus::Ready { .. }), "got {status:?}");
@@ -3597,6 +3649,7 @@ mod tests {
                 intended_fps: Some(30.0),
                 expect_audio: true,
                 pipeline_reported_freezes: false,
+                pipeline_reported_audio_loss: false,
             },
         );
         assert!(
@@ -3614,6 +3667,7 @@ mod tests {
             intended_fps: Some(30.0),
             expect_audio: true,
             pipeline_reported_freezes: false,
+            pipeline_reported_audio_loss: false,
         }
     }
 

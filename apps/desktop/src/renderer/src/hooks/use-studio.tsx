@@ -3730,6 +3730,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           ? { lastSessionId: lastRecordingSessionIdRef.current }
           : {}),
         lastActivity: lastSessionActivityRef.current,
+        currentNotice: sessionRuntimeNoticeRef.current,
         currentDedupeKey: microphoneInputLostSessionRef.current
       })
       if (!presentation) return
@@ -6129,7 +6130,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (event.code === 'captions-srt-written' && event.sessionId) {
           transcriptWrittenSessionIdsRef.current.add(event.sessionId)
         }
-        if (event.code === 'microphone-input-lost') {
+        if (
+          ['microphone-input-lost', 'microphone-timeline-lost', 'system-audio-lost'].includes(
+            event.code
+          )
+        ) {
           void publishMicrophoneInputLost(event)
         } else {
           const qualityDedupeKey = event.sessionId ?? event.message

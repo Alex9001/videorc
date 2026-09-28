@@ -11,6 +11,7 @@ export type SessionRuntimeNotice =
     }
   | {
       kind: 'microphone-input-lost'
+      audioIssues?: { code: string; message: string }[]
       activity: SessionRuntimeActivity
       phase: 'active' | 'ending' | 'ended'
       message: string
@@ -23,6 +24,25 @@ export function sessionRuntimeNoticeTitle(notice: SessionRuntimeNotice): string 
     return notice.activity === 'live-stream'
       ? 'Live session stopped unexpectedly'
       : 'Recording stopped unexpectedly'
+  }
+
+  if (notice.audioIssues?.some((issue) => issue.code !== 'microphone-input-lost')) {
+    const sources = new Set(
+      notice.audioIssues.map((issue) =>
+        issue.code.startsWith('microphone-')
+          ? 'microphone'
+          : issue.code === 'system-audio-lost'
+            ? 'system'
+            : 'both'
+      )
+    )
+    const subject =
+      sources.size > 1 || sources.has('both')
+        ? 'Microphone and system audio lost'
+        : sources.has('system')
+          ? 'System audio lost'
+          : 'Microphone audio could not be recorded'
+    return notice.phase === 'ended' ? `${subject}: saved session has missing audio` : subject
   }
 
   if (notice.phase === 'ended') {
