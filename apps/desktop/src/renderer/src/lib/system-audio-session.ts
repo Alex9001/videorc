@@ -29,8 +29,11 @@ export function confirmedSystemAudioMix(tracks: AudioTrack[] | undefined): boole
 export function systemAudioIssueFromHealthEvent({
   code
 }: Pick<HealthEvent, 'code'>): SystemAudioIssue | null {
-  if (code === SYSTEM_AUDIO_LOST_CODE) return 'lost'
-  if (code === SYSTEM_AUDIO_UNAVAILABLE_CODE) return 'unavailable'
-  if (code === 'system-audio-mic-fallback-bypass') return 'bypassed'
-  return null
+  // Every code is `system-audio-<suffix>`; the suffix lookup keeps this small.
+  const suffix = code.startsWith('system-audio-') ? code.slice(13) : ''
+  return suffix === 'mic-fallback-bypass'
+    ? 'bypassed'
+    : suffix === 'lost' || suffix === 'unavailable'
+      ? suffix
+      : null
 }
