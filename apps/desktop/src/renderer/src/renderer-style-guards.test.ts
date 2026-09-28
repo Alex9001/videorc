@@ -3,8 +3,10 @@ import { join, relative, sep } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 // Plan 050 (D5, D6, S20): the renderer stays on real glass and native feel.
-// - No CSS backdrop blur anywhere: it wedged the compositor in June, and the
-//   OS draws the glass now.
+// - No CSS backdrop blur anywhere: it wedged the compositor in June, the OS
+//   draws the window glass now, and plan 072 found it never reaches the
+//   screen on the vibrancy windows (Chromium's own capture shows the blur,
+//   the display does not).
 // - No cursor-pointer: desktop controls use the arrow.
 // - No colour literals in chrome: colour comes from the tokens in styles.css.
 //   The allowlist names the files whose literals are CONTENT (what ends up in
@@ -84,6 +86,12 @@ describe('renderer style guards (plan 050)', () => {
         /\bbackdrop-(?:blur|brightness|contrast|grayscale|hue-rotate|invert|opacity|saturate|sepia)\b|backdrop-filter\s*:/
       )
     ).toEqual([])
+  })
+
+  it('paints floating surfaces with glass-float, never the popover coat', () => {
+    // Plan 072: a fresh shadcn add brings `bg-popover`, which read as a black
+    // slab on the window glass. Floating surfaces use `border glass-float`.
+    expect(offenders(/\bbg-popover\b/, (path) => /\.(tsx|ts)$/.test(path))).toEqual([])
   })
 
   it('never uses cursor-pointer: desktop controls use the arrow', () => {

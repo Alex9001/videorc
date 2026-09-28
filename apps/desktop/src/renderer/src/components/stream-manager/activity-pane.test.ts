@@ -2,7 +2,11 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
-import { ActivityPane } from '@/components/stream-manager/activity-pane'
+import {
+  ActivityPane,
+  activityCapabilityNote,
+  activityRowShowsPerson
+} from '@/components/stream-manager/activity-pane'
 import type { LiveChatProviderState } from '@/lib/backend'
 import type { ActivityItem } from '@/lib/stream-activity'
 
@@ -62,5 +66,145 @@ describe('ActivityPane', () => {
     expect(markup).not.toContain('Follows')
     expect(markup).not.toContain('Raids')
     expect(markup).not.toContain('Destinations')
+  })
+})
+
+// Plan 071, S1: a row about one person shows that person.
+describe('ActivityPane avatars', () => {
+  const follows: ActivityItem[] = [
+    {
+      id: 'named',
+      kind: 'follow',
+      filter: 'follows',
+      platform: 'twitch',
+      name: 'Sam Carter',
+      line: 'Followed',
+      short: 'Follow',
+      at: '2026-09-24T10:00:00Z',
+      authorAvatarUrl: 'https://static-cdn.jtvnw.net/sam.png'
+    },
+    {
+      id: 'no-picture',
+      kind: 'follow',
+      filter: 'follows',
+      platform: 'kick',
+      name: 'pixel',
+      line: 'Followed',
+      short: 'Follow',
+      at: '2026-09-24T10:00:10Z'
+    },
+    {
+      id: 'unnamed',
+      kind: 'follow',
+      filter: 'follows',
+      platform: 'x',
+      name: 'New follower',
+      line: '1 new follower.',
+      short: '',
+      at: '2026-09-24T10:00:20Z',
+      unnamed: true
+    }
+  ]
+  const markup = renderToStaticMarkup(
+    createElement(ActivityPane, {
+      items: follows,
+      providers: [provider('twitch')],
+      nowMs: Date.parse('2026-09-24T10:01:00Z')
+    })
+  )
+  const row = (id: string): string => {
+    const start = markup.indexOf(`data-activity-id="${id}"`)
+    return markup.slice(start, markup.indexOf('</li>', start))
+  }
+
+  it('shows the follower as an avatar circle, with initials until the picture loads', () => {
+    expect(row('named')).toContain('data-slot="activity-avatar"')
+    expect(row('named')).toContain('>SC<')
+    expect(row('no-picture')).toContain('data-slot="activity-avatar"')
+    expect(row('no-picture')).toContain('>P<')
+  })
+
+  it('keeps the glyph for a count the platform never named', () => {
+    expect(row('unnamed')).toContain('data-slot="activity-glyph"')
+    expect(row('unnamed')).not.toContain('activity-avatar')
+  })
+})
+
+describe('activityRowShowsPerson', () => {
+  const base: ActivityItem = {
+    id: 'x',
+    kind: 'follow',
+    filter: 'follows',
+    platform: 'twitch',
+    name: 'sam',
+    line: 'Followed',
+    short: 'Follow',
+    at: '2026-09-24T10:00:00Z'
+  }
+
+  it('is true for people and false for counts, announcements and destinations', () => {
+    expect(activityRowShowsPerson(base)).toBe(true)
+    expect(activityRowShowsPerson({ ...base, kind: 'raid' })).toBe(true)
+    expect(activityRowShowsPerson({ ...base, unnamed: true })).toBe(false)
+    expect(activityRowShowsPerson({ ...base, kind: 'announcement' })).toBe(false)
+    expect(activityRowShowsPerson({ ...base, kind: 'destination-failed' })).toBe(false)
+  })
+})
+
+// Plan 071, S2: the Twitch reconnect is one click from Activity.
+describe('ActivityPane Show who followed', () => {
+  const render = (audienceScopes: boolean, withAction: boolean) =>
+    renderToStaticMarkup(
+      createElement(ActivityPane, {
+        items: [],
+        providers: [provider('twitch')],
+        nowMs: Date.parse('2026-09-24T10:01:00Z'),
+        audience: {
+          sessionId: 's',
+          updatedAt: '2026-09-24T10:00:00Z',
+          platforms: [
+            { platform: 'twitch', metric: 'followers', capability: 'available', audienceScopes }
+          ]
+        },
+        ...(withAction ? { onShowFollowNames: () => undefined } : {})
+      })
+    )
+
+  it('offers the reconnect while Twitch lacks the follow permission', () => {
+    const markup = render(false, true)
+    expect(markup).toContain('data-slot="activity-follow-names"')
+    expect(markup).toContain('Twitch names each follower once you allow it.')
+    expect(markup).not.toContain('Livestream → Setup')
+  })
+
+  it('hides it once the permission is granted, or when the window cannot act', () => {
+    expect(render(true, true)).not.toContain('activity-follow-names')
+    expect(render(false, false)).not.toContain('activity-follow-names')
+  })
+})
+
+// Plan 071, S4: X names followers while its follow subscription is live.
+describe('activityCapabilityNote for X', () => {
+  const note = (namedFollowsSince?: string, namedFollowsUntil?: string) =>
+    activityCapabilityNote(['x'], {
+      sessionId: 's',
+      updatedAt: '2026-09-28T10:00:00Z',
+      platforms: [
+        {
+          platform: 'x',
+          metric: 'followers',
+          capability: 'available',
+          ...(namedFollowsSince ? { namedFollowsSince } : {}),
+          ...(namedFollowsUntil ? { namedFollowsUntil } : {})
+        }
+      ]
+    })
+
+  it('says follows are a count only while X is not naming them', () => {
+    expect(note()).toBe("X doesn't share tips. New X followers show as a count.")
+    expect(note('2026-09-28T10:00:00Z')).toBe("X doesn't share tips.")
+    expect(note('2026-09-28T10:00:00Z', '2026-09-28T10:30:00Z')).toBe(
+      "X doesn't share tips. New X followers show as a count."
+    )
   })
 })

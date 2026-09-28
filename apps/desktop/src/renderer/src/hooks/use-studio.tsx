@@ -6154,11 +6154,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         if (event.code === 'captions-srt-written' && event.sessionId) {
           transcriptWrittenSessionIdsRef.current.add(event.sessionId)
         }
-        if (
-          ['microphone-input-lost', 'microphone-timeline-lost', 'system-audio-lost'].includes(
-            event.code
-          )
-        ) {
+        // isSessionAudioLossCode lives in the lazy recovery chunk; this stays
+        // byte-cheap for the eager renderer budget.
+        if (/^(microphone-(input|timeline)|system-audio)-lost$/.test(event.code)) {
           void publishMicrophoneInputLost(event)
         } else {
           const qualityDedupeKey = event.sessionId ?? event.message

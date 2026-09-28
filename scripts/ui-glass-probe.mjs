@@ -22,9 +22,18 @@
 // is therefore measured unfocused, the state Chat and Captions live in during
 // a stream; the material is `visualEffectState: 'active'` either way.
 //
+// --surfaces adds the floating glass (plan 072) on main and chat: the real
+// `glass-float` utility painted over a text-free patch of the window and over
+// app text (sidebar rows, Stream Manager filters), scored by
+// scripts/lib/float-glass-checks.mjs (lift over the window glass, text
+// contrast, no bleed of the text underneath). The old near-opaque popover
+// coat is measured beside it as an ungated control, so the report shows the slab the
+// gate exists to catch. The primitives' use of the utility is pinned by the
+// renderer guard tests.
+//
 // Report mode prints every metric; --gate fails the run on any check.
 //
-//   node scripts/ui-glass-probe.mjs [--gate] [--themes=dark,light]
+//   node scripts/ui-glass-probe.mjs [--gate] [--surfaces] [--themes=dark,light]
 //     [--roles=main,chat,captions,notes,preview]
 //
 // Extra app env rides in VIDEORC_UI_GLASS_APP_ENV (JSON), e.g.
@@ -37,6 +46,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { launchDevApp } from './lib/app-launcher.mjs'
+import {
+  belowSheen,
+  centredRect,
+  evaluateFloatBleed,
+  evaluateFloatPatch,
+  FLOAT_GLASS_THRESHOLDS,
+  growRect
+} from './lib/float-glass-checks.mjs'
 import {
   colorDistance,
   contrastRatio,
@@ -113,11 +130,31 @@ const SET_BOUNDS_COMMAND = {
 }
 const PINNED_DARK_ROLES = new Set(['preview'])
 
+// Floating glass (--surfaces): the roles with a renderer page to paint on, the
+// backdrops each patch is shot over, and the pre-072 popover coat (the
+// control). A patch is a hover-card-sized sample inside the role's first
+// text-free window sample; the surface overhangs it by the blur reach.
+const SURFACE_ROLES = new Set(['main', 'chat'])
+const BACKDROPS = ['red', 'blue', 'white', 'black', 'text']
+const SURFACE_OVERHANG = 30
+// App text each role's bleed check hides: the sidebar rows (the selected
+// row's primary text among them) and the Stream Manager filter labels, the
+// white text a 97% coat still leaked on the owner's hover card.
+const TEXT_ROWS = {
+  main: 'aside a, aside button',
+  chat: '[data-slot="chat-filters"] button'
+}
+const OLD_POPOVER_COAT = {
+  dark: 'oklch(0.16 0.004 286 / 92%)',
+  light: 'oklch(0.99 0 0 / 92%)'
+}
+
 const argv = process.argv.slice(2)
 const flag = (name) => argv.includes(`--${name}`)
 const option = (name, fallback) =>
   argv.find((arg) => arg.startsWith(`--${name}=`))?.slice(name.length + 3) ?? fallback
 const gate = flag('gate')
+const surfaces = flag('surfaces')
 const themes = option('themes', 'dark,light').split(',')
 const roles = option('roles', 'main,chat,captions,notes,preview').split(',')
 const extraAppEnv = process.env.VIDEORC_UI_GLASS_APP_ENV
@@ -259,7 +296,7 @@ function measure(file, bounds, role) {
   })
 }
 
-async function shoot(smoke, theme, role, variant) {
+async function shoot(smoke, theme, role, variant, prefix = '') {
   await requestSmokeCommand(
     smoke,
     'open-backdrop-window',
@@ -268,7 +305,7 @@ async function shoot(smoke, theme, role, variant) {
   )
   const raised = await requestSmokeCommand(smoke, 'raise-window', { role, focus: false })
   await sleep(700)
-  return { raised, file: capture(raised.bounds, `${theme}-${role}-${variant}`) }
+  return { raised, file: capture(raised.bounds, `${prefix}${theme}-${role}-${variant}`) }
 }
 
 // Windows open asynchronously (the preview through its supervisor): wait for
@@ -300,6 +337,166 @@ async function placeOnPrimaryDisplay(smoke, role, index) {
     width,
     height
   })
+}
+
+// Paints a probe surface over `rect` (window points) in the role's page:
+// `float` is the real glass-float utility, `control` the old popover coat,
+// `leak` the utility at a 97% coat (the translucency that let white tab
+// labels read through the hover card before the coat went opaque).
+async function showSurface(devtoolsHost, role, bounds, rect, kind, theme) {
+  const target = await pageTarget(devtoolsHost, role)
+  if (!target) throw new Error(`No CDP target for ${role}; cannot paint a floating surface.`)
+  const spec = JSON.stringify({
+    rect,
+    boundsWidth: bounds.width,
+    kind,
+    coat: OLD_POPOVER_COAT[theme]
+  })
+  await cdpEvaluate(
+    target.webSocketDebuggerUrl,
+    `(() => {
+      const spec = ${spec};
+      document.getElementById('ui-glass-probe-surface')?.remove();
+      const scale = innerWidth / spec.boundsWidth;
+      const el = document.createElement('div');
+      el.id = 'ui-glass-probe-surface';
+      el.className = spec.kind === 'control' ? 'rounded-lg border' : 'rounded-lg border glass-float';
+      Object.assign(el.style, {
+        position: 'fixed', zIndex: '2147483647', pointerEvents: 'none',
+        left: spec.rect.x * scale + 'px', top: spec.rect.y * scale + 'px',
+        width: spec.rect.width * scale + 'px', height: spec.rect.height * scale + 'px'
+      });
+      if (spec.kind === 'control') el.style.backgroundColor = spec.coat;
+      if (spec.kind === 'leak') {
+        el.style.backgroundColor = 'color-mix(in oklch, var(--glass-float) 97%, transparent)';
+      }
+      document.body.appendChild(el);
+      return true;
+    })()`
+  )
+}
+
+async function hideSurface(devtoolsHost, role) {
+  const target = await pageTarget(devtoolsHost, role)
+  if (!target) return
+  await cdpEvaluate(
+    target.webSocketDebuggerUrl,
+    `(() => { document.getElementById('ui-glass-probe-surface')?.remove(); return true })()`
+  )
+}
+
+// The union of the role's first rows with text (TEXT_ROWS), in window points:
+// the app text a floating surface must hide. Null when the page has none.
+async function appTextRect(devtoolsHost, role, bounds) {
+  const target = await pageTarget(devtoolsHost, role)
+  const found = await cdpEvaluate(
+    target.webSocketDebuggerUrl,
+    `(() => {
+      const rows = Array.from(document.querySelectorAll(${JSON.stringify(TEXT_ROWS[role])}))
+        .filter((el) => {
+          const r = el.getBoundingClientRect();
+          return r.width > 30 && r.height > 12 && r.top > 30 && (el.textContent || '').trim().length > 2;
+        })
+        .slice(0, 3)
+        .map((el) => el.getBoundingClientRect());
+      if (!rows.length) return null;
+      const x = Math.min(...rows.map((r) => r.left));
+      const y = Math.min(...rows.map((r) => r.top));
+      return {
+        x, y,
+        width: Math.max(...rows.map((r) => r.right)) - x,
+        height: Math.max(...rows.map((r) => r.bottom)) - y,
+        innerWidth
+      };
+    })()`
+  )
+  if (!found) return null
+  const scale = bounds.width / found.innerWidth
+  return {
+    x: found.x * scale,
+    y: found.y * scale,
+    width: found.width * scale,
+    height: found.height * scale
+  }
+}
+
+function regionAt(file, bounds, rect) {
+  const image = decodePng(readFileSync(file))
+  const scale = image.width / bounds.width
+  const pixels = {
+    x: rect.x * scale,
+    y: rect.y * scale,
+    width: rect.width * scale,
+    height: rect.height * scale
+  }
+  return { mean: regionMean(image, pixels), sharpness: laplacianVariance(image, pixels) }
+}
+
+// Floating glass on one role: the patch over every backdrop without the
+// surface (the window shots already taken), with glass-float, and with the
+// old coat; then the bleed of the role's app text through it.
+async function measureSurfaces(smoke, devtoolsHost, theme, role, windowFiles, bounds) {
+  const results = []
+  const patch = centredRect(SAMPLES[role][0].rect(bounds), 160, 18)
+  const surfaceRect = growRect(patch, SURFACE_OVERHANG, bounds)
+  const windowMeans = Object.fromEntries(
+    BACKDROPS.map((variant) => [variant, regionAt(windowFiles[variant], bounds, patch).mean])
+  )
+  const means = {}
+  for (const kind of ['float', 'control']) {
+    await showSurface(devtoolsHost, role, bounds, surfaceRect, kind, theme)
+    means[kind] = {}
+    for (const variant of BACKDROPS) {
+      const { raised, file } = await shoot(smoke, theme, role, variant, `${kind}-`)
+      means[kind][variant] = regionAt(file, raised.bounds, patch).mean
+    }
+  }
+  const text = TEXT[theme]
+  const float = evaluateFloatPatch({ theme, windowMeans, surfaceMeans: means.float, text })
+  const control = evaluateFloatPatch({ theme, windowMeans, surfaceMeans: means.control, text })
+  results.push({
+    theme,
+    role,
+    sample: 'float-patch',
+    metrics: { ...float.metrics, controlLiftMin: control.metrics.liftMin },
+    checks: float.checks,
+    pass: float.pass
+  })
+
+  const textRect = await appTextRect(devtoolsHost, role, bounds)
+  if (textRect) {
+    await hideSurface(devtoolsHost, role)
+    const under = await shoot(smoke, theme, role, 'photo', 'bleed-under-')
+    const surfaceRect = growRect(textRect, SURFACE_OVERHANG, bounds)
+    const sample = belowSheen(textRect, surfaceRect)
+    await showSurface(devtoolsHost, role, bounds, surfaceRect, 'float', theme)
+    const through = await shoot(smoke, theme, role, 'photo', 'bleed-through-')
+    await showSurface(devtoolsHost, role, bounds, surfaceRect, 'leak', theme)
+    const leak = await shoot(smoke, theme, role, 'photo', 'bleed-leak-')
+    const bleed = evaluateFloatBleed({
+      sharpnessUnder: regionAt(under.file, under.raised.bounds, sample).sharpness,
+      sharpnessThrough: regionAt(through.file, through.raised.bounds, sample).sharpness
+    })
+    const leakSharpness = regionAt(leak.file, leak.raised.bounds, sample).sharpness
+    results.push({
+      theme,
+      role,
+      sample: 'float-bleed',
+      ...bleed,
+      metrics: { ...bleed.metrics, leakSharpnessThrough: round(leakSharpness) }
+    })
+  } else {
+    results.push({
+      theme,
+      role,
+      sample: 'float-bleed',
+      metrics: {},
+      checks: { textPresent: false },
+      pass: false
+    })
+  }
+  await hideSurface(devtoolsHost, role)
+  return results
 }
 
 function round(value, digits = 2) {
@@ -410,6 +607,7 @@ async function main() {
   const smoke = launched.connections['preview-motion-ready']
   const report = {
     thresholds: GLASS_THRESHOLDS,
+    floatThresholds: surfaces ? FLOAT_GLASS_THRESHOLDS : undefined,
     extraAppEnv,
     results: [],
     windowServerCpu: null
@@ -434,9 +632,13 @@ async function main() {
       for (const role of roles) {
         await assertTheme(devtoolsHost, theme)
         const shots = {}
-        for (const variant of ['red', 'blue', 'white', 'black', 'text']) {
+        const files = {}
+        let bounds = null
+        for (const variant of BACKDROPS) {
           const { raised, file } = await shoot(smoke, theme, role, variant)
           shots[variant] = measure(file, raised.bounds, role)
+          files[variant] = file
+          bounds = raised.bounds
         }
         await assertTheme(devtoolsHost, theme)
         const look = await shoot(smoke, theme, role, 'photo')
@@ -444,6 +646,22 @@ async function main() {
         const glassState = await requestSmokeCommand(smoke, 'window-glass-state', { role })
         const pageDark = await pageDarkClass(devtoolsHost, role)
         report.results.push(...evaluate(theme, role, shots, glassState, pageDark))
+        if (surfaces && SURFACE_ROLES.has(role)) {
+          report.results.push(
+            ...(await measureSurfaces(smoke, devtoolsHost, theme, role, files, bounds))
+          )
+          await showSurface(
+            devtoolsHost,
+            role,
+            bounds,
+            growRect(centredRect(SAMPLES[role][0].rect(bounds), 160, 18), 60, bounds),
+            'float',
+            theme
+          )
+          const surfaceLook = await shoot(smoke, theme, role, 'photo', 'float-look-')
+          looks.push({ file: surfaceLook.file, label: `${theme} · ${role} · glass-float` })
+          await hideSurface(devtoolsHost, role)
+        }
       }
     }
     await requestSmokeCommand(smoke, 'close-backdrop-window')

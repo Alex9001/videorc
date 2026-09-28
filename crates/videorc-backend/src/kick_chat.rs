@@ -203,6 +203,9 @@ struct RelayFollowPayload {
     follower_id: Option<String>,
     #[serde(default)]
     follower_username: Option<String>,
+    /// Added by the relay for plan 071; absent from older relays.
+    #[serde(default)]
+    follower_avatar_url: Option<String>,
 }
 
 // The relay's activity kinds (videorc-web `lib/kick-chat/webhook.ts`, plan
@@ -1360,13 +1363,15 @@ fn relay_event_to_message(
         "follow" => {
             let payload: RelayFollowPayload = serde_json::from_value(event.payload).ok()?;
             let mut message = base(non_empty(Some(event.message_id))?);
-            let name =
-                non_empty(payload.follower_username).unwrap_or_else(|| "Kick viewer".to_string());
+            let handle = non_empty(payload.follower_username);
+            let name = handle.clone().unwrap_or_else(|| "Kick viewer".to_string());
             message.author_id = non_empty(payload.follower_id);
+            message.author_avatar_url =
+                non_empty(payload.follower_avatar_url).filter(|url| url.starts_with("https://"));
             message.message_text = format!("{name} followed");
             message.author_name = name;
             message.event_type = LiveChatEventType::Follow;
-            message.details = Some(LiveChatEventDetails::Follow);
+            message.details = Some(LiveChatEventDetails::Follow { handle });
             message.raw_provider_type = Some("channel.followed".to_string());
             Some(message)
         }
@@ -1999,8 +2004,36 @@ mod tests {
         .unwrap();
         let message = relay_event_to_message(follow, "s1", None).unwrap();
         assert_eq!(message.event_type, LiveChatEventType::Follow);
-        assert_eq!(message.details, Some(LiveChatEventDetails::Follow));
+        assert_eq!(
+            message.details,
+            Some(LiveChatEventDetails::Follow {
+                handle: Some("fan".to_string())
+            })
+        );
         assert_eq!(message.author_name, "fan");
+        // An older relay sends no avatar: the row shows initials.
+        assert!(message.author_avatar_url.is_none());
+
+        // Plan 071, S3: the follower's avatar, https only.
+        for (avatar, expected) in [
+            (
+                "https://files.kick.com/images/user/fan.webp",
+                Some("https://files.kick.com/images/user/fan.webp"),
+            ),
+            ("http://files.kick.com/images/user/fan.webp", None),
+        ] {
+            let follow: RelayEvent = serde_json::from_value(json!({
+                "kind": "follow", "messageId": "f2",
+                "payload": {
+                    "followerId": "9",
+                    "followerUsername": "fan",
+                    "followerAvatarUrl": avatar
+                }
+            }))
+            .unwrap();
+            let message = relay_event_to_message(follow, "s1", None).unwrap();
+            assert_eq!(message.author_avatar_url.as_deref(), expected);
+        }
 
         for ignored in [
             json!({ "kind": "status", "messageId": "s", "payload": { "isLive": false } }),

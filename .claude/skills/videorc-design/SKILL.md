@@ -26,8 +26,10 @@ a screen ad hoc.
    component libraries and no hand-rolled widgets when a primitive exists.
 2. **Real glass, never fake glass.** The OS draws the blur. No CSS
    `backdrop-filter` / `backdrop-blur` anywhere in the renderer: it wedged the
-   compositor in June, and a guard test fails on it. No wallpaper underlays,
-   no inline `color-scheme` on the root.
+   compositor in June, and on the vibrancy windows it never reaches the screen
+   (Chromium's own capture shows the blur, the display does not; plan 072). A
+   guard test fails on it. No wallpaper underlays, no inline `color-scheme`
+   on the root.
 3. **Dark first, light supported.** Dark is the reference. Light is the same
    structure with the light token column, never a separately designed theme.
 4. **Colour is information.** Chrome is monochrome. Saturated colour appears
@@ -81,8 +83,12 @@ Coats and surfaces
   porcelain `oklch(0.985 0.001 286 / 60%)`.
 - Content coat `--glass-content`: 34% · 30% of the same base.
 - Solid `--glass-solid`: `#0D0D0F` · `#FAFAFB`.
-- Floating surfaces (`bg-popover`, `bg-card`): near-opaque, 92%. Only
-  dialogs, menus, selects, popovers, tooltips, toasts, and the palette float.
+- Floating glass `--glass-float`: black `oklch(0.275 0.004 286)` ·
+  porcelain `oklch(0.99 0 0)`, one raised step above the window glass as
+  measured (`probe:ui-glass --surfaces`), with the chip edge (rim, top
+  highlight, sheen). Opaque: without a frost, even 3% translucency lets
+  white text under a menu read through. Only dialogs, menus, selects,
+  popovers, hover cards, tooltips, toasts, and the palette float.
 
 Text (three tiers, nothing else)
 
@@ -202,10 +208,14 @@ made it chat first: one thin stats bar and fewer words.
 - **Chat keeps the big-text rows** (plan 055, decision 5), virtualized with
   `@tanstack/react-virtual`. While live, a row's time appears on hover.
   Filters are inline chips from 640 px and one Filters menu below it.
-- **Activity rows** use the platform tile with the event glyph (the
-  window-scoped registry `components/stream-manager/activity-icons.tsx`), the
-  name and a short fact on one line ("Resub · 14 months"), the viewer's
-  words, and a ⋯ menu. Filter chips carry their counts.
+- **Activity rows** lead with who: a row about one named person (a follow,
+  sub, gift, tip or raid) shows their avatar circle, with initials until it
+  loads (plan 071). Counts the platform never named, announcements and
+  destinations keep the event glyph tile (the window-scoped registry
+  `components/stream-manager/activity-icons.tsx`). Either way the platform
+  icon sits bottom-right. Then comes the name and a short fact on one line
+  ("Resub · 14 months"), the viewer's words, and a ⋯ menu. Filter chips carry
+  their counts.
 - **Proof.** `pnpm probe:comments-window` sweeps 320/480/640/800/1040/1280.
   It fails on any overflow, a stats bar taller than one row, main stats
   apart or clipped, a stat cut at the bar's edge, a hidden viewer count, a
@@ -215,7 +225,8 @@ made it chat first: one thin stats bar and fewer words.
 
 The command palette alone keeps the Raycast scale:
 
-- `rounded-panel` glass on `bg-popover`.
+- `rounded-panel` float glass (the Dialog's `glass-float`; `Command` itself
+  paints nothing).
 - An 18–20 px borderless search input with a leading 24 px icon.
 - 40 px rows: icon, title, secondary context, an optional alias key chip,
   then right-aligned metadata.
@@ -256,8 +267,13 @@ once in `styles.css`.
 
 ## Floating surfaces
 
-Dialogs, popovers, menus, selects, tooltips, toasts, and the palette are
-near-opaque `bg-popover` surfaces with one soft shadow and a hairline ring.
+Dialogs, popovers, hover cards, menus, selects, tooltips, toasts, and the
+palette are raised pieces of the window glass: `border glass-float` (plan
+072). One surface per float: a `Command` inside a Dialog or Popover stays
+transparent. A toast with a type tints the glass edge
+(`tone-* glass-float-tinted`) and keeps monochrome text. Never `bg-popover`:
+a guard test fails on it, so a fresh shadcn add must be moved onto the
+utility.
 
 - Dialogs: 12 px radius, `p-5`.
 - Menus, selects, and popovers: 10 px radius. Menu items are 28 px with a
@@ -277,8 +293,9 @@ near-opaque `bg-popover` surfaces with one soft shadow and a hairline ring.
 - Editable fields get the native context menu (Cut, Copy, Paste, Select All,
   spelling), which main builds on `context-menu` (`main/context-menu.ts`).
   Notes has none: a popup menu is not capture-protected.
-- `renderer-style-guards.test.ts` fails on backdrop blur, `cursor-pointer`,
-  or a colour literal outside its short content allowlist.
+- `renderer-style-guards.test.ts` fails on backdrop blur outside
+  `glass-float`, `bg-popover`, `cursor-pointer`, or a colour literal outside
+  its short content allowlist.
 - macOS overlay scrollbars: no custom scrollbar recipe. Radix `ScrollArea`
   uses `type="scroll"`.
 - Rows highlight instantly. No `cursor-pointer`: desktop controls use the
@@ -355,8 +372,8 @@ confirming a routine interaction the user just watched succeed.
 | Shortcut hints            | `Kbd`                                           |
 | Dividers                  | `Separator` or a `border-border` hairline       |
 | Scroll regions            | `PaneBody` or `ScrollArea type="scroll"`        |
-| Menus / popovers          | `DropdownMenu` / `Popover` on `bg-popover`      |
-| Toasts                    | sonner on the same popover tokens               |
+| Menus / popovers          | `DropdownMenu` / `Popover` on `glass-float`     |
+| Toasts                    | sonner on `glass-float`, tinted by type         |
 
 Missing a primitive? Install it through the shadcn CLI (see the shadcn skill);
 do not hand-roll it.
@@ -369,6 +386,6 @@ do not hand-roll it.
 - DO use one shared row component for every icon + title + meta list.
 - DON'T put cards on cards, shadows inside a window, or `rounded-panel`
   boxes around page content.
-- DON'T use `backdrop-filter`, `cursor-pointer`, raw colour literals, or
-  ad-hoc radii and pills.
+- DON'T use `backdrop-filter` outside `glass-float`, `bg-popover`,
+  `cursor-pointer`, raw colour literals, or ad-hoc radii and pills.
 - DON'T add a font, a component library, or a direct icon-package import.
