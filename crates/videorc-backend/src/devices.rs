@@ -357,6 +357,46 @@ enum SystemAudioSupport {
     UnsupportedPlatform,
 }
 
+/// WASAPI process loopback (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`)
+/// shipped in Windows build 20348; every Windows 11 build (22000+) has it.
+#[cfg(any(windows, test))]
+const WINDOWS_PROCESS_LOOPBACK_MIN_BUILD: u32 = 20_348;
+
+/// Product gate for Windows system audio (plan 069). The producer exists
+/// (S8a, `system_audio_capture_windows.rs`), but sessions do not route it
+/// into the bus until S8b; until then the row stays Unavailable (hidden), so
+/// the switch never promises audio a session would drop. S8b flips this.
+#[cfg(any(windows, test))]
+const WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED: bool = false;
+
+/// The Windows probe: Ready when the OS build supports process loopback and
+/// sessions can use it. No grant exists to miss; loopback needs none.
+#[cfg(any(windows, test))]
+fn windows_system_audio_support(build: Option<u32>, sessions_wired: bool) -> SystemAudioSupport {
+    let loopback_supported = build.is_some_and(|build| build >= WINDOWS_PROCESS_LOOPBACK_MIN_BUILD);
+    if sessions_wired && loopback_supported {
+        SystemAudioSupport::Ready
+    } else {
+        SystemAudioSupport::UnsupportedPlatform
+    }
+}
+
+/// The real OS build number. `RtlGetVersion` is not subject to the
+/// manifest-based version lie `GetVersionEx` tells unmanifested binaries.
+#[cfg(windows)]
+fn windows_os_build_number() -> Option<u32> {
+    use windows::Wdk::System::SystemServices::RtlGetVersion;
+    use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a valid, sized OSVERSIONINFOW out pointer.
+    let status = unsafe { RtlGetVersion(&mut info) };
+    status.is_ok().then_some(info.dwBuildNumber)
+}
+
 fn system_audio_support() -> SystemAudioSupport {
     #[cfg(target_os = "macos")]
     {
@@ -369,7 +409,14 @@ fn system_audio_support() -> SystemAudioSupport {
             SystemAudioSupport::ScreenRecordingPermissionMissing
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        windows_system_audio_support(
+            windows_os_build_number(),
+            WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED,
+        )
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         SystemAudioSupport::UnsupportedPlatform
     }
@@ -1345,6 +1392,40 @@ mod tests {
     }
 
     #[test]
+    fn windows_system_audio_is_ready_only_on_loopback_builds_once_sessions_are_wired() {
+        // Windows 11 (22000+) and Server 2022 (20348) support process loopback.
+        for build in [20_348, 22_000, 22_631, 26_100] {
+            assert_eq!(
+                windows_system_audio_support(Some(build), true),
+                SystemAudioSupport::Ready,
+                "build {build}"
+            );
+            assert_eq!(
+                system_audio_device_for(windows_system_audio_support(Some(build), true)).status,
+                DeviceStatus::Available
+            );
+        }
+        // Older Windows 10, or an unreadable build: hidden, never a grant ask.
+        for build in [None, Some(19_045), Some(20_347)] {
+            assert_eq!(
+                windows_system_audio_support(build, true),
+                SystemAudioSupport::UnsupportedPlatform,
+                "build {build:?}"
+            );
+        }
+        // Until S8b wires sessions, every build reports Unavailable (S8b
+        // flips the gate and this expectation together).
+        assert_eq!(
+            system_audio_device_for(windows_system_audio_support(
+                Some(26_100),
+                WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED
+            ))
+            .status,
+            DeviceStatus::Unavailable
+        );
+    }
+
+    #[test]
     fn system_audio_device_status_comes_from_the_platform_probe() {
         let device = system_audio_device();
         assert_eq!(device.id, "system-audio:default");
@@ -1357,6 +1438,8 @@ mod tests {
             ),
             "macOS reports the Screen Recording preflight, never a permanent Unavailable: {device:?}"
         );
+        // Windows stays Unavailable until S8b sets
+        // WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED; Linux is out of scope.
         #[cfg(not(target_os = "macos"))]
         assert_eq!(device.status, DeviceStatus::Unavailable);
     }
