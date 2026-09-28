@@ -5277,16 +5277,42 @@ mod mix_tests {
         use std::io::Read;
         let (progress_tx, progress_rx) = tokio::sync::watch::channel(0_usize);
         let reader = thread::spawn(move || {
+            // Opening blocks until the bus connects its writer.
             let mut file = std::fs::File::open(path).unwrap();
+            // A blocking read was seen to miss the writer's close on a macOS
+            // FIFO (no writer left anywhere, read still parked) and hang the
+            // suite. Read non-blocking and treat a long silence as the end:
+            // the bus writes a chunk every 10 ms while it runs.
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let fd = file.as_raw_fd();
+                // SAFETY: fcntl on a descriptor this thread owns.
+                unsafe {
+                    let flags = libc::fcntl(fd, libc::F_GETFL);
+                    assert!(flags >= 0, "F_GETFL failed");
+                    assert!(libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0);
+                }
+            }
+            const IDLE_END: Duration = Duration::from_secs(10);
             let mut bytes = Vec::new();
             let mut buffer = vec![0_u8; 64 * 1024];
+            let mut last_data = Instant::now();
             loop {
                 match file.read(&mut buffer) {
                     Ok(0) => return bytes,
                     Ok(count) => {
                         bytes.extend_from_slice(&buffer[..count]);
                         progress_tx.send_replace(bytes.len() / 8);
+                        last_data = Instant::now();
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if last_data.elapsed() >= IDLE_END {
+                            return bytes;
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) => panic!("{error}"),
                 }
             }
