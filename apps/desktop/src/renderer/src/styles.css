@@ -23,8 +23,9 @@
  *
  * Token contract: reach for these utilities, not raw values:
  *   Coats      bg-glass-window (body) · bg-glass-content (content panes) ·
- *              bg-popover / bg-card (near-opaque floating surfaces only).
- *              Never stack a third coat, never backdrop-filter.
+ *              glass-float (every floating surface: menus, popovers, hover
+ *              cards, tooltips, dialogs, toasts; plan 072). Never stack a
+ *              third coat, never backdrop-filter.
  *   Text tiers text-foreground (primary) · text-muted-foreground (secondary) ·
  *              text-subtle (tertiary). Three tiers, nothing else.
  *   Radius     rounded-panel (12px: containers, dialogs) · rounded-row (8px:
@@ -56,7 +57,9 @@
   --foreground: oklch(0.17 0.004 286);
   --card: oklch(0.99 0 0 / 92%);
   --card-foreground: oklch(0.17 0.004 286);
-  --popover: oklch(0.99 0 0 / 92%);
+  /* Floating surfaces paint glass-float; the token follows it so a stray
+     bg-popover (a fresh shadcn add) still lands on the glass tone. */
+  --popover: var(--glass-float);
   --popover-foreground: oklch(0.17 0.004 286);
 
   /* Monochrome action: ink on porcelain. */
@@ -118,6 +121,19 @@
   --glass-content: oklch(0.985 0.001 286 / 30%);
   --glass-solid: oklch(0.985 0.001 286);
 
+  /* Floating glass (plan 072): menus, popovers, hover cards, tooltips,
+     dialogs and toasts are raised pieces of the window glass: an opaque coat
+     in the window's measured tone plus the chip edge (a rim, a top highlight
+     and a sheen). It cannot frost what it floats over: CSS backdrop-filter
+     paints in Chromium's own capture but never reaches the screen on the
+     vibrancy windows (plan 072 S0). Without a frost any translucency only
+     leaks: at 97% the white tab labels under a hover card still read. */
+  --glass-float: oklch(0.99 0 0);
+  --glass-float-sheen: oklch(1 0 0 / 50%);
+  --glass-float-rim: oklch(0 0 0 / 10%);
+  --glass-float-highlight: oklch(1 0 0 / 85%);
+  --glass-float-drop: 0 12px 36px oklch(0 0 0 / 14%), 0 1px 3px oklch(0 0 0 / 8%);
+
   /* Glass chips (plan 050, D9): the porcelain twin of the dark chip glass. */
   --chip-fill-top: oklch(1 0 0 / 70%);
   --chip-fill-bottom: oklch(1 0 0 / 45%);
@@ -161,7 +177,7 @@
   --foreground: oklch(0.97 0.001 286);
   --card: oklch(0.16 0.004 286 / 92%);
   --card-foreground: oklch(0.97 0.001 286);
-  --popover: oklch(0.16 0.004 286 / 92%);
+  --popover: var(--glass-float);
   --popover-foreground: oklch(0.97 0.001 286);
 
   /* Monochrome action: chrome on black. */
@@ -216,6 +232,15 @@
   --glass-content: oklch(0.13 0.003 286 / 34%);
   --glass-solid: oklch(0.13 0.003 286);
 
+  /* Dark floating glass: the window glass measures L 0.19–0.26 over the
+     probe backdrops, so the float sits just above it: a raised step, never
+     the black hole the old 0.16 popover coat made in it. */
+  --glass-float: oklch(0.275 0.004 286);
+  --glass-float-sheen: oklch(1 0 0 / 6%);
+  --glass-float-rim: oklch(1 0 0 / 13%);
+  --glass-float-highlight: oklch(1 0 0 / 10%);
+  --glass-float-drop: 0 14px 44px oklch(0 0 0 / 50%), 0 1px 3px oklch(0 0 0 / 30%);
+
   /* Glass chips (plan 050, D9): white 10% to 3.5% with a 13% rim, a 12% top
      highlight and a soft drop. Emphasis chips tint the same glass with their
      tone; the status dot glows in it. */
@@ -265,6 +290,7 @@
     --input: oklch(0 0 0 / 28%);
     --muted-foreground: oklch(0.38 0.006 286);
     --glass-window: oklch(0.985 0.001 286 / 75%);
+    --glass-float-rim: oklch(0 0 0 / 24%);
     --chip-rim: oklch(0 0 0 / 24%);
     --keycap-rim: oklch(0 0 0 / 28%);
   }
@@ -274,6 +300,7 @@
     --input: oklch(1 0 0 / 24%);
     --muted-foreground: oklch(0.8 0.01 286);
     --glass-window: oklch(0.13 0.003 286 / 60%);
+    --glass-float-rim: oklch(1 0 0 / 30%);
     --chip-rim: oklch(1 0 0 / 30%);
     --keycap-rim: oklch(1 0 0 / 30%);
   }
@@ -414,6 +441,37 @@
   color: color-mix(in oklch, var(--chip-tone) var(--chip-tint-ink), var(--chip-tint-ink-base));
 }
 
+/*
+ * Floating glass (plan 072): the one surface for menus, popovers, hover cards,
+ * tooltips, dialogs and toasts. A raised piece of the window glass: the float
+ * coat in the window's tone, and the chip edge: a 1 px rim (the element
+ * brings the `border` width), a top highlight and a sheen fading down the
+ * first third. Never backdrop-filter (it never reaches the screen on the
+ * vibrancy windows) and never nest one inside another: the inner surface
+ * (Command in a Dialog) stays transparent.
+ */
+@utility glass-float {
+  border-color: var(--glass-float-edge, var(--glass-float-rim));
+  background-color: var(--glass-float);
+  background-image: linear-gradient(
+    to bottom,
+    var(--glass-float-tint, var(--glass-float-sheen)),
+    transparent 35%
+  );
+  box-shadow:
+    inset 0 1px 0 var(--glass-float-highlight),
+    var(--glass-float-drop);
+}
+
+/* A floating surface that carries news in a tone (a failed or successful
+   toast): the rim and the sheen take the --chip-tone (the tone-* utilities),
+   the text stays monochrome. It only feeds glass-float's variables, so the
+   two never fight over a property. */
+@utility glass-float-tinted {
+  --glass-float-edge: color-mix(in oklch, var(--chip-tone) var(--chip-tint-rim), transparent);
+  --glass-float-tint: color-mix(in oklch, var(--chip-tone) var(--chip-tint-top), transparent);
+}
+
 /* The status dot: the tone, a 2 px halo at 22% and an 8 px glow. */
 @utility glass-dot {
   background-color: var(--chip-tone, var(--muted-foreground));
@@ -460,6 +518,57 @@
 @utility tone-neutral {
   --chip-tone: var(--muted-foreground);
   --chip-dot-glow: 0%;
+}
+
+/*
+ * Toasts (plan 072): sonner injects its own unlayered CSS at runtime, so this
+ * block is unlayered too and outranks sonner's selectors by specificity (the
+ * :root prefix). Every toast is the float glass. `richColors` would paint
+ * solid green and red slabs; its colours point at the glass instead, the
+ * text stays monochrome, and a typed toast carries its tone in the icon and
+ * a tinted rim and sheen (glass-float-tinted).
+ */
+:root [data-sonner-toaster][data-sonner-theme] {
+  --normal-bg: var(--glass-float);
+  --normal-border: var(--glass-float-rim);
+  --normal-text: var(--popover-foreground);
+  --border-radius: var(--radius);
+  --success-bg: var(--glass-float);
+  --success-border: var(--glass-float-rim);
+  --success-text: var(--popover-foreground);
+  --error-bg: var(--glass-float);
+  --error-border: var(--glass-float-rim);
+  --error-text: var(--popover-foreground);
+  --warning-bg: var(--glass-float);
+  --warning-border: var(--glass-float-rim);
+  --warning-text: var(--popover-foreground);
+  --info-bg: var(--glass-float);
+  --info-border: var(--glass-float-rim);
+  --info-text: var(--popover-foreground);
+}
+
+:root [data-sonner-toaster] [data-sonner-toast][data-styled='true'] {
+  @apply glass-float;
+}
+
+:root [data-sonner-toaster] [data-sonner-toast][data-type='success'] {
+  @apply tone-success glass-float-tinted;
+}
+
+:root [data-sonner-toaster] [data-sonner-toast][data-type='error'] {
+  @apply tone-destructive glass-float-tinted;
+}
+
+:root [data-sonner-toaster] [data-sonner-toast][data-type='warning'] {
+  @apply tone-warning glass-float-tinted;
+}
+
+:root [data-sonner-toaster] [data-sonner-toast][data-type='info'] {
+  @apply tone-info glass-float-tinted;
+}
+
+:root [data-sonner-toaster] [data-sonner-toast][data-type] [data-icon] {
+  color: var(--chip-tone);
 }
 
 @layer components {

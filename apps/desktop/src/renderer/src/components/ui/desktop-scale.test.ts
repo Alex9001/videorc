@@ -58,17 +58,29 @@ describe('desktop scale', () => {
     expect(markup).not.toMatch(/data-active:/)
   })
 
-  it('keeps floating surfaces on the popover tokens, never an inverted pill', () => {
+  it('puts every floating surface on the float glass, never an inverted pill', () => {
     const tooltip = read('tooltip.tsx')
-    expect(tooltip).toContain('bg-popover')
     expect(tooltip).not.toContain('bg-foreground')
     expect(tooltip).toContain('delayDuration = 600')
-    for (const name of ['dropdown-menu.tsx', 'select.tsx', 'popover.tsx']) {
+    // Plan 072: one surface for everything that floats. The old near-opaque
+    // popover coat read as a black slab on the plan 050 window glass.
+    for (const name of [
+      'tooltip.tsx',
+      'hover-card.tsx',
+      'popover.tsx',
+      'dropdown-menu.tsx',
+      'context-menu.tsx',
+      'select.tsx',
+      'chart.tsx'
+    ]) {
       const source = read(name)
-      expect(source).toContain('rounded-lg bg-popover')
-      expect(source).not.toMatch(/rounded-(2xl|3xl)/)
+      expect(source, name).toMatch(/rounded-(md|lg|xl) border glass-float/)
+      expect(source, name).not.toContain('bg-popover')
+      expect(source, name).not.toMatch(/rounded-(2xl|3xl)/)
     }
-    expect(read('dialog.tsx')).toContain('rounded-panel bg-popover p-5')
+    expect(read('dialog.tsx')).toContain('rounded-panel border glass-float p-5')
+    // Command always sits inside a Dialog or Popover: it never paints a coat.
+    expect(read('command.tsx')).not.toMatch(/\bbg-(popover|card|background)\b/)
   })
 
   it('mounts the tooltip provider with the desktop delay', () => {

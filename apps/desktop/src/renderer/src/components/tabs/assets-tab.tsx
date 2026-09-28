@@ -399,7 +399,7 @@ function PresetTile({
           {active ? <BackgroundStylePopover asset={asset} name={name} onStyle={onStyle} /> : null}
           <KebabMenu
             label={`Actions for ${name}`}
-            className="bg-popover"
+            className="border glass-float"
             items={[
               { id: 'rename', label: 'Rename', icon: EditIcon, onSelect: onStartRename },
               {
@@ -487,7 +487,7 @@ function BackgroundStylePopover({
       <PopoverTrigger asChild>
         <Button
           aria-label={`Adjust style for ${name}`}
-          className="bg-popover"
+          className="border glass-float"
           size="icon-sm"
           title="Adjust style"
           variant="ghost"
