@@ -15578,7 +15578,11 @@ mod tests {
                     .presentation_at()
                     .expect("recording frame carries its presentation time");
                 assert!(presented_at >= content_at);
-                let epoch = crate::encoder_bridge::recording_epoch(frame.captured_at, presented_at);
+                let epoch = crate::encoder_bridge::recording_epoch(
+                    frame.captured_at,
+                    presented_at,
+                    Duration::from_secs_f64(1.0 / f64::from(video.fps)),
+                );
                 // Both inputs deliver current audio from the moment Record starts.
                 let started = Instant::now();
                 for (microphone, system) in [(true, false), (false, true), (true, true)] {
@@ -15600,6 +15604,10 @@ mod tests {
                             .unwrap_or_else(|| panic!("{case}: no audible output {audio:?}"));
                         // Audible within 150 ms of the file start, then continuous.
                         assert!(first < 7_200, "{case}: {audio:?}");
+                        // Held pixels are current: no pre-roll beyond half a tick.
+                        if age_ms >= 500 {
+                            assert!(first < 2_400, "{case}: {audio:?}");
+                        }
                         assert!(
                             audio.audible_frames + 480 >= audio.rendered_frames - first,
                             "{case}: {audio:?}"

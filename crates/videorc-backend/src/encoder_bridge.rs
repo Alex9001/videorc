@@ -4004,7 +4004,7 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
                     .as_ref()
                     .and_then(|frame| frame.frame.metadata.presentation_at())
                     .unwrap_or(fed_at);
-                let epoch = recording_epoch(captured_at, presented_at);
+                let epoch = recording_epoch(captured_at, presented_at, frame_interval);
                 if video_epoch.set(epoch).is_ok() {
                     tracing::info!(
                         source_age_ms = frame_age_ms,
@@ -6911,13 +6911,23 @@ const RECORDING_EPOCH_MAX_SOURCE_LATENCY: Duration = Duration::from_millis(100);
 /// Audio sample zero: the capture time of the content shown at video PTS zero.
 /// Live content keeps its source-to-presentation latency, so A/V alignment is
 /// unchanged. An unchanged screen reuses pixels captured seconds ago, but they
-/// are still current when presented, so their age is bounded, not trusted.
-/// An epoch seconds old maps every current audio sample far ahead of the bus
-/// cursor, where the timeline drops it (plan 070).
-pub(crate) fn recording_epoch(content_captured_at: Instant, presented_at: Instant) -> Instant {
+/// are still current when presented: the epoch is the capture time a change
+/// would have had, half a tick before presentation on average. Trusting the
+/// held age maps every current audio sample seconds ahead of the bus cursor,
+/// where the timeline drops it (plan 070).
+pub(crate) fn recording_epoch(
+    content_captured_at: Instant,
+    presented_at: Instant,
+    frame_interval: Duration,
+) -> Instant {
+    if presented_at.saturating_duration_since(content_captured_at)
+        <= RECORDING_EPOCH_MAX_SOURCE_LATENCY
+    {
+        return content_captured_at;
+    }
     presented_at
-        .checked_sub(RECORDING_EPOCH_MAX_SOURCE_LATENCY)
-        .map_or(content_captured_at, |floor| content_captured_at.max(floor))
+        .checked_sub(frame_interval / 2)
+        .unwrap_or(presented_at)
 }
 
 fn latest_compositor_frame(
@@ -10680,24 +10690,31 @@ mod tests {
     }
 
     #[test]
-    fn recording_epoch_keeps_live_latency_and_bounds_held_content() {
+    fn recording_epoch_keeps_live_latency_and_presents_held_content_as_current() {
         let presented = Instant::now();
+        let tick = Duration::from_secs_f64(1.0 / 30.0);
         // Live camera/screen content: the calibrated capture-time epoch stands.
-        for latency_ms in [0, 40, 72, 100] {
+        for latency_ms in [0, 16, 40, 72, 100] {
             let content = presented - Duration::from_millis(latency_ms);
-            assert_eq!(recording_epoch(content, presented), content);
+            assert_eq!(recording_epoch(content, presented, tick), content);
         }
-        // Held static pixels: the epoch is never older than the bound.
+        // Held static pixels: current at presentation, as a change would be
+        // after waiting half a tick. 8,849 ms is the 0.9.119 incident's age.
         for age_ms in [101, 2_000, 8_849, 30_000] {
             let content = presented - Duration::from_millis(age_ms);
             assert_eq!(
-                recording_epoch(content, presented),
-                presented - RECORDING_EPOCH_MAX_SOURCE_LATENCY
+                recording_epoch(content, presented, tick),
+                presented - tick / 2
             );
         }
+        let tick_60 = Duration::from_secs_f64(1.0 / 60.0);
+        assert_eq!(
+            recording_epoch(presented - Duration::from_secs(9), presented, tick_60),
+            presented - tick_60 / 2
+        );
         // A frame stamped after its composition start is not moved earlier.
         let later = presented + Duration::from_millis(3);
-        assert_eq!(recording_epoch(later, presented), later);
+        assert_eq!(recording_epoch(later, presented, tick), later);
     }
 
     #[test]
