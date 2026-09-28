@@ -210,7 +210,7 @@ export interface RendererDiagnosticsSnapshot {
   runtimeInfo?: RuntimeInfo
 }
 
-export type AudioTrackSource = 'microphone' | 'test-tone'
+export type AudioTrackSource = 'microphone' | 'test-tone' | 'system-audio'
 
 export type RecordingContainer = 'none' | 'mkv' | 'flv' | 'tee'
 export type RecordingFinalizationState = 'none' | 'finalizing' | 'finalized' | 'failed'
@@ -245,6 +245,9 @@ export interface AudioTrack {
   id: string
   label: string
   source: AudioTrackSource
+  /** Sources currently summed into this one mixed track (plan 069). Absent
+   * for a track that carries only its `source`. */
+  mixSources?: AudioTrackSource[]
 }
 
 export interface BackendLogEvent {
@@ -1387,12 +1390,26 @@ export interface AudioSettings {
   microphoneMuted: boolean
   microphoneSyncOffsetMs: number
   microphoneSyncOffsetUserSet?: boolean
+  /** System audio On/Off (plan 069). Off, the default, means not captured. */
+  systemAudioEnabled: boolean
+  /** System audio level in dB, within SYSTEM_AUDIO_GAIN_DB_MIN..MAX. */
+  systemAudioGainDb: number
 }
+
+/** System audio level range and default (plan 069 decision 7); mirrors
+ * `SYSTEM_AUDIO_GAIN_DB_*` in the Rust protocol. */
+export const SYSTEM_AUDIO_GAIN_DB_MIN = -24
+export const SYSTEM_AUDIO_GAIN_DB_MAX = 12
+export const SYSTEM_AUDIO_GAIN_DB_DEFAULT = -6
 
 export interface AudioProcessingUpdateParams {
   sessionId: string
   microphoneGainDb: number
   microphoneMuted: boolean
+  /** Live System audio On/Off. Omitted means unchanged. */
+  systemAudioEnabled?: boolean
+  /** Live System audio level in dB. Omitted means unchanged. */
+  systemAudioGainDb?: number
 }
 
 export interface AudioProcessingUpdateResult extends AudioProcessingUpdateParams {
@@ -2823,6 +2840,15 @@ export interface DiagnosticStats {
    * frames; absent when no session is live. Drives the Studio mixer. */
   micLiveLevel?: number
   micLivePeakDb?: number
+  /** System audio live meter (0-1, dB-scaled); absent while no system source
+   * is attached (plan 069). */
+  systemAudioLiveLevel?: number | null
+  systemAudioLivePeakDb?: number | null
+  systemAudioCapturedFrames?: number | null
+  /** True while a system audio source is attached to the session audio bus. */
+  systemAudioActive?: boolean | null
+  /** Samples the mix limiter pulled under its ceiling this session. */
+  audioMixClippedSamples?: number | null
   deviceDisconnected: boolean
   backendRssBytes?: number
   activeFfmpegProcesses: number
@@ -3722,6 +3748,8 @@ export interface GlobalShortcutsConfig {
   recordToggle?: string
   streamToggle?: string
   micToggle?: string
+  /** Turn system audio on/off (plan 069 S6). Unbound by default. */
+  systemAudioToggle?: string
   /** Mark a clip at the current moment (plan 068 D6). Unbound by default. */
   clipMark?: string
 }

@@ -339,6 +339,10 @@ impl AudioCaptureStats {
         self.dropped_frames.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn generated_frames(&self) -> u64 {
+        self.generated_frames.load(Ordering::Relaxed)
+    }
+
     pub fn live_peak(&self) -> f32 {
         self.live_peak_milli.load(Ordering::Relaxed) as f32 / 1000.0
     }
@@ -1070,7 +1074,7 @@ fn fake_pcm_frames(frame_count: usize, chunk_frames: usize, frequency_hz: f32) -
     frames
 }
 
-fn db_to_gain(db: f32) -> f32 {
+pub(crate) fn db_to_gain(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
 }
 

@@ -154,6 +154,7 @@ mod tests {
             id: "microphone".to_string(),
             label: "Microphone".to_string(),
             source: AudioTrackSource::Microphone,
+            mix_sources: Vec::new(),
         }
     }
 

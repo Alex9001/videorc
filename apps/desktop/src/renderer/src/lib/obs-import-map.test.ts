@@ -259,19 +259,62 @@ describe('mapping table rows', () => {
     expect(result.stream).toMatchObject({ kind: 'oauth-suggest', platform: 'twitch' })
   })
 
-  it('browser/text/media sources are skipped with human reasons; desktop audio names the roadmap', () => {
+  it('browser/text/media sources are skipped with human reasons', () => {
     const browser = { name: 'Chat overlay', kind: 'browser' as const, obsKind: 'browser_source' }
     const result = mapObsSetup(
       setupFrom({
         sources: [display, browser],
-        scenes: [{ name: 'S', current: true, items: [item('Screen'), item('Chat overlay')] }],
-        hasDesktopAudio: true
+        scenes: [{ name: 'S', current: true, items: [item('Screen'), item('Chat overlay')] }]
       }),
       DEVICES
     )
     const skipped = reportNotes(result, 'skipped').join('\n')
     expect(skipped).toContain('Chat overlay: Videorc has no browser source')
-    expect(skipped).toContain('Desktop audio')
+    expect(skipped).not.toContain('Desktop audio')
+    expect(result.audio.systemAudioEnabled).toBeUndefined()
+  })
+
+  it('desktop audio turns System audio on where this computer can capture it (plan 069)', () => {
+    const systemAudio = (status: Device['status']): Device => ({
+      ...device('system-audio', 'system-audio:default', 'System audio'),
+      status
+    })
+    const setup = setupFrom({
+      sources: [display],
+      scenes: [{ name: 'S', current: true, items: [item('Screen')] }],
+      hasDesktopAudio: true
+    })
+
+    const on = mapObsSetup(setup, [...DEVICES, systemAudio('available')])
+    expect(on.audio.systemAudioEnabled).toBe(true)
+    expect(reportNotes(on, 'imported')).toContain('Desktop audio: → System audio (on)')
+
+    const needsPermission = mapObsSetup(setup, [...DEVICES, systemAudio('permission-required')])
+    expect(needsPermission.audio.systemAudioEnabled).toBe(true)
+    expect(reportNotes(needsPermission, 'approximated')).toContain(
+      'Desktop audio: → System audio (on) once Screen Recording is allowed'
+    )
+
+    // Unsupported here (Windows before S8, Linux): nothing turns on, and the
+    // report says so instead of promising a roadmap.
+    for (const devices of [DEVICES, [...DEVICES, systemAudio('unavailable')]]) {
+      const skipped = mapObsSetup(setup, devices)
+      expect(skipped.audio.systemAudioEnabled).toBeUndefined()
+      expect(reportNotes(skipped, 'skipped')).toContain(
+        'Desktop audio: this computer cannot capture system audio yet'
+      )
+    }
+    expect(JSON.stringify(on.report)).not.toContain('roadmap')
+  })
+
+  it('reads an unmuted OBS Desktop Audio as on and a muted one as off', () => {
+    const collection = (desktop: unknown): string =>
+      JSON.stringify({ name: 'C', sources: [], DesktopAudioDevice1: desktop })
+    expect(parseSceneCollection(collection({ name: 'Desktop Audio' })).hasDesktopAudio).toBe(true)
+    expect(
+      parseSceneCollection(collection({ name: 'Desktop Audio', muted: true })).hasDesktopAudio
+    ).toBe(false)
+    expect(parseSceneCollection(collection(undefined)).hasDesktopAudio).toBe(false)
   })
 
   it('an image source becomes the background; extra images are skipped', () => {

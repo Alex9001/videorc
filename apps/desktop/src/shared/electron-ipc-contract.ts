@@ -1,3 +1,4 @@
+import { isGlobalShortcutConfigKey } from './global-shortcut-bindings'
 import { GLOBAL_SHORTCUT_ACTIONS, type GlobalShortcutAction } from './global-shortcuts'
 import type {
   AccountCallbackEnvelope,
@@ -528,11 +529,7 @@ const globalShortcutsSchema = runtimeSchema<GlobalShortcutsConfig>(
           stringSchema({ maxLength: 160 }).parse(accelerator, `${path}.layouts.${id}`)
         }
       } else {
-        if (
-          !['recordToggle', 'streamToggle', 'micToggle', 'layoutNext', 'layoutPrevious'].includes(
-            key
-          )
-        )
+        if (!isGlobalShortcutConfigKey(key))
           throw new RuntimeSchemaError(path, 'a known shortcut action')
         optionalSchema(stringSchema({ maxLength: 160 })).parse(entry, `${path}.${key}`)
       }

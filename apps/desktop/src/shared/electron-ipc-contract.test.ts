@@ -1,3 +1,4 @@
+import { withGlobalShortcut } from './global-shortcut-bindings'
 import { GLOBAL_SHORTCUT_ACTIONS } from './global-shortcuts'
 import { readFileSync } from 'node:fs'
 
@@ -548,5 +549,23 @@ describe('global layout shortcut IPC', () => {
         { layoutNext: 'Control+Alt+N', layouts: { 'camera-only': 'Control+Alt+C' } }
       ])
     ).not.toThrow()
+  })
+
+  it('admits every single-action binding the Settings recorder can write', () => {
+    // A hand-kept key list once missed clipMark (plan 068), which rejected the
+    // whole config and dropped every global shortcut with it.
+    for (const action of GLOBAL_SHORTCUT_ACTIONS) {
+      expect(() =>
+        validateElectronInvokeArgs('global-shortcuts:set', [
+          withGlobalShortcut({}, action, 'Control+Alt+S')
+        ])
+      ).not.toThrow()
+    }
+    expect(() =>
+      validateElectronInvokeArgs('global-shortcuts:set', [{ systemAudioToggle: 'Control+Alt+S' }])
+    ).not.toThrow()
+    expect(() =>
+      validateElectronInvokeArgs('global-shortcuts:set', [{ systemAudioMute: 'Control+Alt+S' }])
+    ).toThrow()
   })
 })

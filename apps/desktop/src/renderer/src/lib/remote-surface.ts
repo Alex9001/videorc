@@ -1,4 +1,5 @@
-import type { LayoutPreset } from '@/lib/backend'
+import type { DeviceStatus, LayoutPreset } from '@/lib/backend'
+import { systemAudioTarget } from '@/lib/system-audio'
 
 /** The state projection deck keys render. Minimal by design and the ONLY
  * payload remote sockets receive — never widen it with tokens/paths/URLs. */
@@ -15,6 +16,12 @@ export interface RemoteSurfaceState {
     comments: boolean
     preview: boolean
   }
+  /** Plan 069: whether the session mixes system audio (confirmed, else the
+   * request while idle or unreported). Always false when not available. */
+  systemAudioOn: boolean
+  /** The device can run: present, supported, and granted. Only a boolean —
+   * never the device name or the permission state's detail. */
+  systemAudioAvailable: boolean
 }
 
 export interface RemoteSurfaceDescribe {
@@ -40,7 +47,9 @@ export type RemoteSurfaceValues = readonly [
   commentsOpen: boolean,
   previewOpen: boolean,
   layoutPresets: readonly LayoutPreset[],
-  takeovers: { id: string; name: string }[]
+  takeovers: { id: string; name: string }[],
+  systemAudioStatus: DeviceStatus | undefined,
+  systemAudioShown: boolean
 ]
 
 function snapshotFromValues(values: RemoteSurfaceValues): RemoteSurfaceSnapshot {
@@ -53,7 +62,9 @@ function snapshotFromValues(values: RemoteSurfaceValues): RemoteSurfaceSnapshot 
       micMuted: values[4],
       layoutPreset: values[5],
       activeTakeoverId: values[6],
-      windows: { notes: values[7], comments: values[8], preview: values[9] }
+      windows: { notes: values[7], comments: values[8], preview: values[9] },
+      systemAudioOn: values[12] === 'available' && values[13],
+      systemAudioAvailable: values[12] === 'available'
     },
     describe: {
       layoutPresets: values[10],
@@ -74,6 +85,12 @@ export interface RemoteIntentContext {
   startSession: () => Promise<boolean>
   stopSession: () => Promise<boolean>
   setMicrophoneMuted: (mode: 'mute' | 'unmute' | 'toggle') => Promise<boolean>
+  /** Plan 069 S6: the system-audio device status and the state the remotes
+   * are shown (`systemAudioOn` before the availability mask). */
+  systemAudio: readonly [status: DeviceStatus | undefined, shown: boolean]
+  /** Sets captureConfig.audio.systemAudioEnabled, exactly as the switch does;
+   * a live session picks it up through the latest-wins audio update. */
+  setSystemAudioEnabled: (enabled: boolean) => void
   knownLayoutPresets: readonly LayoutPreset[]
   applyLayoutPreset: (layoutPreset: LayoutPreset) => Promise<boolean>
   hasTakeover: (assetId: string) => boolean
@@ -263,6 +280,25 @@ export async function executeRemoteIntent(
         if (!applied) {
           return void (await ack(false, 'The microphone change was not applied.'))
         }
+        return void (await ack(true))
+      }
+      case 'systemAudioOn':
+      case 'systemAudioOff':
+      case 'systemAudioToggle': {
+        const [status, shown] = context.systemAudio
+        const target = systemAudioTarget(
+          intent.kind === 'systemAudioToggle'
+            ? 'toggle'
+            : intent.kind === 'systemAudioOn'
+              ? 'on'
+              : 'off',
+          status,
+          shown
+        )
+        if (target === null) return void (await ack(false, 'System audio is not available.'))
+        // Accepted = requested. The key renders the confirmed mix from
+        // remote.state, which follows once the session reports it.
+        context.setSystemAudioEnabled(target)
         return void (await ack(true))
       }
       case 'sceneApply': {

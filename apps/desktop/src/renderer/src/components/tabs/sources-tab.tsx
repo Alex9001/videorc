@@ -1,6 +1,7 @@
 import {
   CameraIcon,
   CheckIcon,
+  DesktopIcon,
   DisplayIcon,
   ResetIcon,
   SpeakerOffIcon,
@@ -23,6 +24,7 @@ import { Badge } from '@/components/ui/badge'
 import { PowerSlider } from '@/components/power-slider'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
+import { useWorkspaceNav } from '@/components/workspace-nav'
 import { useStudioCore, useStudioDiagnostics, useStudioPreview } from '@/hooks/use-studio'
 import { cameraFormatShortfall, cameraFormatShortfallMessage } from '@/lib/camera-format-shortfall'
 import {
@@ -40,8 +42,19 @@ import {
   resetAudioSyncCalibration,
   type AudioSyncRecommendationReport
 } from '@/lib/capture'
-import type { SourceSelection } from '@/lib/backend'
+import {
+  SYSTEM_AUDIO_GAIN_DB_DEFAULT,
+  SYSTEM_AUDIO_GAIN_DB_MAX,
+  SYSTEM_AUDIO_GAIN_DB_MIN,
+  type SourceSelection
+} from '@/lib/backend'
 import { systemAccessAction, systemAccessRows } from '@/lib/system-access'
+import {
+  systemAudioDevice,
+  systemAudioIssueCopy,
+  systemAudioSwitchView,
+  type SystemAudioSwitchView
+} from '@/lib/system-audio'
 
 // Live chip for a capture source (UI rewrite V3): what the preview pipeline says
 // about the source RIGHT NOW. A live source whose newest frame is old is reported
@@ -117,8 +130,11 @@ export function SourcesTab(): ReactElement {
     revealPermissionTarget,
     runtimeInfo,
     mediaAccess,
-    wsStatus
+    wsStatus,
+    systemAudioConfirmed,
+    systemAudioIssue
   } = useStudioCore()
+  const { openSettings } = useWorkspaceNav()
   const { previewCameraStatus, previewScreenStatus } = useStudioPreview()
   const { diagnosticStats } = useStudioDiagnostics()
   // Q6 (plan 022): explicit select states while device discovery is pending.
@@ -156,6 +172,13 @@ export function SourcesTab(): ReactElement {
   const [refreshing, setRefreshing] = useState(false)
   const syncMeasurementInputRef = useRef<HTMLInputElement | null>(null)
   const syncCalibration = audioSyncCalibrationState(syncRecommendation, captureConfig.audio)
+  const systemAudio = systemAudioSwitchView({
+    device: systemAudioDevice(deviceList),
+    requested: captureConfig.audio.systemAudioEnabled,
+    sessionActive: isSessionActive,
+    confirmed: systemAudioConfirmed,
+    issue: systemAudioIssue
+  })
 
   const selectedCaptureId = captureConfig.sources.screenId ?? captureConfig.sources.windowId
 
@@ -400,7 +423,7 @@ export function SourcesTab(): ReactElement {
       <PanelSection
         description="Live input meter with manual source gain. No automatic processing is applied."
         icon={WaveformIcon}
-        title="Microphone mixer"
+        title="Audio mixer"
       >
         <SourceSelect
           allowNone
@@ -551,7 +574,100 @@ export function SourcesTab(): ReactElement {
             </div>
           </div>
         </div>
+        {systemAudio.visible ? (
+          <SystemAudioSettings
+            gainDb={captureConfig.audio.systemAudioGainDb}
+            macOS={runtimeInfo?.platform === 'darwin'}
+            view={systemAudio}
+            onEnabledChange={(systemAudioEnabled) =>
+              setCaptureConfig((current) => ({
+                ...current,
+                audio: { ...current.audio, systemAudioEnabled }
+              }))
+            }
+            onGainChange={(systemAudioGainDb) =>
+              setCaptureConfig((current) => ({
+                ...current,
+                audio: { ...current.audio, systemAudioGainDb }
+              }))
+            }
+            onOpenPermissions={() => openSettings('permissions')}
+          />
+        ) : null}
       </PanelSection>
     </PageStack>
+  )
+}
+
+/** System audio (plan 069): the switch, its level, and the one fact people need. */
+export function SystemAudioSettings({
+  view,
+  gainDb,
+  macOS,
+  onEnabledChange,
+  onGainChange,
+  onOpenPermissions
+}: {
+  view: SystemAudioSwitchView
+  gainDb: number
+  macOS: boolean
+  onEnabledChange: (enabled: boolean) => void
+  onGainChange: (gainDb: number) => void
+  onOpenPermissions: () => void
+}): ReactElement {
+  return (
+    <div
+      className="grid gap-2 rounded-row border border-border bg-foreground/[0.03] px-3 py-2"
+      data-videorc-system-audio-settings
+    >
+      <div className="flex items-center justify-between gap-3">
+        <span className="flex min-w-0 items-center gap-2 text-sm font-medium">
+          <DesktopIcon className="size-4 shrink-0 text-muted-foreground" weight="duotone" />
+          <span className="truncate">System audio</span>
+        </span>
+        <span className="flex shrink-0 items-center gap-2.5">
+          {view.permissionRequired ? null : (
+            <span className="text-xs text-muted-foreground">{view.stateLabel}</span>
+          )}
+          <Switch
+            aria-label="System audio"
+            checked={view.checked}
+            disabled={view.disabled}
+            size="sm"
+            onCheckedChange={onEnabledChange}
+          />
+        </span>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Everything your computer plays, except Videorc. Use headphones so your mic doesn't pick it
+        up twice.{macOS ? " Your Mac's volume and mute don't change what's recorded." : null}
+      </p>
+      <PowerSlider
+        bipolar
+        defaultValue={SYSTEM_AUDIO_GAIN_DB_DEFAULT}
+        disabled={view.permissionRequired}
+        label="Level"
+        max={SYSTEM_AUDIO_GAIN_DB_MAX}
+        min={SYSTEM_AUDIO_GAIN_DB_MIN}
+        numericInput
+        suffix=" dB"
+        value={gainDb}
+        onChange={onGainChange}
+      />
+      {view.permissionRequired || view.issue === 'unavailable' ? (
+        <div className="flex items-center justify-between gap-2 text-xs text-warning">
+          <span className="min-w-0">
+            {view.permissionRequired
+              ? 'Needs Screen Recording permission'
+              : systemAudioIssueCopy('unavailable')}
+          </span>
+          <Button className="shrink-0" size="xs" variant="ghost" onClick={onOpenPermissions}>
+            Open Settings
+          </Button>
+        </div>
+      ) : view.issue === 'lost' ? (
+        <span className="text-xs text-warning">{systemAudioIssueCopy('lost')}</span>
+      ) : null}
+    </div>
   )
 }

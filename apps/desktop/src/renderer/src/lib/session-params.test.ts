@@ -56,6 +56,29 @@ describe('buildStartSessionParams', () => {
     })
   })
 
+  it('passes the system audio switch and level through on session.start', () => {
+    const settings = { outputDirectory: '', keepOriginalRecording: false }
+    const off = buildStartSessionParams({ captureConfig: captureConfig(), scene, settings })
+    expect(off.audio).toMatchObject({ systemAudioEnabled: false, systemAudioGainDb: -6 })
+
+    const on = buildStartSessionParams({
+      captureConfig: captureConfig({
+        audio: {
+          ...defaultCaptureConfig.audio,
+          systemAudioEnabled: true,
+          systemAudioGainDb: -12
+        }
+      }),
+      scene,
+      settings
+    })
+    expect(on.audio).toStrictEqual({
+      ...defaultCaptureConfig.audio,
+      systemAudioEnabled: true,
+      systemAudioGainDb: -12
+    })
+  })
+
   it('omits the derived scene unless scene edit mode is active', () => {
     const params = buildStartSessionParams({
       captureConfig: captureConfig(),

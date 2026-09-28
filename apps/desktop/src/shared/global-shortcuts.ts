@@ -4,6 +4,7 @@ export const GLOBAL_SHORTCUT_ACTIONS = [
   'record-toggle',
   'stream-toggle',
   'mic-toggle',
+  'system-audio-toggle',
   'clip-mark',
   'layout-next',
   'layout-previous',
@@ -20,6 +21,7 @@ export function globalShortcutEntries(
     ['record-toggle', config.recordToggle],
     ['stream-toggle', config.streamToggle],
     ['mic-toggle', config.micToggle],
+    ['system-audio-toggle', config.systemAudioToggle],
     ['clip-mark', config.clipMark],
     ['layout-next', config.layoutNext],
     ['layout-previous', config.layoutPrevious],
@@ -48,29 +50,4 @@ export function nextEligibleLayout(
     if (eligible.includes(candidate)) return candidate
   }
   return null
-}
-
-const ACTION_CONFIG_KEYS = {
-  'record-toggle': 'recordToggle',
-  'stream-toggle': 'streamToggle',
-  'mic-toggle': 'micToggle',
-  'clip-mark': 'clipMark',
-  'layout-next': 'layoutNext',
-  'layout-previous': 'layoutPrevious'
-} as const satisfies Partial<Record<GlobalShortcutAction, keyof GlobalShortcutsConfig>>
-
-/** The config with one action's binding replaced ('' releases it). */
-export function withGlobalShortcut(
-  config: GlobalShortcutsConfig | undefined,
-  action: GlobalShortcutAction,
-  accelerator: string
-): GlobalShortcutsConfig {
-  const layout = globalShortcutLayout(action)
-  if (layout) {
-    return { ...config, layouts: { ...config?.layouts, [layout]: accelerator } }
-  }
-  return {
-    ...config,
-    [ACTION_CONFIG_KEYS[action as keyof typeof ACTION_CONFIG_KEYS]]: accelerator
-  }
 }

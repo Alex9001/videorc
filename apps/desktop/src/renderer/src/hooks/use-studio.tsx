@@ -414,7 +414,14 @@ import { effectiveSceneBackground, removeSlotAsset } from '@/lib/background-asse
 import { useBackgroundAssets } from '@/hooks/use-background-assets'
 import { findDevice, isActiveRecordingState, mergeStreamHealth } from '@/lib/format'
 import {
+  confirmedSystemAudioMix,
+  systemAudioIssueFromHealthEvent,
+  type SystemAudioIssue
+} from '@/lib/system-audio-session'
+import {
   activeAudioProcessingUpdateParams,
+  systemAudioProcessingDelta,
+  type LiveSystemAudioValues,
   LatestWinsLiveAudioProcessingQueue,
   liveAudioProcessingSessionSyncDecision,
   rejectedLiveAudioProcessingUpdate,
@@ -1298,6 +1305,11 @@ export type StudioContextValue = {
   outputEnabled: boolean
   streamReady: boolean
   isSessionActive: boolean
+  /** Whether the active session mixes system audio, from `recording.status`
+   * `mixSources` (plan 069); null until the backend reports it. */
+  systemAudioConfirmed: boolean | null
+  /** The newest system-audio health issue for the active session. */
+  systemAudioIssue: SystemAudioIssue | null
   startBlockedReason: string | null
   canStart: boolean
   canStop: boolean
@@ -1987,6 +1999,13 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const [recording, setRecording] = useState<RecordingStatus>({ state: 'idle', message: 'Ready.' })
   const [logs, setLogs] = useState<BackendLogEvent[]>([])
   const [healthEvents, setHealthEvents] = useState<HealthEvent[]>([])
+  // Plan 069: the newest system-audio health issue, kept apart from the
+  // bounded event list so a long session cannot scroll it away.
+  const [systemAudioIssueEvent, setSystemAudioIssueEvent] = useState<{
+    sessionId: string
+    issue: SystemAudioIssue
+  } | null>(null)
+  const [systemAudioRetry, retrySystemAudio] = useState(0)
   const [streamHealth, setStreamHealth] = useState<StreamHealth | null>(null)
   const [streamTargets, setStreamTargets] = useState<StreamTargetRuntime[]>([])
   const [diagnosticStats, setDiagnosticStats] = useState<DiagnosticStats>(idleDiagnosticStats)
@@ -3085,6 +3104,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     token: object
     sessionId: string
     lastApplied: LiveAudioProcessingValues
+    /** System audio as last sent to this session (start request or update);
+     * null until known, and again after an update the session did not apply,
+     * so it is sent again. Confirmation comes from `recording.status`. */
+    systemAudioSent: LiveSystemAudioValues | null
     authoritative: boolean
     disabled: boolean
     queue: LatestWinsLiveAudioProcessingQueue
@@ -6063,6 +6086,14 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         bootstrapGuard.mark('sessions')
         const event = payload as HealthEvent
         setHealthEvents((current) => [event, ...current].slice(0, 40))
+        const systemAudioIssue = systemAudioIssueFromHealthEvent(event)
+        const systemAudioIssueSessionId = event.sessionId ?? recordingRef.current.sessionId
+        if (systemAudioIssue && systemAudioIssueSessionId) {
+          setSystemAudioIssueEvent({
+            sessionId: systemAudioIssueSessionId,
+            issue: systemAudioIssue
+          })
+        }
         if (event.sessionId) {
           if (sessionDetailRequestRef.current.isActive(event.sessionId)) {
             const liveEntries = sessionDetailLiveEntriesRef.current.get(event.sessionId) ?? {
@@ -9475,6 +9506,37 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     : { allowed: true as const }
   const isSessionActive =
     isActiveRecordingState(recording.state) || startRequestPending || stopRequestPending
+  const mixingSessionActive =
+    ['recording', 'streaming'].includes(recording.state) && Boolean(recording.sessionId)
+  const systemAudioConfirmed = mixingSessionActive
+    ? confirmedSystemAudioMix(recording.audioTracks)
+    : null
+  const systemAudioIssue =
+    mixingSessionActive &&
+    systemAudioIssueEvent &&
+    systemAudioIssueEvent.sessionId === recording.sessionId
+      ? systemAudioIssueEvent.issue
+      : null
+  // Plan 069 S6: what the shortcut and the remotes act on — the device status
+  // and the state the switch shows (the confirmed mix, else the request).
+  const systemAudioStatus = deviceList.devices.find(
+    (device) => device.kind === 'system-audio'
+  )?.status
+  // With an issue the switch stays as the user set it, so a toggle turns it
+  // Off (PR #477 review).
+  const systemAudioShown =
+    (systemAudioIssue ? null : systemAudioConfirmed) ?? captureConfig.audio.systemAudioEnabled
+  // A shortcut or remote request is sent even when it repeats the last one:
+  // the retry after a failed start or a lost update.
+  const setSystemAudioEnabled = (systemAudioEnabled: boolean): void => {
+    if (liveAudioProcessingSyncRef.current)
+      liveAudioProcessingSyncRef.current.systemAudioSent = null
+    retrySystemAudio((count) => count + 1)
+    setCaptureConfig((current) => ({
+      ...current,
+      audio: { ...current.audio, systemAudioEnabled }
+    }))
+  }
 
   const currentStreamOutputTopologyRequest = useMemo(
     () =>
@@ -9716,6 +9778,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             )
             return true
           }
+          // Not applied: send the system audio fields again (PR #477 review).
+          latest.systemAudioSent = null
           if (validResult?.reasonCode === 'session-ended') {
             failLiveMicrophoneWaiters(requested.sessionId)
             return false
@@ -9793,6 +9857,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
         token,
         sessionId: params.sessionId,
         lastApplied: syncDecision.lastApplied,
+        systemAudioSent:
+          startSnapshot?.sessionId === params.sessionId
+            ? (startSnapshot.systemAudio ?? null)
+            : null,
         authoritative: startSnapshot?.sessionId === params.sessionId,
         disabled: false,
         queue
@@ -9830,20 +9898,39 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       return
     }
 
+    // System audio rides the same latest-wins queue, carrying only the fields
+    // this session does not already hold (plan 069): a mic edit never re-sends
+    // the switch, and a switch flip never needs a mic change.
+    // The deps below hold the same values; the ref only avoids a dep on the
+    // whole audio object.
+    const systemAudio = captureConfigRef.current.audio
+    const systemAudioDelta = systemAudioProcessingDelta(systemAudio, sync.systemAudioSent)
+    const systemAudioChanged = Object.keys(systemAudioDelta).length > 0
     const desiredMatchesLastApplied =
       params.microphoneGainDb === sync.lastApplied.microphoneGainDb &&
       params.microphoneMuted === sync.lastApplied.microphoneMuted
-    if (!enqueueDesiredForNewSync && !sync.queue.hasOutstandingWork && desiredMatchesLastApplied) {
+    if (
+      !enqueueDesiredForNewSync &&
+      !sync.queue.hasOutstandingWork &&
+      desiredMatchesLastApplied &&
+      !systemAudioChanged
+    ) {
       return
     }
 
-    sync.queue.enqueue(params)
+    // A new switch state supersedes the last issue (PR #477 review).
+    if (systemAudioDelta.systemAudioEnabled !== undefined) setSystemAudioIssueEvent(null)
+    sync.systemAudioSent = systemAudio
+    sync.queue.enqueue({ ...params, ...systemAudioDelta })
   }, [
     client,
     recording.sessionId,
     recording.state,
     captureConfig.audio.microphoneGainDb,
     captureConfig.audio.microphoneMuted,
+    captureConfig.audio.systemAudioEnabled,
+    captureConfig.audio.systemAudioGainDb,
+    systemAudioRetry,
     commitLiveAudioProcessingApplied,
     failLiveMicrophoneWaiters,
     reportError,
@@ -11867,7 +11954,11 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           const startAudioSnapshot = nextSessionParams.audio
             ? {
                 microphoneGainDb: nextSessionParams.audio.microphoneGainDb,
-                microphoneMuted: nextSessionParams.audio.microphoneMuted
+                microphoneMuted: nextSessionParams.audio.microphoneMuted,
+                systemAudio: {
+                  systemAudioEnabled: nextSessionParams.audio.systemAudioEnabled,
+                  systemAudioGainDb: nextSessionParams.audio.systemAudioGainDb
+                }
               }
             : null
           liveAudioProcessingStartSnapshotRef.current = null
@@ -13823,6 +13914,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       startSession,
       stopSession,
       setMicrophoneMuted: requestRemoteMicrophoneMute,
+      systemAudio: [systemAudioStatus, systemAudioShown],
+      setSystemAudioEnabled,
       knownLayoutPresets,
       applyLayoutPreset: (layoutPreset) => requestCameraPresetTransaction({ layoutPreset }),
       hasTakeover: (assetId) => screens.some((screen) => screen.id === assetId),
@@ -13931,7 +14024,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     commentsWindow.open,
     previewWindow.open,
     [...HORIZONTAL_LAYOUT_PRESETS, ...VERTICAL_LAYOUT_PRESETS],
-    screens.map((screen) => ({ id: screen.id, name: screen.name }))
+    screens.map((screen) => ({ id: screen.id, name: screen.name })),
+    systemAudioStatus,
+    systemAudioShown
   ]
   // Latest-value hand-off (same render-body pattern as the ref mirrors
   // above): the publisher dedupes, debounces past the commit, republishes on
@@ -14100,7 +14195,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       },
       markClip: () => {
         void markClip()
-      }
+      },
+      systemAudio: [systemAudioStatus, systemAudioShown],
+      setSystemAudioEnabled
     }
     if (action.startsWith('layout')) return context.switchLayout?.(action)
     void import('@/lib/global-shortcuts')
@@ -14469,6 +14566,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       outputEnabled,
       streamReady,
       isSessionActive,
+      systemAudioConfirmed,
+      systemAudioIssue,
       startBlockedReason,
       canStart,
       canStop,
@@ -14696,6 +14795,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       outputEnabled,
       streamReady,
       isSessionActive,
+      systemAudioConfirmed,
+      systemAudioIssue,
       startBlockedReason,
       canStart,
       canStop,

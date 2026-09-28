@@ -7,8 +7,13 @@ import type {
 
 export type LiveAudioProcessingValues = Pick<AudioSettings, 'microphoneGainDb' | 'microphoneMuted'>
 
+/** The system-audio switch and level (plan 069), sent only when they change. */
+export type LiveSystemAudioValues = Pick<AudioSettings, 'systemAudioEnabled' | 'systemAudioGainDb'>
+
 export interface LiveAudioProcessingSessionStartSnapshot extends LiveAudioProcessingValues {
   sessionId: string
+  /** What `session.start` sent for system audio; absent when it sent none. */
+  systemAudio?: LiveSystemAudioValues
 }
 
 export interface LiveAudioProcessingSessionSyncDecision {
@@ -58,9 +63,14 @@ export class LatestWinsLiveAudioProcessingQueue {
 
   enqueue(params: AudioProcessingUpdateParams): void {
     if (this.stopped || params.sessionId !== this.sessionId) return
-    if (sameAudioProcessingParams(params, this.pending ?? this.inFlight)) return
+    // The mic fields are always a complete state; the optional system-audio
+    // fields mean "unchanged" when omitted. Fold a newer request into the one
+    // still waiting so a system-audio edit is never lost to a later mic-only
+    // edit (and the reverse): newest value per field wins.
+    const next = this.pending ? mergeAudioProcessingParams(this.pending, params) : params
+    if (sameAudioProcessingParams(next, this.pending ?? this.inFlight)) return
 
-    this.pending = params
+    this.pending = next
     if (!this.drainPromise) {
       this.drainPromise = this.drain().finally(() => {
         this.drainPromise = null
@@ -99,6 +109,32 @@ export class LatestWinsLiveAudioProcessingQueue {
   }
 }
 
+const OPTIONAL_AUDIO_PROCESSING_FIELDS = ['systemAudioEnabled', 'systemAudioGainDb'] as const
+
+/**
+ * Newest value per field wins. Optional fields the newer request omits keep
+ * the older request's value, and stay omitted when neither request set them.
+ */
+export function mergeAudioProcessingParams(
+  older: AudioProcessingUpdateParams,
+  newer: AudioProcessingUpdateParams
+): AudioProcessingUpdateParams {
+  const merged: AudioProcessingUpdateParams = {
+    sessionId: newer.sessionId,
+    microphoneGainDb: newer.microphoneGainDb,
+    microphoneMuted: newer.microphoneMuted
+  }
+  const systemAudioEnabled = newer.systemAudioEnabled ?? older.systemAudioEnabled
+  if (systemAudioEnabled !== undefined) merged.systemAudioEnabled = systemAudioEnabled
+  const systemAudioGainDb = newer.systemAudioGainDb ?? older.systemAudioGainDb
+  if (systemAudioGainDb !== undefined) merged.systemAudioGainDb = systemAudioGainDb
+  return merged
+}
+
+/**
+ * True when sending `left` after `right` would change nothing: same session,
+ * same mic state, and every optional field `left` sets already matches.
+ */
 function sameAudioProcessingParams(
   left: AudioProcessingUpdateParams,
   right: AudioProcessingUpdateParams | null
@@ -107,7 +143,10 @@ function sameAudioProcessingParams(
     right !== null &&
     left.sessionId === right.sessionId &&
     left.microphoneGainDb === right.microphoneGainDb &&
-    left.microphoneMuted === right.microphoneMuted
+    left.microphoneMuted === right.microphoneMuted &&
+    OPTIONAL_AUDIO_PROCESSING_FIELDS.every(
+      (field) => left[field] === undefined || left[field] === right[field]
+    )
   )
 }
 
@@ -128,6 +167,26 @@ export function activeAudioProcessingUpdateParams(
     microphoneGainDb: audio.microphoneGainDb,
     microphoneMuted: audio.microphoneMuted
   }
+}
+
+/**
+ * The system-audio fields a live update must carry: only those the session
+ * does not already hold. `known` is what the session was last sent (its start
+ * request, then each queued update); null means unknown, so both are sent.
+ * An empty result means the system audio state is already in step.
+ */
+export function systemAudioProcessingDelta(
+  desired: LiveSystemAudioValues,
+  known: LiveSystemAudioValues | null
+): Partial<LiveSystemAudioValues> {
+  const delta: Partial<LiveSystemAudioValues> = {}
+  if (known?.systemAudioEnabled !== desired.systemAudioEnabled) {
+    delta.systemAudioEnabled = desired.systemAudioEnabled
+  }
+  if (known?.systemAudioGainDb !== desired.systemAudioGainDb) {
+    delta.systemAudioGainDb = desired.systemAudioGainDb
+  }
+  return delta
 }
 
 /**

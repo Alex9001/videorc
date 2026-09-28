@@ -54,6 +54,7 @@ interface HighRiskContractFixtures {
     wire: RecordingStatus
     minimalWire: RecordingStatus
     minimalNormalized: RecordingStatus
+    mixedAudioWire: RecordingStatus
   }
   compositorStatus: { stoppedWire: CompositorStatus }
   account: {
@@ -144,6 +145,11 @@ describe('shared high-risk protocol fixture', () => {
     expect(
       jsonShape(validateBackendRpcResult('recording.status', fixtures.recordingStatus.minimalWire))
     ).toEqual(fixtures.recordingStatus.minimalNormalized)
+    // Plan 069: the one mixed track names its sources; an unmixed track omits them.
+    const mixed = fixtures.recordingStatus.mixedAudioWire
+    expect(jsonShape(validateBackendRpcResult('recording.status', mixed))).toEqual(mixed)
+    expect(mixed.audioTracks?.[0]?.mixSources).toEqual(['microphone', 'system-audio'])
+    expect(fixtures.recordingStatus.wire.audioTracks?.[0]).not.toHaveProperty('mixSources')
   })
 
   it('accepts the Rust stopped compositor wire shape without nullable metrics', () => {

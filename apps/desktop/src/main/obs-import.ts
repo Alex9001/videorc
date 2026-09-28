@@ -214,8 +214,14 @@ export function parseSceneCollection(json: string): {
       typeof auxDevice === 'string' && auxDevice && auxDevice !== 'default'
         ? String(aux?.name ?? 'Mic/Aux')
         : undefined,
-    hasDesktopAudio: Boolean(doc.DesktopAudioDevice1)
+    // Plan 069: OBS's global Desktop Audio becomes Videorc's System audio. A
+    // muted one was not being recorded, so it imports as Off.
+    hasDesktopAudio: desktopAudioActive(doc.DesktopAudioDevice1 as RawObsSource | undefined)
   }
+}
+
+function desktopAudioActive(raw: RawObsSource | undefined): boolean {
+  return Boolean(raw) && raw?.muted !== true
 }
 
 export function parseService(json: string): (ObsStreamService & { key?: string }) | undefined {

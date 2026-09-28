@@ -348,6 +348,11 @@ pub struct AudioTrack {
     pub id: String,
     pub label: String,
     pub source: AudioTrackSource,
+    /// The sources currently summed into this one mixed track (plan 069: one
+    /// mixed track everywhere). Empty, and omitted on the wire, for a track
+    /// that carries only its `source`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mix_sources: Vec<AudioTrackSource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -355,6 +360,8 @@ pub struct AudioTrack {
 pub enum AudioTrackSource {
     Microphone,
     TestTone,
+    /// Everything the computer plays, except Videorc itself (plan 069).
+    SystemAudio,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1183,6 +1190,13 @@ pub struct AudioSettings {
     pub microphone_muted: bool,
     #[serde(default = "default_microphone_sync_offset_ms")]
     pub microphone_sync_offset_ms: i32,
+    /// System audio On/Off (plan 069). Off, the default, means not captured at
+    /// all. Older clients omit the key and get Off.
+    #[serde(default)]
+    pub system_audio_enabled: bool,
+    /// System audio level in dB, within `SYSTEM_AUDIO_GAIN_DB_MIN..=MAX`.
+    #[serde(default = "default_system_audio_gain_db")]
+    pub system_audio_gain_db: f32,
 }
 
 impl Default for AudioSettings {
@@ -1191,7 +1205,34 @@ impl Default for AudioSettings {
             microphone_gain_db: 0.0,
             microphone_muted: false,
             microphone_sync_offset_ms: default_microphone_sync_offset_ms(),
+            system_audio_enabled: false,
+            system_audio_gain_db: default_system_audio_gain_db(),
         }
+    }
+}
+
+/// System audio level range and default (plan 069 decision 7). Games and music
+/// are mastered near 0 dBFS and voice sits around -18, so -6 keeps the voice on
+/// top. Mirrored in `apps/desktop/src/shared/backend.ts`. The range is read by
+/// the session audio bus once it mixes a system source (plan 069 S2/S4).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SYSTEM_AUDIO_GAIN_DB_MIN: f32 = -24.0;
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SYSTEM_AUDIO_GAIN_DB_MAX: f32 = 12.0;
+pub const SYSTEM_AUDIO_GAIN_DB_DEFAULT: f32 = -6.0;
+
+fn default_system_audio_gain_db() -> f32 {
+    SYSTEM_AUDIO_GAIN_DB_DEFAULT
+}
+
+/// Clamp a system audio level into the supported range. A non-finite value
+/// falls back to the default rather than poisoning the mix.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn clamp_system_audio_gain_db(gain_db: f32) -> f32 {
+    if gain_db.is_finite() {
+        gain_db.clamp(SYSTEM_AUDIO_GAIN_DB_MIN, SYSTEM_AUDIO_GAIN_DB_MAX)
+    } else {
+        SYSTEM_AUDIO_GAIN_DB_DEFAULT
     }
 }
 
@@ -1201,6 +1242,12 @@ pub struct AudioProcessingUpdateParams {
     pub session_id: String,
     pub microphone_gain_db: f32,
     pub microphone_muted: bool,
+    /// Live System audio On/Off. Omitted means "unchanged".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio_enabled: Option<bool>,
+    /// Live System audio level in dB. Omitted means "unchanged".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio_gain_db: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -2832,6 +2879,20 @@ pub struct DiagnosticStats {
     pub mic_live_level: Option<f64>,
     #[serde(default)]
     pub mic_live_peak_db: Option<f64>,
+    /// System audio live meter level (0-1, dB-scaled), plan 069. Omitted,
+    /// never null, while no system source is attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio_live_level: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio_live_peak_db: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio_captured_frames: Option<u64>,
+    /// True while a system audio source is attached to the session's audio bus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_audio_active: Option<bool>,
+    /// Samples the mix limiter had to pull under its ceiling this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_mix_clipped_samples: Option<u64>,
     pub device_disconnected: bool,
     pub backend_rss_bytes: Option<u64>,
     pub active_ffmpeg_processes: u64,
@@ -5438,6 +5499,16 @@ mod tests {
             shared_high_risk_contract_fixture_value("/recordingStatus/minimalNormalized");
         let status: RecordingStatus = serde_json::from_value(minimal).unwrap();
         assert_eq!(serde_json::to_value(status).unwrap(), expected);
+
+        // Plan 069: the one mixed track reports its sources; an unmixed track
+        // (the `wire` fixture above) keeps omitting `mixSources`.
+        let mixed = shared_high_risk_contract_fixture_value("/recordingStatus/mixedAudioWire");
+        let status: RecordingStatus = serde_json::from_value(mixed.clone()).unwrap();
+        assert_eq!(
+            status.audio_tracks[0].mix_sources,
+            vec![AudioTrackSource::Microphone, AudioTrackSource::SystemAudio]
+        );
+        assert_eq!(serde_json::to_value(status).unwrap(), mixed);
     }
 
     #[test]
@@ -6107,5 +6178,179 @@ mod tests {
             .remove("mediaGeneration");
         let legacy: WindowsD3d11PresenterDiagnostics = serde_json::from_value(legacy_wire).unwrap();
         assert_eq!(legacy.media_generation, 0);
+    }
+
+    mod system_audio_protocol {
+        use super::super::{
+            AudioProcessingUpdateParams, AudioSettings, AudioTrack, AudioTrackSource,
+            SYSTEM_AUDIO_GAIN_DB_DEFAULT, SYSTEM_AUDIO_GAIN_DB_MAX, SYSTEM_AUDIO_GAIN_DB_MIN,
+            clamp_system_audio_gain_db,
+        };
+        use serde_json::json;
+
+        #[test]
+        fn audio_settings_without_system_audio_keys_load_as_off_at_minus_six_db() {
+            let legacy: AudioSettings = serde_json::from_value(json!({
+                "microphoneGainDb": 3.0,
+                "microphoneMuted": false,
+                "microphoneSyncOffsetMs": 0
+            }))
+            .unwrap();
+            assert!(!legacy.system_audio_enabled);
+            assert_eq!(legacy.system_audio_gain_db, -6.0);
+            assert_eq!(legacy.system_audio_gain_db, SYSTEM_AUDIO_GAIN_DB_DEFAULT);
+            assert_eq!(legacy.microphone_gain_db, 3.0);
+
+            let empty: AudioSettings = serde_json::from_value(json!({})).unwrap();
+            assert_eq!(empty, AudioSettings::default());
+            assert!(!empty.system_audio_enabled);
+            assert_eq!(empty.system_audio_gain_db, -6.0);
+        }
+
+        #[test]
+        fn audio_settings_round_trip_explicit_system_audio_values_in_camel_case() {
+            let off: AudioSettings = serde_json::from_value(json!({
+                "systemAudioEnabled": false,
+                "systemAudioGainDb": 4.5
+            }))
+            .unwrap();
+            assert!(!off.system_audio_enabled);
+            assert_eq!(off.system_audio_gain_db, 4.5);
+
+            let on = AudioSettings {
+                system_audio_enabled: true,
+                system_audio_gain_db: -12.0,
+                ..AudioSettings::default()
+            };
+            let wire = serde_json::to_value(&on).unwrap();
+            assert_eq!(wire["systemAudioEnabled"], true);
+            assert_eq!(wire["systemAudioGainDb"], -12.0);
+            let back: AudioSettings = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, on);
+
+            // Off is sent explicitly, never dropped.
+            let wire_off = serde_json::to_value(AudioSettings::default()).unwrap();
+            assert_eq!(wire_off["systemAudioEnabled"], false);
+            assert_eq!(wire_off["systemAudioGainDb"], -6.0);
+        }
+
+        #[test]
+        fn system_audio_gain_clamps_to_the_shared_range() {
+            assert_eq!(SYSTEM_AUDIO_GAIN_DB_MIN, -24.0);
+            assert_eq!(SYSTEM_AUDIO_GAIN_DB_MAX, 12.0);
+            assert_eq!(clamp_system_audio_gain_db(-40.0), -24.0);
+            assert_eq!(clamp_system_audio_gain_db(40.0), 12.0);
+            assert_eq!(clamp_system_audio_gain_db(-3.5), -3.5);
+            assert_eq!(clamp_system_audio_gain_db(f32::NAN), -6.0);
+            assert_eq!(clamp_system_audio_gain_db(f32::INFINITY), -6.0);
+        }
+
+        #[test]
+        fn audio_processing_update_omits_untouched_system_audio_fields() {
+            let mic_only: AudioProcessingUpdateParams = serde_json::from_value(json!({
+                "sessionId": "session-1",
+                "microphoneGainDb": 2.0,
+                "microphoneMuted": true
+            }))
+            .unwrap();
+            assert_eq!(mic_only.system_audio_enabled, None);
+            assert_eq!(mic_only.system_audio_gain_db, None);
+            let wire = serde_json::to_value(&mic_only).unwrap();
+            let object = wire.as_object().unwrap();
+            assert!(!object.contains_key("systemAudioEnabled"), "{wire}");
+            assert!(!object.contains_key("systemAudioGainDb"), "{wire}");
+
+            let toggle: AudioProcessingUpdateParams = serde_json::from_value(json!({
+                "sessionId": "session-1",
+                "microphoneGainDb": 2.0,
+                "microphoneMuted": true,
+                "systemAudioEnabled": false,
+                "systemAudioGainDb": -9.0
+            }))
+            .unwrap();
+            assert_eq!(toggle.system_audio_enabled, Some(false));
+            assert_eq!(toggle.system_audio_gain_db, Some(-9.0));
+            let wire = serde_json::to_value(&toggle).unwrap();
+            assert_eq!(wire["systemAudioEnabled"], false);
+            assert_eq!(wire["systemAudioGainDb"], -9.0);
+        }
+
+        #[test]
+        fn audio_track_source_system_audio_is_kebab_case_on_the_wire() {
+            assert_eq!(
+                serde_json::to_value(AudioTrackSource::SystemAudio).unwrap(),
+                json!("system-audio")
+            );
+            assert_eq!(
+                serde_json::to_value(AudioTrackSource::TestTone).unwrap(),
+                json!("test-tone")
+            );
+            let parsed: AudioTrackSource = serde_json::from_value(json!("system-audio")).unwrap();
+            assert_eq!(parsed, AudioTrackSource::SystemAudio);
+        }
+
+        #[test]
+        fn audio_track_omits_empty_mix_sources_and_round_trips_a_mixed_track() {
+            let mic_only = AudioTrack {
+                id: "microphone".to_string(),
+                label: "Microphone".to_string(),
+                source: AudioTrackSource::Microphone,
+                mix_sources: Vec::new(),
+            };
+            let wire = serde_json::to_value(&mic_only).unwrap();
+            assert!(
+                !wire.as_object().unwrap().contains_key("mixSources"),
+                "an unmixed track keeps the legacy wire shape: {wire}"
+            );
+            let legacy: AudioTrack = serde_json::from_value(json!({
+                "id": "microphone",
+                "label": "Microphone",
+                "source": "microphone"
+            }))
+            .unwrap();
+            assert_eq!(legacy, mic_only);
+
+            let mixed = AudioTrack {
+                mix_sources: vec![AudioTrackSource::Microphone, AudioTrackSource::SystemAudio],
+                ..mic_only
+            };
+            let wire = serde_json::to_value(&mixed).unwrap();
+            assert_eq!(wire["id"], "microphone");
+            assert_eq!(wire["mixSources"], json!(["microphone", "system-audio"]));
+            let back: AudioTrack = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, mixed);
+        }
+
+        #[test]
+        fn diagnostic_stats_omit_absent_system_audio_fields_instead_of_null() {
+            let idle = crate::diagnostics::idle_diagnostics();
+            let wire = serde_json::to_value(&idle).unwrap();
+            let object = wire.as_object().unwrap();
+            for key in [
+                "systemAudioLiveLevel",
+                "systemAudioLivePeakDb",
+                "systemAudioCapturedFrames",
+                "systemAudioActive",
+                "audioMixClippedSamples",
+            ] {
+                assert!(
+                    !object.contains_key(key),
+                    "{key} must be omitted, never null (the serde-null trap)"
+                );
+            }
+
+            let mut live = idle;
+            live.system_audio_live_level = Some(0.5);
+            live.system_audio_live_peak_db = Some(-12.0);
+            live.system_audio_captured_frames = Some(48_000);
+            live.system_audio_active = Some(true);
+            live.audio_mix_clipped_samples = Some(3);
+            let wire = serde_json::to_value(&live).unwrap();
+            assert_eq!(wire["systemAudioLiveLevel"], 0.5);
+            assert_eq!(wire["systemAudioLivePeakDb"], -12.0);
+            assert_eq!(wire["systemAudioCapturedFrames"], 48_000);
+            assert_eq!(wire["systemAudioActive"], true);
+            assert_eq!(wire["audioMixClippedSamples"], 3);
+        }
     }
 }

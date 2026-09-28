@@ -10,6 +10,7 @@ import { after, before, describe, it } from 'node:test'
 
 import {
   buildAvSyncRecommendationReport,
+  clickOnsetFilter,
   clickOnsetsFromSilences,
   clusterFlashes,
   evaluateAvSync,
@@ -221,6 +222,18 @@ describe('measureAvSync (integration)', { skip: ffmpegAvailable(ffmpegPath) ? fa
     assert.equal(result.pass, true)
   })
 
+  it('band-passed 1 kHz click detection agrees with the full band', async () => {
+    const [full, band] = await Promise.all([
+      measureAvSync(offset, { ffmpegPath }),
+      measureAvSync(offset, { ffmpegPath, clickBandpassHz: 1000 })
+    ])
+    assert.equal(band.clickCount, full.clickCount)
+    assert.ok(
+      Math.abs(band.medianOffsetMs - full.medianOffsetMs) <= 5,
+      `band ${band.medianOffsetMs}ms vs full ${full.medianOffsetMs}ms`
+    )
+  })
+
   it('recovers an injected 200ms A/V offset and hard-fails it', async () => {
     const result = await measureAvSync(offset, { ffmpegPath, currentMicrophoneSyncOffsetMs: 0 })
     assert.ok(
@@ -233,6 +246,19 @@ describe('measureAvSync (integration)', { skip: ffmpegAvailable(ffmpegPath) ? fa
       result.recommendedMicrophoneSyncOffsetMs <= -150 &&
         result.recommendedMicrophoneSyncOffsetMs >= -260,
       `suggested ${result.recommendedMicrophoneSyncOffsetMs}ms`
+    )
+  })
+})
+
+describe('clickOnsetFilter', () => {
+  it('detects clicks on the full band by default', () => {
+    assert.equal(clickOnsetFilter({ noiseDb: -40 }), 'silencedetect=noise=-40dB:d=0.02')
+  })
+
+  it('narrows detection to the 1 kHz click for system-audio recordings', () => {
+    assert.equal(
+      clickOnsetFilter({ noiseDb: -40, bandpassHz: 1000 }),
+      'bandpass=f=1000:width_type=h:w=300,silencedetect=noise=-40dB:d=0.02'
     )
   })
 })

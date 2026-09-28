@@ -8,8 +8,9 @@ windows forward. **Off by default**; enable it in Settings → Remote control.
 Two integration tiers:
 
 1. **Global shortcuts (no protocol):** Settings → Global shortcuts registers
-   OS-wide accelerators for record/stream/mic. Bind them to any macro tool or
-   a Stream Deck Hotkey action. Works while Videorc is in the background.
+   OS-wide accelerators for record/stream/mic/system audio. Bind them to any
+   macro tool or a Stream Deck Hotkey action. Works while Videorc is in the
+   background.
 2. **The remote protocol below** — richer: scenes, takeovers, windows, and
    live state for key rendering. The official plugin lives in
    `apps/streamdeck-plugin`.
@@ -53,25 +54,29 @@ message? }`. Accepted intents produce a `remote.ack` event
 
 Intent params (`kind` + fields):
 
-| kind                                          | fields                                   | effect                                                                            |
-| --------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------- |
-| `recordStart` / `recordStop` / `recordToggle` | —                                        | recording session                                                                 |
-| `streamStart` / `streamStop`                  | —                                        | streaming session (needs streaming configured)                                    |
-| `micMute` / `micUnmute` / `micToggle`         | —                                        | microphone mute                                                                   |
-| `sceneApply`                                  | `layoutPreset`                           | switch layout preset                                                              |
-| `takeoverShow`                                | `assetId`                                | show a takeover image (BRB etc.)                                                  |
-| `takeoverHide`                                | —                                        | hide the takeover                                                                 |
-| `windowFront`                                 | `window`: `notes`\|`comments`\|`preview` | bring window forward                                                              |
-| `commentHighlight`                            | `messageId`                              | put that live-chat comment on stream (explicit show, idempotent — never a toggle) |
-| `commentHighlightClear`                       | —                                        | take the on-stream comment down                                                   |
-| `clipMark`                                    | —                                        | mark this moment for a clip (plan 068); needs an active session and recording on  |
+| kind                                                     | fields                                   | effect                                                                            |
+| -------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------- |
+| `recordStart` / `recordStop` / `recordToggle`            | —                                        | recording session                                                                 |
+| `streamStart` / `streamStop`                             | —                                        | streaming session (needs streaming configured)                                    |
+| `micMute` / `micUnmute` / `micToggle`                    | —                                        | microphone mute                                                                   |
+| `systemAudioOn` / `systemAudioOff` / `systemAudioToggle` | —                                        | system audio on/off (plan 069); refused while the device cannot run               |
+| `sceneApply`                                             | `layoutPreset`                           | switch layout preset                                                              |
+| `takeoverShow`                                           | `assetId`                                | show a takeover image (BRB etc.)                                                  |
+| `takeoverHide`                                           | —                                        | hide the takeover                                                                 |
+| `windowFront`                                            | `window`: `notes`\|`comments`\|`preview` | bring window forward                                                              |
+| `commentHighlight`                                       | `messageId`                              | put that live-chat comment on stream (explicit show, idempotent — never a toggle) |
+| `commentHighlightClear`                                  | —                                        | take the on-stream comment down                                                   |
+| `clipMark`                                               | —                                        | mark this moment for a clip (plan 068); needs an active session and recording on  |
 
 ## Events
 
 - `remote.state` — the full projection on every change:
   `{ sessionState, sessionActive, recordEnabled, streamEnabled, micMuted,
-layoutPreset, activeTakeoverId, windows }`. Render keys from THIS, not
-  from optimistic intent.
+layoutPreset, activeTakeoverId, windows, systemAudioOn, systemAudioAvailable }`.
+  Render keys from THIS, not from optimistic intent. `systemAudioOn` is what
+  the session mixes (the request while idle, or until the session reports
+  it) and is always `false` while `systemAudioAvailable` is `false`. An app
+  that predates plan 069 omits both.
 - `remote.ack` — `{ intentId, ok, message? }` after the renderer executed
   (or refused) an accepted intent.
 
@@ -214,6 +219,20 @@ The Remote allowlist: `remote.describe`, `remote.intent` (both as in protocol
 1, including the two comment intents above) and:
 
 `remote.chat.snapshot` → `{ chatSeq, messages: RemoteChatMessage[≤200], highlight }`
+
+### System audio on the phone (plan 069 leak argument)
+
+The phone gets a System audio key only while `systemAudioAvailable` is true.
+What crosses the LAN socket is two booleans in `remote.state`
+(`systemAudioOn`, `systemAudioAvailable`) and what a paired phone can do is
+send `systemAudioOn` / `systemAudioOff` / `systemAudioToggle`. No audio,
+level, device id or name, permission detail, or app list ever reaches a
+remote socket: the renderer builds the projection from the device status and
+the confirmed mix, and `LAN_EVENTS` and the router are unchanged. The worst a
+paired device can do is what it could already do with the mic: switch the
+computer's sound into, or out of, the recording and the stream. Turning it on
+is the privacy-relevant direction, so it runs through the same renderer path
+as the Studio switch, and the Studio shows the change.
 
 ## Events (LAN sockets only)
 

@@ -228,6 +228,11 @@ import {
   electronBackgroundPolicyFromEnv,
   shouldDisableOcclusionThrottling
 } from './electron-background-policy'
+import {
+  chromiumFeaturesToDisable,
+  DISABLE_FEATURES_SWITCH,
+  mergeDisabledFeatures
+} from './chromium-disabled-features'
 import { createMediaPermissionGrantWatcher } from './system-permission-watch'
 import {
   flushPermissionRestart,
@@ -984,6 +989,18 @@ const backendGenerationEvidence = new WeakMap<BackendRuntime, BackendGenerationE
 if (shouldDisableOcclusionThrottling(process.platform, electronBackgroundPolicy)) {
   app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
   app.commandLine.appendSwitch('disable-renderer-backgrounding')
+}
+// Plan 069 (system audio): on macOS, play renderer audio from the main process
+// instead of Chromium's out-of-process audio service. ScreenCaptureKit cannot
+// attribute that helper's audio to Videorc, so without this Library playback
+// and Orcle's voice would leak into recordings with System audio on. Merged,
+// never overwritten: Chromium honours a single disable-features value.
+const disabledChromiumFeatures = mergeDisabledFeatures(
+  app.commandLine.getSwitchValue(DISABLE_FEATURES_SWITCH),
+  chromiumFeaturesToDisable(process.platform)
+)
+if (disabledChromiumFeatures) {
+  app.commandLine.appendSwitch(DISABLE_FEATURES_SWITCH, disabledChromiumFeatures)
 }
 const packagedSmokeHarnessCapability =
   app.isPackaged && process.env.VIDEORC_PACKAGED_SMOKE_TEST === '1'

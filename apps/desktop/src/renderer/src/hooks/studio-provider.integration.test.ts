@@ -24,6 +24,7 @@ import type {
   AccountCallbackEnvelope,
   AiArtifact,
   AudioMeterResult,
+  AudioTrack,
   BackendConnection,
   CaptureRecoveryStatus,
   CohostSettings,
@@ -407,7 +408,7 @@ class StudioBackend {
   xEndFailuresRemaining = 0
   platformAccountValidations: PlatformAccountValidation[] = []
   audioProcessingResponseDelayMs = 0
-  audioProcessingReasonCode: 'session-ended' | null = null
+  audioProcessingReasonCode: string | null = null
   deviceListFailuresRemaining = 0
   audioMeterFailuresRemaining = 0
   sessionDetailFailuresRemaining = 0
@@ -7334,6 +7335,475 @@ describe('real StudioProvider lifecycle', () => {
         }
       })
     ])
+  })
+
+  it('sends one latest-wins system audio update live and shows the confirmed mix without a toast', async () => {
+    const backend = new StudioBackend()
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => []
+    })
+    const testDom = installProviderTestEnvironment(api)
+    restoreEnvironment = testDom.restore
+    const observations: StudioObservation[] = []
+    const latest = (): StudioObservation | undefined => observations.at(-1)
+
+    await act(async () => {
+      root = createRoot(testDom.container)
+      root.render(
+        createElement(
+          BackgroundAssetsProvider,
+          null,
+          createElement(
+            StudioProvider,
+            null,
+            createElement(Probe, {
+              observe: (value) => {
+                observations.push(value)
+              }
+            })
+          )
+        )
+      )
+    })
+    await waitForObservation(
+      () =>
+        latest()?.core.wsStatus === 'connected' &&
+        latest()?.core.captureConfig.sources.microphoneId === 'mic:1'
+    )
+
+    await act(async () => {
+      await latest()?.core.startSession()
+    })
+    await waitForObservation(() => latest()?.recording.recording.state === 'recording')
+    const startAudio = (
+      backend.sentCommands.find((command) => command.method === 'session.start')?.params as {
+        audio?: Record<string, unknown>
+      }
+    ).audio
+    expect(startAudio).toMatchObject({ systemAudioEnabled: false, systemAudioGainDb: -6 })
+    const audioUpdates = (): BackendCommand[] =>
+      backend.sentCommands.filter((command) => command.method === 'audio.processing.update')
+    expect(audioUpdates()).toEqual([])
+    // No track reports its mix yet: the switch falls back to the request.
+    expect(latest()?.core.systemAudioConfirmed).toBeNull()
+    vi.clearAllMocks()
+
+    // Flip On, Off, On and move the level in one burst: the session gets one
+    // update with only the system fields that changed since session.start.
+    await act(async () => {
+      for (const systemAudioEnabled of [true, false, true]) {
+        latest()?.core.setCaptureConfig((current) => ({
+          ...current,
+          audio: { ...current.audio, systemAudioEnabled }
+        }))
+      }
+      latest()?.core.setCaptureConfig((current) => ({
+        ...current,
+        audio: { ...current.audio, systemAudioGainDb: -9 }
+      }))
+    })
+    await waitForObservation(() => audioUpdates().length === 1)
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    expect(audioUpdates()).toEqual([
+      expect.objectContaining({
+        params: {
+          sessionId: 'session-1',
+          microphoneGainDb: 0,
+          microphoneMuted: false,
+          systemAudioEnabled: true,
+          systemAudioGainDb: -9
+        }
+      })
+    ])
+
+    const micTrack = { id: 'microphone', label: 'Microphone', source: 'microphone' }
+    const emitStatus = (mixSources: string[]): void => {
+      backend.recordingStatusOverride = {
+        state: 'recording',
+        sessionId: 'session-1',
+        startedAt: now,
+        message: 'Recording.',
+        audioTracks: [{ ...micTrack, mixSources } as AudioTrack]
+      }
+      backend.sockets[0]?.onmessage?.({
+        data: JSON.stringify({
+          event: 'recording.status',
+          payload: backend.recordingStatusOverride
+        })
+      })
+    }
+    await act(async () => {
+      emitStatus(['microphone'])
+      await Promise.resolve()
+    })
+    await waitForObservation(() => latest()?.core.systemAudioConfirmed === false)
+    await act(async () => {
+      emitStatus(['microphone', 'system-audio'])
+      await Promise.resolve()
+    })
+    await waitForObservation(() => latest()?.core.systemAudioConfirmed === true)
+    expect(latest()?.core.systemAudioIssue).toBeNull()
+
+    // Lost mid-session: the mix drops the source, the issue names why, and
+    // the requested switch state is untouched.
+    await act(async () => {
+      backend.sockets[0]?.onmessage?.({
+        data: JSON.stringify({
+          event: 'health.event',
+          payload: {
+            id: 'health-system-audio-lost',
+            sessionId: 'session-1',
+            level: 'warn',
+            code: 'system-audio-lost',
+            message: 'System audio stopped. The session continues with the microphone.',
+            permissionPane: null,
+            createdAt: now
+          }
+        })
+      })
+      emitStatus(['microphone'])
+      await Promise.resolve()
+    })
+    await waitForObservation(
+      () =>
+        latest()?.core.systemAudioIssue === 'lost' && latest()?.core.systemAudioConfirmed === false
+    )
+    expect(latest()?.core.captureConfig.audio.systemAudioEnabled).toBe(true)
+    expect(audioUpdates()).toHaveLength(1)
+    expect(toastSpies.warning).not.toHaveBeenCalled()
+    expect(toastSpies.error).not.toHaveBeenCalled()
+    expect(toastSpies.success).not.toHaveBeenCalled()
+  })
+
+  it('turns system audio on and off from remote intents and the shortcut, only while it can run', async () => {
+    const backend = new StudioBackend()
+    backend.deviceList = {
+      ...backend.deviceList,
+      devices: [
+        ...backend.deviceList.devices,
+        {
+          id: 'system-audio:default',
+          name: 'System audio',
+          kind: 'system-audio',
+          status: 'available'
+        }
+      ]
+    }
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+    let emit: (name: string, value: unknown) => void = () => {}
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => [],
+      registerEmitter: (next) => {
+        emit = next
+      }
+    })
+    const testDom = installProviderTestEnvironment(api)
+    restoreEnvironment = testDom.restore
+    const observations: StudioObservation[] = []
+    const latest = (): StudioCoreContextValue => observations.at(-1)!.core
+    root = await mountStudioProvider(testDom.container, (value) => {
+      observations.push(value)
+    })
+    type PublishedState = { systemAudioOn?: boolean; systemAudioAvailable?: boolean }
+    const published = (): PublishedState[] =>
+      backend.sentCommands
+        .filter((command) => command.method === 'remote.surface.publish')
+        .map((command) => (command.params as { state: PublishedState }).state)
+    const ack = (intentId: string): unknown =>
+      backend.sentCommands.find(
+        (command) =>
+          command.method === 'remote.intent.ack' &&
+          (command.params as { intentId?: string }).intentId === intentId
+      )?.params
+    const sendIntent = async (intentId: string, kind: string): Promise<void> => {
+      await act(async () => {
+        for (const socket of backend.sockets) {
+          socket.onmessage?.({
+            data: JSON.stringify({
+              event: 'remote.intent',
+              payload: { intentId, intent: { kind } }
+            })
+          })
+        }
+      })
+    }
+    await waitForObservation(() => latest().wsStatus === 'connected')
+    await act(async () => {
+      for (const socket of backend.sockets) {
+        socket.onmessage?.({ data: JSON.stringify({ event: 'backend.ready', payload: null }) })
+      }
+      await Promise.resolve()
+    })
+    await waitForObservation(() => published().some((state) => state.systemAudioAvailable === true))
+    expect(latest().captureConfig.audio.systemAudioEnabled).toBe(false)
+
+    await sendIntent('ri-sa-toggle', 'systemAudioToggle')
+    await waitForObservation(() => latest().captureConfig.audio.systemAudioEnabled === true)
+    await waitForObservation(() => ack('ri-sa-toggle') !== undefined)
+    expect(ack('ri-sa-toggle')).toEqual({ intentId: 'ri-sa-toggle', ok: true })
+    await waitForObservation(() => published().at(-1)?.systemAudioOn === true)
+
+    await act(async () => {
+      emit('onGlobalShortcut', 'system-audio-toggle')
+    })
+    await waitForObservation(() => latest().captureConfig.audio.systemAudioEnabled === false)
+    await waitForObservation(() => published().at(-1)?.systemAudioOn === false)
+    expect(latest().captureConfig.audio.microphoneMuted).toBe(false)
+    // The phone and the deck learn two booleans, never the device itself.
+    const remoteBodies = JSON.stringify(
+      backend.sentCommands.filter((command) => command.method === 'remote.surface.publish')
+    )
+    expect(remoteBodies).not.toContain('system-audio:default')
+
+    // Without the Screen Recording grant: both paths refuse, nothing flips.
+    backend.deviceList = {
+      ...backend.deviceList,
+      devices: backend.deviceList.devices.map((device) =>
+        device.kind === 'system-audio' ? { ...device, status: 'permission-required' } : device
+      )
+    }
+    await act(async () => {
+      await latest().refreshBackend()
+    })
+    await waitForObservation(() => published().at(-1)?.systemAudioAvailable === false)
+    await sendIntent('ri-sa-on', 'systemAudioOn')
+    await waitForObservation(() => ack('ri-sa-on') !== undefined)
+    expect(ack('ri-sa-on')).toEqual({
+      intentId: 'ri-sa-on',
+      ok: false,
+      message: 'System audio is not available.'
+    })
+    await act(async () => {
+      emit('onGlobalShortcut', 'system-audio-toggle')
+    })
+    await waitForObservation(() => toastSpies.warning.mock.calls.length > 0)
+    expect(toastSpies.warning).toHaveBeenCalledWith(
+      'System audio needs Screen Recording access',
+      expect.objectContaining({ id: 'global-shortcut-system-audio' })
+    )
+    expect(latest().captureConfig.audio.systemAudioEnabled).toBe(false)
+    expect(published().at(-1)).toMatchObject({ systemAudioOn: false, systemAudioAvailable: false })
+  })
+
+  describe('system audio after a failure (PR #477 review)', () => {
+    const withSystemAudioDevice = (backend: StudioBackend): void => {
+      backend.deviceList = {
+        ...backend.deviceList,
+        devices: [
+          ...backend.deviceList.devices,
+          {
+            id: 'system-audio:default',
+            name: 'System audio',
+            kind: 'system-audio',
+            status: 'available'
+          }
+        ]
+      }
+    }
+
+    async function startSystemAudioSession(backend: StudioBackend): Promise<{
+      latest: () => StudioCoreContextValue
+      emit: (name: string, value: unknown) => void
+      updates: () => Array<Record<string, unknown>>
+      emitMix: (mixSources: string[]) => Promise<void>
+      emitIssue: (code: string) => Promise<void>
+      sendIntent: (intentId: string, kind: string) => Promise<void>
+    }> {
+      withSystemAudioDevice(backend)
+      TestWebSocket.backend = backend
+      vi.stubGlobal('WebSocket', TestWebSocket)
+      let emit: (name: string, value: unknown) => void = () => {}
+      const api = createVideorcApi({
+        acknowledge: async () => true,
+        pending: async () => [],
+        acknowledgeProvider: async () => true,
+        pendingProvider: async () => [],
+        registerEmitter: (next) => {
+          emit = next
+        }
+      })
+      const testDom = installProviderTestEnvironment(api)
+      restoreEnvironment = testDom.restore
+      const observations: StudioObservation[] = []
+      const latest = (): StudioCoreContextValue => observations.at(-1)!.core
+      root = await mountStudioProvider(testDom.container, (value) => {
+        observations.push(value)
+      })
+      await waitForObservation(
+        () =>
+          latest().wsStatus === 'connected' &&
+          latest().captureConfig.sources.microphoneId === 'mic:1'
+      )
+      await act(async () => {
+        await latest().startSession()
+      })
+      await waitForObservation(() => observations.at(-1)?.recording.recording.state === 'recording')
+      const broadcast = (event: string, payload: unknown): void => {
+        for (const socket of backend.sockets) {
+          socket.onmessage?.({ data: JSON.stringify({ event, payload }) })
+        }
+      }
+      const emitMix = async (mixSources: string[]): Promise<void> => {
+        backend.recordingStatusOverride = {
+          state: 'recording',
+          sessionId: 'session-1',
+          startedAt: now,
+          message: 'Recording.',
+          audioTracks: [
+            {
+              id: 'microphone',
+              label: 'Microphone',
+              source: 'microphone',
+              mixSources
+            } as AudioTrack
+          ]
+        }
+        await act(async () => {
+          broadcast('recording.status', backend.recordingStatusOverride)
+          await Promise.resolve()
+        })
+      }
+      const emitIssue = async (code: string): Promise<void> => {
+        await act(async () => {
+          broadcast('health.event', {
+            id: `health-${code}-${backend.sentCommands.length}`,
+            sessionId: 'session-1',
+            level: 'warn',
+            code,
+            message: 'System audio could not start.',
+            permissionPane: null,
+            createdAt: now
+          })
+          await Promise.resolve()
+        })
+      }
+      const sendIntent = async (intentId: string, kind: string): Promise<void> => {
+        await act(async () => {
+          broadcast('remote.intent', { intentId, intent: { kind } })
+        })
+      }
+      const updates = (): Array<Record<string, unknown>> =>
+        backend.sentCommands
+          .filter((command) => command.method === 'audio.processing.update')
+          .map((command) => command.params as Record<string, unknown>)
+      return {
+        latest,
+        emit: (name, value) => emit(name, value),
+        updates,
+        emitMix,
+        emitIssue,
+        sendIntent
+      }
+    }
+
+    it('toggles off after unavailable and lost, re-sends mid-transition, and On again retries', async () => {
+      const backend = new StudioBackend()
+      const { latest, emit, updates, emitMix, emitIssue, sendIntent } =
+        await startSystemAudioSession(backend)
+      const toggle = async (): Promise<void> => {
+        await act(async () => {
+          emit('onGlobalShortcut', 'system-audio-toggle')
+        })
+      }
+
+      await toggle()
+      await waitForObservation(() => updates().length === 1)
+      expect(updates()[0]).toMatchObject({ systemAudioEnabled: true })
+      expect(latest().captureConfig.audio.systemAudioEnabled).toBe(true)
+
+      // Mid-transition: requested On, the session still mixes only the mic
+      // ("Turning on…"). The switch shows Off, so the toggle asks for On
+      // again, and that request is sent, not dropped as unchanged.
+      await emitMix(['microphone'])
+      await waitForObservation(() => latest().systemAudioConfirmed === false)
+      await toggle()
+      await waitForObservation(() => updates().length === 2)
+      expect(updates()[1]).toMatchObject({ systemAudioEnabled: true })
+      expect(latest().captureConfig.audio.systemAudioEnabled).toBe(true)
+
+      // Unavailable: the switch stays On with the issue; a toggle turns it Off.
+      await emitIssue('system-audio-unavailable')
+      await waitForObservation(() => latest().systemAudioIssue === 'unavailable')
+      await toggle()
+      await waitForObservation(() => latest().captureConfig.audio.systemAudioEnabled === false)
+      await waitForObservation(() => updates().length === 3)
+      expect(updates()[2]).toMatchObject({ systemAudioEnabled: false })
+      expect(latest().systemAudioIssue).toBeNull()
+
+      // On again: sent, and the old issue does not come back while it starts.
+      await toggle()
+      await waitForObservation(() => latest().captureConfig.audio.systemAudioEnabled === true)
+      await waitForObservation(() => updates().length === 4)
+      expect(updates()[3]).toMatchObject({ systemAudioEnabled: true })
+      expect(latest().systemAudioIssue).toBeNull()
+
+      // Lost mid-session: the phone or deck toggle turns it Off too.
+      await emitMix(['microphone', 'system-audio'])
+      await waitForObservation(() => latest().systemAudioConfirmed === true)
+      await emitIssue('system-audio-lost')
+      await emitMix(['microphone'])
+      await waitForObservation(
+        () => latest().systemAudioIssue === 'lost' && latest().systemAudioConfirmed === false
+      )
+      await sendIntent('ri-sa-after-lost', 'systemAudioToggle')
+      await waitForObservation(() => latest().captureConfig.audio.systemAudioEnabled === false)
+      await waitForObservation(() => updates().length === 5)
+      expect(updates()[4]).toMatchObject({ systemAudioEnabled: false })
+      expect(latest().systemAudioIssue).toBeNull()
+    })
+
+    it('sends a rejected system audio update again instead of treating it as sent', async () => {
+      const backend = new StudioBackend()
+      backend.audioProcessingReasonCode = 'stale-session'
+      const { latest, updates } = await startSystemAudioSession(backend)
+      await act(async () => {
+        latest().setCaptureConfig((current) => ({
+          ...current,
+          audio: { ...current.audio, systemAudioEnabled: true }
+        }))
+      })
+      await waitForObservation(() => updates().length === 1)
+      expect(updates()[0]).toMatchObject({ systemAudioEnabled: true })
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      })
+
+      // The session never applied it; the next update carries it again.
+      backend.audioProcessingReasonCode = null
+      await act(async () => {
+        latest().setCaptureConfig((current) => ({
+          ...current,
+          audio: { ...current.audio, systemAudioGainDb: -9 }
+        }))
+      })
+      await waitForObservation(() => updates().length === 2)
+      expect(updates()[1]).toMatchObject({ systemAudioEnabled: true, systemAudioGainDb: -9 })
+
+      // Once applied, a level change carries only the level.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      })
+      await act(async () => {
+        latest().setCaptureConfig((current) => ({
+          ...current,
+          audio: { ...current.audio, systemAudioGainDb: -12 }
+        }))
+      })
+      await waitForObservation(() => updates().length === 3)
+      expect(updates()[2]).not.toHaveProperty('systemAudioEnabled')
+      expect(updates()[2]).toMatchObject({ systemAudioGainDb: -12 })
+    })
   })
 
   it('keeps an exact-session stopping event authoritative when start responds late', async () => {

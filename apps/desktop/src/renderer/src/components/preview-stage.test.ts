@@ -77,7 +77,7 @@ describe('previewSupervisorDisplay', () => {
           row: {
             id: 'screen-recording',
             label: 'Screen Recording',
-            purpose: 'Capture displays and app windows.',
+            purpose: 'Capture displays, app windows and system audio.',
             state: 'granted',
             detail: 'Permission granted.'
           }
@@ -100,7 +100,7 @@ describe('previewSupervisorDisplay', () => {
           row: {
             id: 'screen-recording',
             label: 'Screen Recording',
-            purpose: 'Capture displays and app windows.',
+            purpose: 'Capture displays, app windows and system audio.',
             state: 'not-granted',
             detail: 'System Settings is blocking screen capture.'
           }

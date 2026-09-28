@@ -8,7 +8,8 @@
 //   2. the remote role is a hard allowlist (health.ping → forbidden-method)
 //   3. remote sockets cannot widen their event filter (events.setIncluded)
 //   4. micToggle + sceneApply intents ack ok AND the state projection
-//      reflects them (backend-confirmed state, not optimistic)
+//      reflects them (backend-confirmed state, not optimistic); clipMark and
+//      systemAudioToggle relay through the renderer
 //   5. token regenerate closes the paired client
 //
 // No recording is started: the intents exercised here are disk-free.
@@ -199,6 +200,47 @@ try {
     fail(`clipMark refusal carried the wrong reason: ${JSON.stringify(clipAck)}`)
   }
   console.log('remote-control smoke: clipMark relay + refusal reason OK')
+
+  // 4c. System audio (plan 069 S6): the projection carries exactly two
+  // booleans, and systemAudioToggle relays through the renderer. With the
+  // Screen Recording grant it flips the confirmed state (and is flipped back);
+  // without it the renderer refuses with a reason and nothing changes.
+  const systemAudioState = (await remoteRequest(remote, 'remote.describe')).payload?.state
+  if (
+    typeof systemAudioState?.systemAudioOn !== 'boolean' ||
+    typeof systemAudioState?.systemAudioAvailable !== 'boolean'
+  ) {
+    fail(`remote.state lacks the system-audio booleans: ${JSON.stringify(systemAudioState)}`)
+  }
+  const toggleSystemAudio = async (expectOn) => {
+    const ackPromise = waitForRemoteEvent(remote, 'remote.ack')
+    const statePromise =
+      expectOn === null
+        ? null
+        : waitForRemoteEvent(remote, 'remote.state', (state) => state?.systemAudioOn === expectOn)
+    const ticket = await remoteRequest(remote, 'remote.intent', { kind: 'systemAudioToggle' })
+    if (!ticket.payload?.accepted) fail('systemAudioToggle intent was not accepted')
+    const ack = await ackPromise
+    if (ack?.intentId !== ticket.payload.intentId)
+      fail(`systemAudioToggle ack mismatch: ${JSON.stringify(ack)}`)
+    await statePromise
+    return ack
+  }
+  if (systemAudioState.systemAudioAvailable) {
+    const before = systemAudioState.systemAudioOn
+    const on = await toggleSystemAudio(!before)
+    if (on?.ok !== true) fail(`systemAudioToggle was not applied: ${JSON.stringify(on)}`)
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 250))
+    const back = await toggleSystemAudio(before)
+    if (back?.ok !== true) fail(`systemAudioToggle back was not applied: ${JSON.stringify(back)}`)
+    console.log('remote-control smoke: systemAudioToggle ack + confirmed state OK')
+  } else {
+    const refused = await toggleSystemAudio(null)
+    if (refused?.ok !== false || refused?.message !== 'System audio is not available.') {
+      fail(`systemAudioToggle without the device was not refused: ${JSON.stringify(refused)}`)
+    }
+    console.log('remote-control smoke: systemAudioToggle refused without the device OK')
+  }
 
   // 5. Regenerate cuts the paired client.
   const closed = new Promise((resolveClose) => remote.once('close', resolveClose))

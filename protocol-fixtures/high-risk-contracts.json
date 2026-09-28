@@ -159,6 +159,18 @@
     },
     "minimalNormalized": {
       "state": "idle"
+    },
+    "mixedAudioWire": {
+      "state": "streaming",
+      "sessionId": "session-fixture",
+      "audioTracks": [
+        {
+          "id": "microphone",
+          "label": "Microphone",
+          "source": "microphone",
+          "mixSources": ["microphone", "system-audio"]
+        }
+      ]
     }
   },
   "compositorStatus": {

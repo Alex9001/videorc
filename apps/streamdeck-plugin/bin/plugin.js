@@ -162,6 +162,37 @@ let MicToggle = (() => {
     };
     return MicToggle = _classThis;
 })();
+// Plan 069: System audio On/Off. The key shows what the session mixes; an
+// app that cannot capture it (no grant, unsupported, or too old to say)
+// shows N/A and the key alerts instead of sending.
+let SystemAudioToggle = (() => {
+    let _classDecorators = [action({ UUID: 'com.videorc.streamdeck.system-audio-toggle' })];
+    let _classDescriptor;
+    let _classExtraInitializers = [];
+    let _classThis;
+    let _classSuper = VideorcAction;
+    var SystemAudioToggle = class extends _classSuper {
+        static { _classThis = this; }
+        static {
+            const _metadata = typeof Symbol === "function" && Symbol.metadata ? Object.create(_classSuper[Symbol.metadata] ?? null) : void 0;
+            __esDecorate(null, _classDescriptor = { value: _classThis }, _classDecorators, { kind: "class", name: _classThis.name, metadata: _metadata }, null, _classExtraInitializers);
+            SystemAudioToggle = _classThis = _classDescriptor.value;
+            if (_metadata) Object.defineProperty(_classThis, Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });
+            __runInitializers(_classThis, _classExtraInitializers);
+        }
+        renderTitle = (state, connected) => !connected
+            ? 'Videorc\noffline'
+            : !state?.systemAudioAvailable
+                ? 'System\naudio N/A'
+                : state.systemAudioOn
+                    ? 'System\naudio ON'
+                    : 'System\naudio off';
+        intentFor(_settings, state) {
+            return state?.systemAudioAvailable ? { kind: 'systemAudioToggle' } : null;
+        }
+    };
+    return SystemAudioToggle = _classThis;
+})();
 let SceneApply = (() => {
     let _classDecorators = [action({ UUID: 'com.videorc.streamdeck.scene-apply' })];
     let _classDescriptor;
@@ -261,6 +292,7 @@ let WindowFront = (() => {
 streamDeck.actions.registerAction(new RecordToggle());
 streamDeck.actions.registerAction(new StreamToggle());
 streamDeck.actions.registerAction(new MicToggle());
+streamDeck.actions.registerAction(new SystemAudioToggle());
 streamDeck.actions.registerAction(new SceneApply());
 streamDeck.actions.registerAction(new TakeoverToggle());
 streamDeck.actions.registerAction(new WindowFront());

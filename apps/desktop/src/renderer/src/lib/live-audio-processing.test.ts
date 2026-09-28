@@ -4,7 +4,9 @@ import {
   activeAudioProcessingUpdateParams,
   LatestWinsLiveAudioProcessingQueue,
   liveAudioProcessingSessionSyncDecision,
-  rejectedLiveAudioProcessingUpdate
+  mergeAudioProcessingParams,
+  rejectedLiveAudioProcessingUpdate,
+  systemAudioProcessingDelta
 } from './live-audio-processing'
 
 function deferred<T>(): {
@@ -449,5 +451,151 @@ describe('LatestWinsLiveAudioProcessingQueue', () => {
       message:
         'The live microphone change could not be confirmed, and the captured audio state may differ from the controls shown. Stop and restart this capture before relying on microphone gain or mute.'
     })
+  })
+})
+
+describe('system audio on the latest-wins queue (plan 069)', () => {
+  it('merges per field: newest wins, untouched optional fields stay omitted', () => {
+    const micOnly = { sessionId: 'session-1', microphoneGainDb: 2, microphoneMuted: false }
+    expect(mergeAudioProcessingParams(micOnly, { ...micOnly, microphoneGainDb: 4 })).toStrictEqual({
+      sessionId: 'session-1',
+      microphoneGainDb: 4,
+      microphoneMuted: false
+    })
+    expect(
+      mergeAudioProcessingParams(
+        { ...micOnly, systemAudioEnabled: true, systemAudioGainDb: -6 },
+        { ...micOnly, microphoneMuted: true, systemAudioGainDb: -12 }
+      )
+    ).toStrictEqual({
+      sessionId: 'session-1',
+      microphoneGainDb: 2,
+      microphoneMuted: true,
+      systemAudioEnabled: true,
+      systemAudioGainDb: -12
+    })
+    expect(
+      mergeAudioProcessingParams(
+        { ...micOnly, systemAudioEnabled: true },
+        { ...micOnly, systemAudioEnabled: false }
+      )
+    ).toStrictEqual({ ...micOnly, systemAudioEnabled: false })
+  })
+
+  it('keeps a pending system-audio toggle when a later mic-only edit replaces it', async () => {
+    const first = deferred<ReturnType<typeof appliedResult>>()
+    const sent: unknown[] = []
+    const queue = new LatestWinsLiveAudioProcessingQueue(
+      'session-1',
+      async (params) => {
+        sent.push(params)
+        return sent.length === 1 ? first.promise : appliedResult(5)
+      },
+      () => true
+    )
+
+    queue.enqueue({ sessionId: 'session-1', microphoneGainDb: 1, microphoneMuted: false })
+    await Promise.resolve()
+    queue.enqueue({
+      sessionId: 'session-1',
+      microphoneGainDb: 1,
+      microphoneMuted: false,
+      systemAudioEnabled: true
+    })
+    queue.enqueue({
+      sessionId: 'session-1',
+      microphoneGainDb: 3,
+      microphoneMuted: false,
+      systemAudioGainDb: -9
+    })
+    queue.enqueue({ sessionId: 'session-1', microphoneGainDb: 5, microphoneMuted: false })
+
+    first.resolve(appliedResult(1))
+    await queue.waitForIdle()
+    expect(sent).toStrictEqual([
+      { sessionId: 'session-1', microphoneGainDb: 1, microphoneMuted: false },
+      {
+        sessionId: 'session-1',
+        microphoneGainDb: 5,
+        microphoneMuted: false,
+        systemAudioEnabled: true,
+        systemAudioGainDb: -9
+      }
+    ])
+  })
+
+  it('sends a system-audio-only change even when the mic state is unchanged', async () => {
+    const first = deferred<ReturnType<typeof appliedResult>>()
+    const sent: unknown[] = []
+    const queue = new LatestWinsLiveAudioProcessingQueue(
+      'session-1',
+      async (params) => {
+        sent.push(params)
+        return sent.length === 1 ? first.promise : appliedResult(0)
+      },
+      () => true
+    )
+    const mic = { sessionId: 'session-1', microphoneGainDb: 0, microphoneMuted: false }
+
+    queue.enqueue(mic)
+    await Promise.resolve()
+    // A mic-only repeat of the in-flight state adds nothing.
+    queue.enqueue(mic)
+    // The same mic state plus a system-audio toggle is a real change.
+    queue.enqueue({ ...mic, systemAudioEnabled: true })
+    // Repeating it while it waits adds nothing either.
+    queue.enqueue({ ...mic, systemAudioEnabled: true })
+    first.resolve(appliedResult(0))
+    await queue.waitForIdle()
+
+    expect(sent).toStrictEqual([mic, { ...mic, systemAudioEnabled: true }])
+  })
+
+  it('does not re-send a pending request that a newer request leaves unchanged', async () => {
+    const first = deferred<ReturnType<typeof appliedResult>>()
+    const sent: unknown[] = []
+    const queue = new LatestWinsLiveAudioProcessingQueue(
+      'session-1',
+      async (params) => {
+        sent.push(params)
+        return sent.length === 1 ? first.promise : appliedResult(2)
+      },
+      () => true
+    )
+    const mic = { sessionId: 'session-1', microphoneGainDb: 2, microphoneMuted: false }
+
+    queue.enqueue({ ...mic, microphoneGainDb: 1 })
+    await Promise.resolve()
+    queue.enqueue({ ...mic, systemAudioEnabled: true, systemAudioGainDb: -3 })
+    queue.enqueue(mic)
+    queue.enqueue({ ...mic, systemAudioGainDb: -3 })
+    first.resolve(appliedResult(1))
+    await queue.waitForIdle()
+
+    expect(sent).toStrictEqual([
+      { ...mic, microphoneGainDb: 1 },
+      { ...mic, systemAudioEnabled: true, systemAudioGainDb: -3 }
+    ])
+  })
+})
+
+describe('systemAudioProcessingDelta (plan 069)', () => {
+  const off = { systemAudioEnabled: false, systemAudioGainDb: -6 }
+
+  it('sends nothing when the session already holds the state', () => {
+    expect(systemAudioProcessingDelta(off, off)).toStrictEqual({})
+  })
+
+  it('sends only the fields that changed', () => {
+    expect(systemAudioProcessingDelta({ ...off, systemAudioEnabled: true }, off)).toStrictEqual({
+      systemAudioEnabled: true
+    })
+    expect(systemAudioProcessingDelta({ ...off, systemAudioGainDb: -12 }, off)).toStrictEqual({
+      systemAudioGainDb: -12
+    })
+  })
+
+  it('sends both when the session state is unknown', () => {
+    expect(systemAudioProcessingDelta(off, null)).toStrictEqual(off)
   })
 })

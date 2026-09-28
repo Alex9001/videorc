@@ -1169,6 +1169,48 @@ describe('backend RPC contract', () => {
     }
   })
 
+  it('validates the optional system audio diagnostics and tolerates the serde-null trap', () => {
+    const idle = { skippedFrames: 0, droppedFrames: 0, ...idleCapturePressureDiagnostics }
+    // Absent while no system source is attached: the Rust side skips None.
+    expect(validateBackendEventPayload('diagnostics.stats', idle)).toEqual(idle)
+    const live = {
+      ...idle,
+      systemAudioLiveLevel: 0.62,
+      systemAudioLivePeakDb: -14.5,
+      systemAudioCapturedFrames: 96_000,
+      systemAudioActive: true,
+      audioMixClippedSamples: 0
+    }
+    expect(validateBackendRpcResult('diagnostics.stats', live)).toEqual(live)
+    expect(validateBackendEventPayload('diagnostics.stats', live)).toEqual(live)
+    for (const field of [
+      'systemAudioLiveLevel',
+      'systemAudioLivePeakDb',
+      'systemAudioCapturedFrames',
+      'systemAudioActive',
+      'audioMixClippedSamples'
+    ] as const) {
+      // A regressed skip_serializing_if emits null; that must never drop the
+      // whole stats event (0.9.68 / 0.9.79 / 0.9.80 outage class).
+      const nullable = { ...live, [field]: null }
+      expect(validateBackendRpcResult('diagnostics.stats', nullable)).toEqual(nullable)
+      expect(validateBackendEventPayload('diagnostics.stats', nullable)).toEqual(nullable)
+    }
+    for (const [field, invalid] of [
+      ['systemAudioLiveLevel', 1.5],
+      ['systemAudioLiveLevel', -0.1],
+      ['systemAudioLivePeakDb', Number.NEGATIVE_INFINITY],
+      ['systemAudioCapturedFrames', -1],
+      ['systemAudioCapturedFrames', 1.5],
+      ['systemAudioActive', 'yes'],
+      ['audioMixClippedSamples', -3]
+    ] as const) {
+      expect(() =>
+        validateBackendEventPayload('diagnostics.stats', { ...live, [field]: invalid })
+      ).toThrow(field)
+    }
+  })
+
   it('accepts real diagnostic wire payloads without renderer-only timestamps', () => {
     const diagnostics = {
       skippedFrames: 0,

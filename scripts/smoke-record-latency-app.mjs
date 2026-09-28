@@ -74,6 +74,9 @@ const { values: args } = parseArgs({
     'expect-height': { type: 'string' },
     report: { type: 'string' },
     enforce: { type: 'boolean', default: false },
+    // Plan 069 S4: seed System audio On so every cycle also starts the
+    // system-audio capture after publication. The budgets must not move.
+    'system-audio': { type: 'boolean', default: false },
     debug: { type: 'boolean', default: false }
   },
   strict: true
@@ -110,6 +113,7 @@ const expectedWidth =
 const expectedHeight =
   optionalPositiveInteger(args['expect-height'], 'expect-height') ?? videoProfile.height
 const enforce = args.enforce
+const systemAudio = args['system-audio']
 const debug = args.debug || process.env.VIDEORC_RECORD_LATENCY_DEBUG === '1'
 const timeoutMs = Number(process.env.VIDEORC_SMOKE_TIMEOUT_MS ?? 120000)
 // The startup analyzer inspects the first two seconds of the file.
@@ -241,11 +245,14 @@ async function seedRendererVideoProfile(smoke) {
         // diagnostic pattern replaces the screen, so the scene is fully
         // deterministic.
         const layout = { ...(current.layout ?? {}), layoutPreset: 'screen-only' };
-        localStorage.setItem(key, JSON.stringify({ ...current, video: params.video, layout, recordEnabled: true, streamEnabled: false }));
+        const seeded = { ...current, video: params.video, layout, recordEnabled: true, streamEnabled: false };
+        if (params.systemAudio) seeded.audio = { ...(current.audio ?? {}), systemAudioEnabled: true };
+        localStorage.setItem(key, JSON.stringify(seeded));
         setTimeout(() => location.reload(), 50);
         return true;
       `,
-      video: videoProfile
+      video: videoProfile,
+      systemAudio
     },
     { timeoutMs }
   )
@@ -589,7 +596,7 @@ try {
 
   await seedRendererVideoProfile(smoke)
   log(
-    `seeded renderer video profile ${videoProfile.preset} (${videoProfile.width}x${videoProfile.height}@${videoProfile.fps})`
+    `seeded renderer video profile ${videoProfile.preset} (${videoProfile.width}x${videoProfile.height}@${videoProfile.fps})${systemAudio ? ' with System audio on' : ''}`
   )
 
   // Arm the renderer-owned test pattern so the Record button has a source, and
@@ -617,6 +624,25 @@ try {
 
   const summary = summarizeRecordCycles(measured)
   const verdict = evaluateRecordLatencyBudget(summary, budgets)
+  // What System audio actually did: whether sessions mixed it, or why not
+  // (without the dev binary's Screen Recording grant every start reports
+  // system-audio-unavailable, and the cycles still measure its start cost).
+  const systemAudioEvidence = {
+    mixedStatuses: recorder.events.filter(
+      (record) =>
+        record.event === 'recording.status' &&
+        (record.payload?.audioTracks ?? []).some((track) =>
+          (track.mixSources ?? []).includes('system-audio')
+        )
+    ).length,
+    unavailable: recorder.events.filter(
+      (record) =>
+        record.event === 'health.event' && record.payload?.code === 'system-audio-unavailable'
+    ).length,
+    lost: recorder.events.filter(
+      (record) => record.event === 'health.event' && record.payload?.code === 'system-audio-lost'
+    ).length
+  }
   const report = {
     generatedAt: new Date().toISOString(),
     commit: gitHead(),
@@ -628,8 +654,10 @@ try {
       profile: videoProfile.preset,
       intendedFps,
       expectedWidth,
-      expectedHeight
+      expectedHeight,
+      systemAudio
     },
+    systemAudioEvidence: systemAudio ? systemAudioEvidence : undefined,
     budgets,
     enforce,
     verdict,
@@ -647,6 +675,11 @@ try {
   log(
     `compositor path: ${armedCycles} armed in place, ${restartedCycles} restarted, ${measured.length - armedCycles - restartedCycles} unknown`
   )
+  if (systemAudio) {
+    log(
+      `system audio: ${systemAudioEvidence.mixedStatuses} mixed status event(s), ${systemAudioEvidence.unavailable} unavailable, ${systemAudioEvidence.lost} lost`
+    )
+  }
   log(`report written to ${reportPath}`)
   if (!verdict.pass) {
     for (const failure of verdict.failures) log(`budget: ${failure}`)

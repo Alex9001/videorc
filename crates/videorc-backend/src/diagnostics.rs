@@ -820,6 +820,11 @@ pub fn idle_diagnostics() -> DiagnosticStats {
         mic_capture_coverage: None,
         mic_live_level: None,
         mic_live_peak_db: None,
+        system_audio_live_level: None,
+        system_audio_live_peak_db: None,
+        system_audio_captured_frames: None,
+        system_audio_active: None,
+        audio_mix_clipped_samples: None,
         device_disconnected: false,
         backend_rss_bytes: None,
         active_ffmpeg_processes: 0,
@@ -2151,6 +2156,24 @@ pub fn apply_audio_stats(
     stats
 }
 
+/// Plan 069: the system-audio meter and mix counters from the session bus.
+/// The live meter is omitted (never null) while no system source is
+/// attached; `None` (no session bus) omits every system field.
+pub fn apply_system_audio_stats(
+    mut stats: DiagnosticStats,
+    system: Option<&crate::session_audio::SystemAudioObservation>,
+) -> DiagnosticStats {
+    let meter = system
+        .filter(|system| system.attached)
+        .map(|system| crate::audio::amplitude_to_db(system.live_peak));
+    stats.system_audio_live_peak_db = meter.map(f64::from);
+    stats.system_audio_live_level = meter.map(crate::audio::db_to_level);
+    stats.system_audio_active = system.map(|system| system.attached);
+    stats.system_audio_captured_frames = system.map(|system| system.captured_frames);
+    stats.audio_mix_clipped_samples = system.map(|system| system.mix_clipped_samples);
+    stats
+}
+
 pub fn classify_bottleneck(
     capture_fps: Option<f64>,
     render_fps: Option<f64>,
@@ -2536,6 +2559,49 @@ mod tests {
         let gap = apply_audio_stats(idle_diagnostics(), 24_000, 0, Some(0.5), None);
         assert_eq!(gap.mic_capture_coverage, Some(0.5));
         assert_eq!(gap.bottleneck, DiagnosticBottleneck::Audio);
+    }
+
+    #[test]
+    fn system_audio_stats_meter_only_while_attached_and_omit_without_a_bus() {
+        let mut system = crate::session_audio::SystemAudioObservation {
+            attached: true,
+            device_name: Some("System audio".into()),
+            cutover_sample: Some(4_800),
+            live_peak: 0.5,
+            session_peak: 0.7,
+            captured_frames: 96_000,
+            generated_frames: 480,
+            dropped_frames: 0,
+            mix_clipped_samples: 12,
+        };
+        let live = apply_system_audio_stats(idle_diagnostics(), Some(&system));
+        assert_eq!(live.system_audio_active, Some(true));
+        assert!(
+            live.system_audio_live_level
+                .is_some_and(|level| level > 0.0)
+        );
+        assert!(
+            live.system_audio_live_peak_db
+                .is_some_and(|peak| (peak + 6.02).abs() < 0.01)
+        );
+        assert_eq!(live.system_audio_captured_frames, Some(96_000));
+        assert_eq!(live.audio_mix_clipped_samples, Some(12));
+        system.attached = false;
+        let off = apply_system_audio_stats(live, Some(&system));
+        assert_eq!(off.system_audio_active, Some(false));
+        assert_eq!(off.system_audio_live_level, None);
+        assert_eq!(off.system_audio_live_peak_db, None);
+        let none = apply_system_audio_stats(off, None);
+        let json = serde_json::to_value(&none).unwrap();
+        for key in [
+            "systemAudioLiveLevel",
+            "systemAudioLivePeakDb",
+            "systemAudioCapturedFrames",
+            "systemAudioActive",
+            "audioMixClippedSamples",
+        ] {
+            assert!(json.get(key).is_none(), "{key} is omitted, never null");
+        }
     }
 
     #[test]
