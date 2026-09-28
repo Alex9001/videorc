@@ -254,6 +254,9 @@ Evidence: [docs/acceptance/2026-09-28-glass-floating-surfaces.md](../docs/accept
 - **Deviation: `--card` is untouched.** It paints in-window cards
   (`PanelSection`, the co-host nudge), not floating surfaces. Only `--popover`
   follows `--glass-float`.
+- **Deviation: the Assets on-thumbnail buttons use `glass-float`, not
+  `glass-chip`.** A chip's 10%→3.5% white is nearly transparent over a photo,
+  and the old backing was opaque.
 - **Deviation: no Win32 override.** With no blur anywhere, Windows takes the
   same opaque coat, so there is nothing platform-specific left to tune except
   the tone, on the box.
