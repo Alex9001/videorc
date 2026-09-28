@@ -369,3 +369,34 @@ describe('o_sys end to end', () => {
     assert.equal(mixed.spreadMs, 38)
   })
 })
+
+describe('static-screen startup evidence', () => {
+  it('requires held source pixels, a fresh presentation epoch, and zero ahead-cap loss', async () => {
+    const { evaluateStaticScreenEpoch } = await import('./system-audio-gates.mjs')
+    const evidence = {
+      sourceAgeMs: 10000,
+      presentationAgeMs: 20,
+      epochAgeMs: 120,
+      aheadCapDrops: 0
+    }
+    assert.equal(evaluateStaticScreenEpoch(evidence).pass, true)
+    for (const patch of [
+      { sourceAgeMs: 20 },
+      { presentationAgeMs: 9000 },
+      // The 0.9.119 incident: epoch taken from 8.8 s-old screen pixels.
+      { epochAgeMs: 8849 },
+      { epochAgeMs: undefined },
+      { aheadCapDrops: 480 },
+      { presentationAgeMs: undefined }
+    ]) {
+      assert.equal(evaluateStaticScreenEpoch({ ...evidence, ...patch }).pass, false)
+    }
+  })
+  it('cannot accept silence as a mixed-input test tone', async () => {
+    const { evaluateMixedToneCapturedCase } = await import('./system-audio-gates.mjs')
+    assert.equal(
+      evaluateMixedToneCapturedCase({ envelope: [], expectedPlay: { start: 3, end: 6 } }).pass,
+      false
+    )
+  })
+})

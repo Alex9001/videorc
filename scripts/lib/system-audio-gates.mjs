@@ -404,6 +404,60 @@ export function evaluateToneCapturedCase(
   return verdict(failures, evidence)
 }
 
+/** Mixed-input acceptance allows speech outside the known, stronger test tone. */
+export function evaluateMixedToneCapturedCase(
+  { envelope, expectedPlay },
+  gates = SYSTEM_AUDIO_GATES
+) {
+  const regions = findToneRegions(envelope, {
+    thresholdDbfs: -24,
+    mergeGapMs: gates.mergeGapMs,
+    minToneMs: gates.minToneMs,
+    interiorMarginMs: gates.interiorMarginMs
+  })
+  const failures = []
+  const region = checkSingleTone(regions, gates, 'mixed-input test tone', failures)
+  const evidence = { regions: regions.map(reportRegion) }
+  if (region) {
+    evidence.startDeltaMs = checkWallAligned(
+      region.start,
+      expectedPlay.start,
+      gates,
+      'mixed tone start',
+      failures
+    )
+    if (
+      Math.abs(region.durationMs - (expectedPlay.end - expectedPlay.start) * 1000) >
+      gates.toneDurationToleranceMs
+    ) {
+      failures.push('mixed-input test tone duration or continuity is incorrect')
+    }
+  }
+  return verdict(failures, evidence)
+}
+
+/**
+ * Plan 070: a static screen keeps its old content time (honest freshness), but
+ * the recording epoch comes from the current composition, bounded by the
+ * backend's 100 ms live-latency allowance, so no audio lands ahead of the cap.
+ */
+export function evaluateStaticScreenEpoch({
+  sourceAgeMs,
+  presentationAgeMs,
+  epochAgeMs,
+  aheadCapDrops
+}) {
+  const failures = []
+  if (!(sourceAgeMs >= 9000))
+    failures.push('first recorded frame did not retain the held static content')
+  if (!(presentationAgeMs >= 0 && presentationAgeMs < 250))
+    failures.push('first recorded frame is not a current compositor presentation')
+  if (!(epochAgeMs >= 0 && epochAgeMs < 250))
+    failures.push('recording epoch follows the held content age, not the presentation')
+  if (aheadCapDrops !== 0) failures.push('audio samples were rejected ahead of the timeline cap')
+  return verdict(failures, { sourceAgeMs, presentationAgeMs, epochAgeMs, aheadCapDrops })
+}
+
 /**
  * Case b: System audio turned Off while the tone plays. The tone stops at the
  * bus cutover (within the toggle tolerance plus the ramp), well before the
