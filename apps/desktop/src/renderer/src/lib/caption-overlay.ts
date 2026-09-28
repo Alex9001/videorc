@@ -433,6 +433,8 @@ export async function renderCommentHighlightPng(params: {
   text: string
   avatarUrl: string | null
   canvasWidth: number
+  /** Omitted = landscape. A portrait canvas gets the vertical-leg card. */
+  canvasHeight?: number
   platform?: import('@/lib/backend').StreamPlatform
 }): Promise<string | null> {
   // Q8 (plan 022): use-studio already imports comment-highlight statically, so

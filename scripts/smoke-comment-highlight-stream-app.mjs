@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
 import { resolveFinalRecordingPath } from './lib/final-recording-path.mjs'
 import { tmpdir } from 'node:os'
@@ -50,6 +50,20 @@ const modernScenarios = [
     fps: 30,
     streamProfile: streamSafe1080p30,
     allowHighlightUnavailable: false
+  },
+  {
+    label: 'dual-orientation-record-stream',
+    // Plan 074 regression (owner live stream 2026-09-28): with a vertical
+    // simulcast leg the backend said "On stream" while the card reached NO
+    // output. Both the horizontal destination and the vertical destination
+    // must now carry it. Simulcast refuses stream-burned captions, so this
+    // scenario proves the card alone.
+    anchor: 'bottom-left',
+    recordEnabled: true,
+    fps: 30,
+    streamProfile: streamSafe1080p30,
+    verticalLeg: { width: 720, height: 1280 },
+    allowHighlightUnavailable: false
   }
 ]
 const legacyScenario = {
@@ -76,7 +90,7 @@ await runScenarioGroup({
 })
 
 console.log(
-  `Comment-highlight stream smoke PASS — stream-only and split stream artifacts contain coexisting highlight/caption pixels; legacy output was visible or explicitly unavailable. Evidence: ${outputDirectory}`
+  `Comment-highlight stream smoke PASS — stream-only and split stream artifacts contain coexisting highlight/caption pixels; both legs of a dual-orientation stream carry the card; legacy output was visible or explicitly unavailable. Evidence: ${outputDirectory}`
 )
 
 async function runScenarioGroup({ label, scenarios, indexOffset, env = {} }) {
@@ -147,17 +161,33 @@ async function runScenario(ws, smoke, scenario, index) {
     listenUrl: `rtmp://127.0.0.1:${port}/live/${streamKey}`,
     receivedPath: join(scenarioDirectory, 'stream-received.flv')
   }
+  const verticalTarget = scenario.verticalLeg
+    ? {
+        id: `${targetId}-vertical`,
+        platform: 'custom',
+        label: `Local ${scenario.label} vertical`,
+        serverUrl: `rtmp://127.0.0.1:${port + 50}/live`,
+        streamKey: `${streamKey}-vertical`,
+        listenUrl: `rtmp://127.0.0.1:${port + 50}/live/${streamKey}-vertical`,
+        receivedPath: join(scenarioDirectory, 'stream-received-vertical.flv')
+      }
+    : null
+  // Stream-burned captions are refused beside a vertical leg.
+  const requireCaption = !verticalTarget
   const listener = spawnRtmpListener(target)
+  const verticalListener = verticalTarget ? spawnRtmpListener(verticalTarget) : null
   let sessionActive = false
   let sessionId = null
   let stopCaptionStimulus = null
 
   try {
     await sleep(listenerBindMs)
-    if (listener.process.exitCode !== null) {
-      throw new Error(
-        `[${scenario.label}] local RTMP listener exited before session start: ${listener.stderr.join('').trim()}`
-      )
+    for (const candidate of [listener, verticalListener].filter(Boolean)) {
+      if (candidate.process.exitCode !== null) {
+        throw new Error(
+          `[${scenario.label}] local RTMP listener exited before session start: ${candidate.stderr.join('').trim()}`
+        )
+      }
     }
 
     const outputAuthorization = await smokeCommand(smoke, 'authorize-smoke-resource', {
@@ -171,7 +201,8 @@ async function runScenario(ws, smoke, scenario, index) {
       sessionParams({
         scenario,
         outputDirectoryCapability: outputAuthorization.capabilityId,
-        target
+        target,
+        verticalTarget
       })
     )
     if (!['recording', 'streaming'].includes(started.state) || !started.sessionId) {
@@ -209,25 +240,27 @@ async function runScenario(ws, smoke, scenario, index) {
     // renderer owns overlay reconciliation and may still be settling while the Comments IPC
     // request rasterizes the card; this order proves the two final viewer-facing slots coexist.
     await sleep(1500)
-    // Caption bars are output-sized raster overlays and the compositor never scales
-    // them. Use the resolved viewer-facing stream width even for stream-only sessions,
-    // whose 640x360 recording placeholder is normalized to this provider profile.
-    const captionStimulusWidth = scenario.streamProfile.width
-    const captionStimulus = startCaptionOverlayStimulus(ws, {
-      width: captionStimulusWidth,
-      height: Math.round(captionStimulusWidth * (140 / 1920)),
-      intervalMs: 250
-    })
-    stopCaptionStimulus = captionStimulus.stop
-    const captionSet = await captionStimulus.first
-    if (!captionSet?.active) {
-      throw new Error(
-        `[${scenario.label}] caption marker did not install: ${JSON.stringify(captionSet)}`
-      )
+    if (requireCaption) {
+      // Caption bars are output-sized raster overlays and the compositor never scales
+      // them. Use the resolved viewer-facing stream width even for stream-only sessions,
+      // whose 640x360 recording placeholder is normalized to this provider profile.
+      const captionStimulusWidth = scenario.streamProfile.width
+      const captionStimulus = startCaptionOverlayStimulus(ws, {
+        width: captionStimulusWidth,
+        height: Math.round(captionStimulusWidth * (140 / 1920)),
+        intervalMs: 250
+      })
+      stopCaptionStimulus = captionStimulus.stop
+      const captionSet = await captionStimulus.first
+      if (!captionSet?.active) {
+        throw new Error(
+          `[${scenario.label}] caption marker did not install: ${JSON.stringify(captionSet)}`
+        )
+      }
     }
 
     await sleep(captureMs)
-    await stopCaptionStimulus()
+    await stopCaptionStimulus?.()
     stopCaptionStimulus = null
     const highlightBeforeStop = await detailedRequest(
       ws,
@@ -246,6 +279,7 @@ async function runScenario(ws, smoke, scenario, index) {
     const stopped = await request(ws, timeoutMs, 'session.stop', {})
     sessionActive = false
     await stopRtmpListener(listener)
+    await stopRtmpListener(verticalListener)
 
     assertArtifactFile(scenario.label, target.receivedPath, 'RTMP-received stream')
     const quality = await analyzeRecording(target.receivedPath, {
@@ -272,6 +306,7 @@ async function runScenario(ws, smoke, scenario, index) {
       ffmpegPath,
       highlightDisposition: highlight.disposition,
       allowHighlightUnavailable: scenario.allowHighlightUnavailable,
+      requireCaption,
       anchor: scenario.anchor
     })
     const artifactPath = join(scenarioDirectory, 'comment-highlight-artifact.json')
@@ -281,6 +316,48 @@ async function runScenario(ws, smoke, scenario, index) {
       throw new Error(
         `[${scenario.label}] comment-highlight artifact gate failed: ${artifact.failures.join('; ')} (report: ${artifactPath})`
       )
+    }
+
+    if (verticalTarget) {
+      assertArtifactFile(
+        scenario.label,
+        verticalTarget.receivedPath,
+        'RTMP-received vertical stream'
+      )
+      // The vertical destination must receive the PORTRAIT leg, not the program.
+      const size = probeVideoSize(verticalTarget.receivedPath)
+      if (
+        size?.width !== scenario.verticalLeg.width ||
+        size?.height !== scenario.verticalLeg.height
+      ) {
+        throw new Error(
+          `[${scenario.label}] vertical destination received ${JSON.stringify(size)}, expected ${scenario.verticalLeg.width}x${scenario.verticalLeg.height}`
+        )
+      }
+      const verticalArtifact = await analyzeCommentHighlightArtifact(verticalTarget.receivedPath, {
+        ffmpegPath,
+        highlightDisposition: highlight.disposition,
+        requireCaption: false,
+        anchor: scenario.anchor,
+        sampleWidth: 360,
+        sampleHeight: 640
+      })
+      const verticalArtifactPath = join(
+        scenarioDirectory,
+        'comment-highlight-artifact-vertical.json'
+      )
+      writeFileSync(
+        verticalArtifactPath,
+        JSON.stringify({ scenario, highlight, artifact: verticalArtifact }, null, 2)
+      )
+      console.log(
+        `[${scenario.label}:vertical] ${formatCommentHighlightArtifactSummary(verticalArtifact)}`
+      )
+      if (!verticalArtifact.pass) {
+        throw new Error(
+          `[${scenario.label}] vertical comment-highlight artifact gate failed: ${verticalArtifact.failures.join('; ')} (report: ${verticalArtifactPath})`
+        )
+      }
     }
 
     if (scenario.recordEnabled) {
@@ -317,6 +394,7 @@ async function runScenario(ws, smoke, scenario, index) {
     await requestSafe(ws, 'captions.overlay.clear', {})
     await requestSafe(ws, 'liveChat.stop', {})
     await stopRtmpListener(listener)
+    await stopRtmpListener(verticalListener)
   }
 }
 
@@ -439,8 +517,74 @@ async function selectAndWaitForHighlight(ws, smoke, params) {
   )
 }
 
-function sessionParams({ scenario, outputDirectoryCapability, target }) {
+function sessionParams({ scenario, outputDirectoryCapability, target, verticalTarget }) {
   const timestamp = '2026-01-01T00:00:00.000Z'
+  const params = baseSessionParams({ scenario, outputDirectoryCapability, target, timestamp })
+  if (!verticalTarget) {
+    return params
+  }
+  // Dual orientation: horizontal destinations share the session profile (one
+  // horizontal encode), the vertical destination consumes the portrait leg.
+  const video = { ...params.output.video, width: 1280, height: 720 }
+  const targetEntry = (entry, extra = {}) => ({
+    id: entry.id,
+    platform: entry.platform,
+    label: entry.label,
+    enabled: true,
+    serverUrl: entry.serverUrl,
+    urlMode: 'server-and-key',
+    streamKey: entry.streamKey,
+    streamKeyPresent: true,
+    authMode: 'manual-rtmp',
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ...extra
+  })
+  return {
+    ...params,
+    output: { ...params.output, video },
+    streaming: {
+      ...params.streaming,
+      mode: 'multi',
+      targets: [
+        targetEntry(target),
+        targetEntry(verticalTarget, { outputOrientation: 'vertical' })
+      ],
+      enabledTargetIds: [target.id, verticalTarget.id]
+    },
+    captions: { ...params.captions, burnTarget: 'off' },
+    simulcast: {
+      layout: {
+        ...params.layout,
+        layoutPreset: 'vertical-camera-bottom',
+        verticalScreenFraming: 'fit'
+      },
+      video: { ...video, ...scenario.verticalLeg }
+    }
+  }
+}
+
+function probeVideoSize(path) {
+  const probe = spawnSync(
+    ffprobePath,
+    [
+      '-v',
+      'error',
+      '-select_streams',
+      'v:0',
+      '-show_entries',
+      'stream=width,height',
+      '-of',
+      'csv=p=0:s=x',
+      path
+    ],
+    { encoding: 'utf8' }
+  )
+  const match = /^(\d+)x(\d+)/.exec(String(probe.stdout).trim())
+  return match ? { width: Number(match[1]), height: Number(match[2]) } : null
+}
+
+function baseSessionParams({ scenario, outputDirectoryCapability, target, timestamp }) {
   return {
     sources: { testPattern: true },
     layout: {

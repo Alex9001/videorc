@@ -174,6 +174,9 @@ export function evaluateCommentHighlightArtifactMetrics(
   {
     highlightDisposition,
     allowHighlightUnavailable = false,
+    // Dual-orientation sessions refuse stream-burned captions, so their
+    // artifacts prove the card alone.
+    requireCaption = true,
     minMarkerPixelRatio = COMMENT_HIGHLIGHT_ARTIFACT_DEFAULTS.minMarkerPixelRatio,
     minMarkerFrames = COMMENT_HIGHLIGHT_ARTIFACT_DEFAULTS.minMarkerFrames,
     minCardDarkPixelRatio = COMMENT_HIGHLIGHT_ARTIFACT_DEFAULTS.minCardDarkPixelRatio,
@@ -215,7 +218,7 @@ export function evaluateCommentHighlightArtifactMetrics(
     failures.push('comment-highlight: no decoded stream frames were sampled')
   }
   if (highlightDisposition === 'live') {
-    if (captionFrames < minMarkerFrames) {
+    if (requireCaption && captionFrames < minMarkerFrames) {
       failures.push(
         `comment-highlight: caption marker appeared in ${captionFrames} frame(s), expected at least ${minMarkerFrames}`
       )
@@ -225,7 +228,7 @@ export function evaluateCommentHighlightArtifactMetrics(
         `comment-highlight: backend reported live but highlight pixels appeared in ${highlightFrames} frame(s), expected at least ${minMarkerFrames}`
       )
     }
-    if (coexistFrames < minMarkerFrames) {
+    if (requireCaption && coexistFrames < minMarkerFrames) {
       failures.push(
         `comment-highlight: highlight and caption markers coexisted in ${coexistFrames} frame(s), expected at least ${minMarkerFrames}`
       )
@@ -270,6 +273,7 @@ export async function analyzeCommentHighlightArtifact(
     ffmpegPath = 'ffmpeg',
     highlightDisposition,
     allowHighlightUnavailable = false,
+    requireCaption = true,
     sampleWidth = COMMENT_HIGHLIGHT_ARTIFACT_DEFAULTS.sampleWidth,
     sampleHeight = COMMENT_HIGHLIGHT_ARTIFACT_DEFAULTS.sampleHeight,
     sampleFps = COMMENT_HIGHLIGHT_ARTIFACT_DEFAULTS.sampleFps,
@@ -294,6 +298,7 @@ export async function analyzeCommentHighlightArtifact(
   const verdict = evaluateCommentHighlightArtifactMetrics(metrics, {
     highlightDisposition,
     allowHighlightUnavailable,
+    requireCaption,
     minMarkerPixelRatio,
     minMarkerFrames,
     minCardDarkPixelRatio,

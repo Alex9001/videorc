@@ -45,6 +45,33 @@ describe('comment highlight artifact gate', () => {
     assert.equal(verdict.pass, true)
   })
 
+  it('proves the card alone when captions are not required (dual-orientation legs)', () => {
+    const rgb = Buffer.concat([markerFrame({ highlight: true }), markerFrame({ highlight: true })])
+    const metrics = measureCommentHighlightArtifactRgb(rgb, { width, height, anchor: 'top-left' })
+    const cardOnly = evaluateCommentHighlightArtifactMetrics(metrics, {
+      highlightDisposition: 'live',
+      requireCaption: false,
+      minMarkerPixelRatio: 0.1,
+      minMarkerFrames: 2
+    })
+    assert.equal(cardOnly.pass, true, cardOnly.failures.join('\n'))
+
+    // Still a failure when the backend said live and no card was drawn — the
+    // exact 2026-09-28 incident shape.
+    const empty = measureCommentHighlightArtifactRgb(
+      Buffer.concat([markerFrame({}), markerFrame({})]),
+      { width, height, anchor: 'top-left' }
+    )
+    const missing = evaluateCommentHighlightArtifactMetrics(empty, {
+      highlightDisposition: 'live',
+      requireCaption: false,
+      minMarkerPixelRatio: 0.1,
+      minMarkerFrames: 2
+    })
+    assert.equal(missing.pass, false)
+    assert.match(missing.failures.join('\n'), /highlight pixels appeared in 0 frame/)
+  })
+
   it('fails when both markers exist but never in the same frame', () => {
     const rgb = Buffer.concat([
       markerFrame({ highlight: true }),

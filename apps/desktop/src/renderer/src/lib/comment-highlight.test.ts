@@ -112,6 +112,31 @@ describe('layoutCommentHighlight', () => {
     )
   })
 
+  it('sizes a vertical-leg card like its horizontal twin and fits the portrait width', () => {
+    const text = 'what capture card is that? '.repeat(4).trim()
+    const horizontal = layoutCommentHighlight({
+      authorName: 'Orc Dev',
+      text,
+      canvasWidth: 1920,
+      canvasHeight: 1080,
+      measure
+    })!
+    const vertical = layoutCommentHighlight({
+      authorName: 'Orc Dev',
+      text,
+      canvasWidth: 1080,
+      canvasHeight: 1920,
+      measure
+    })!
+    // Same type size on a phone as on the 16:9 stream, not the width-based 23px.
+    expect(vertical.metrics.textFontPx).toBe(horizontal.metrics.textFontPx)
+    // The horizontal card could be 1152px wide; the portrait one never crops.
+    expect(vertical.cardWidthPx).toBeLessThanOrEqual(Math.floor(1080 * 0.85))
+    expect(vertical.textLines.length).toBeLessThanOrEqual(HIGHLIGHT_MAX_TEXT_LINES)
+    // Omitting the height keeps the landscape recipe.
+    expect(highlightMetrics(1920)).toEqual(highlightMetrics(1920, 1080))
+  })
+
   it('collapses to the identity row when there is no message text', () => {
     const layout = layoutCommentHighlight({
       authorName: 'Orc Dev',

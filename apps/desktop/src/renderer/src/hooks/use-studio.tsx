@@ -207,6 +207,7 @@ import type {
   CohostState,
   CohostWindowState,
   CommentHighlightAnchor,
+  CommentHighlightCanvases,
   CommentHighlightCommand,
   CommentHighlightState,
   CommentsClearCommand,
@@ -2567,19 +2568,41 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
           captureConfig.video,
           captureConfig.streamEnabled ? captureConfig.streaming : undefined
         )
-        const avatarUrl = message.authorAvatarUrl
-          ? await window.videorc?.cacheChatAvatar?.(message.authorAvatarUrl).catch(() => null)
-          : null
+        // The backend owns the session's leg topology: a vertical simulcast
+        // leg needs its own portrait-sized card (plan 074). A failed probe
+        // still puts the card on the horizontal stream.
+        const [avatarUrl, canvases] = await Promise.all([
+          message.authorAvatarUrl
+            ? window.videorc?.cacheChatAvatar?.(message.authorAvatarUrl).catch(() => null)
+            : null,
+          client
+            .request<CommentHighlightCanvases | null>('comments.highlight.canvases')
+            .catch(() => null)
+        ])
         if (commentHighlightIntentRef.current !== intent) return null
         const { renderCommentHighlightPng, commentHighlightCardText } = await loadCaptionOverlay()
         if (commentHighlightIntentRef.current !== intent) return null
-        const pngBase64 = await renderCommentHighlightPng({
+        const card = {
           authorName: message.authorName,
           text: commentHighlightCardText(message),
           avatarUrl: avatarUrl ?? null,
-          canvasWidth: streamVideo.width,
           platform: message.platform
-        })
+        }
+        const vertical = canvases?.vertical
+        const [pngBase64, verticalPngBase64] = await Promise.all([
+          renderCommentHighlightPng({
+            ...card,
+            canvasWidth: streamVideo.width,
+            canvasHeight: streamVideo.height
+          }),
+          vertical
+            ? renderCommentHighlightPng({
+                ...card,
+                canvasWidth: vertical.width,
+                canvasHeight: vertical.height
+              })
+            : null
+        ])
         if (!pngBase64) throw new Error('Could not render this message for the stream.')
         if (commentHighlightIntentRef.current !== intent) return null
         let state: CommentHighlightState
@@ -2588,7 +2611,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             sessionId,
             messageId: message.id,
             pngBase64,
-            anchor: commentHighlightAnchorRef.current
+            anchor: commentHighlightAnchorRef.current,
+            ...(verticalPngBase64 ? { verticalPngBase64 } : {})
           } satisfies SetCommentHighlightParams)
         } catch (error) {
           const failurePolicy = await loadCommandFailurePolicy()

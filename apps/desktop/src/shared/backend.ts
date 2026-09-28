@@ -3555,6 +3555,15 @@ export interface SetCommentHighlightParams {
   messageId: string
   pngBase64: string
   anchor: CommentHighlightAnchor
+  /** The same card rasterized for the vertical simulcast leg; sent only when
+   *  `comments.highlight.canvases` reports a vertical canvas. */
+  verticalPngBase64?: string
+}
+
+/** `comments.highlight.canvases`: extra canvases the running session burns
+ *  the card on. Mirrors Rust `CommentHighlightCanvases`. */
+export interface CommentHighlightCanvases {
+  vertical?: { width: number; height: number }
 }
 
 export interface CommentsCommandResolution<T> {
