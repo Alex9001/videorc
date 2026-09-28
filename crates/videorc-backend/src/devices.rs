@@ -339,7 +339,7 @@ fn avfoundation_probe_failed_screen_device() -> Device {
 
 /// Stable id of the one system-audio device (plan 069). Everything the
 /// computer plays, except Videorc, is one source; there is no per-output pick.
-const SYSTEM_AUDIO_DEVICE_ID: &str = "system-audio:default";
+pub(crate) const SYSTEM_AUDIO_DEVICE_ID: &str = "system-audio:default";
 
 /// What the platform says about capturing system audio. It comes from a cheap
 /// probe that never prompts and never starts a capture stream.

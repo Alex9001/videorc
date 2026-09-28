@@ -50,7 +50,8 @@ use crate::diagnostics::{
     RecordingStartupBarrierDiagnosticSnapshot, apply_active_scene_revision, apply_audio_stats,
     apply_duplicate_capture_sources, apply_preview_frame_age, apply_preview_stats,
     apply_recording_startup_barrier_stats, apply_recording_timeline_stats,
-    apply_runtime_diagnostics_snapshot, apply_stream_health, starting_diagnostics,
+    apply_runtime_diagnostics_snapshot, apply_stream_health, apply_system_audio_stats,
+    starting_diagnostics,
 };
 #[cfg(target_os = "windows")]
 use crate::encoder_bridge::DirectD3D11CameraOverlay;
@@ -1909,6 +1910,9 @@ pub struct ActiveRecording {
     pub audio_tracks: Vec<AudioTrack>,
     pub pipeline: RecordingPipeline,
     pub native_audio: Option<NativeAudioCaptureSession>,
+    /// The session's System audio switch (plan 069 S4), on every session whose
+    /// bus can mix system audio (macOS). It opens nothing until turned on.
+    system_audio: Option<crate::system_audio_session::SessionSystemAudio>,
     ffmpeg_live_audio_session: Option<SharedFfmpegLiveAudioSession>,
     pub screen_overlay: Option<ScreenOverlaySession>,
     pub encoder_bridge: Option<EncoderBridgeRecordingSession>,
@@ -2041,6 +2045,7 @@ pub(crate) fn test_active_recording_stub(session_id: &str) -> ActiveRecording {
         audio_tracks: Vec::new(),
         pipeline: RecordingPipeline::new(false, true, &[]),
         native_audio: None,
+        system_audio: None,
         ffmpeg_live_audio_session: None,
         screen_overlay: None,
         encoder_bridge: None,
@@ -2391,10 +2396,24 @@ impl ActiveRecording {
                 .map(|path| path.display().to_string()),
             stream_url: self.stream_url.clone(),
             started_at: Some(self.started_at.clone()),
-            audio_tracks: self.audio_tracks.clone(),
+            audio_tracks: with_system_audio_mix(
+                &self.audio_tracks,
+                self.system_audio
+                    .as_ref()
+                    .map(crate::system_audio_session::SessionSystemAudio::mixing),
+            ),
             pipeline: Some(self.pipeline.status()),
             duration_ms: None,
             message,
+        }
+    }
+
+    /// The running state `recording.status` reports for this session.
+    fn running_state(&self) -> RecordingState {
+        if self.mode == "stream" {
+            RecordingState::Streaming
+        } else {
+            RecordingState::Recording
         }
     }
 
@@ -2508,6 +2527,19 @@ pub async fn update_active_audio_processing(
         if active.stop_requested {
             result.reason_code = Some("session-ended".to_string());
             return result;
+        }
+
+        // Plan 069: the System audio switch and level. Omitted fields are
+        // unchanged; the switch is latest-wins and reports through
+        // `recording.status` (`mixSources`) and health events, never through
+        // this reply. Sessions that cannot mix system audio ignore them.
+        if let Some(system_audio) = active.system_audio.as_ref() {
+            if let Some(gain_db) = params.system_audio_gain_db {
+                system_audio.set_gain_db(gain_db);
+            }
+            if let Some(enabled) = params.system_audio_enabled {
+                system_audio.request(enabled);
+            }
         }
 
         if let Some(native_audio) = active.native_audio.as_ref() {
@@ -4530,28 +4562,41 @@ async fn start_session_with_timeline(
     // await between construction and publication, synchronously signalling
     // FFmpeg before this active value joins its native-audio FIFO writer.
     let pending_active: ActiveRecording;
+    // Plan 069: on a system-audio platform every bus runs at the system-audio
+    // playout delay with the decision 8 offset split, matching the FFmpeg
+    // track shift in `ffmpeg_session_params`; elsewhere the defaults.
+    let system_audio_capable = crate::system_audio_session::system_audio_capable();
+    let session_audio_options = session_audio_options(&params.audio, system_audio_capable);
     let attached_native_audio = native_audio_source
         .take()
         .map(|prepared| {
-            crate::session_audio::attach_prepared(
+            crate::session_audio::attach_prepared_with(
                 Some(prepared.source),
                 prepared.fifo_path,
                 use_encoder_bridge.then(|| video_epoch.clone()),
                 audio_processing_settings(&params),
                 crate::audio::NATIVE_AUDIO_SOURCE_STALL_TIMEOUT,
+                session_audio_options,
             )
         })
         .or_else(|| {
             silent_audio_fifo.map(|path| {
-                crate::session_audio::attach(
+                crate::session_audio::attach_prepared_with(
                     None,
                     path,
                     use_encoder_bridge.then(|| video_epoch.clone()),
                     audio_processing_settings(&params),
                     crate::audio::NATIVE_AUDIO_SOURCE_STALL_TIMEOUT,
+                    session_audio_options,
                 )
             })
         });
+    // The System audio switch (plan 069 S4). It opens nothing here: an On
+    // setting is requested only after the session is published, so capture
+    // never delays Record (decision 12).
+    let session_system_audio = attached_native_audio
+        .as_ref()
+        .and_then(|audio| spawn_session_system_audio(&state, &session_id, audio));
     // Declare the uncommitted process guard after every blocking FIFO writer.
     // Rust drops locals in reverse declaration order, so even cancellation or
     // a future unhandled early return starts terminating FFmpeg before native
@@ -5118,6 +5163,7 @@ async fn start_session_with_timeline(
         audio_tracks,
         pipeline,
         native_audio: attached_native_audio,
+        system_audio: session_system_audio,
         ffmpeg_live_audio_session,
         screen_overlay,
         encoder_bridge,
@@ -5391,12 +5437,156 @@ async fn start_session_with_timeline(
             },
         },
     ));
+    // System audio On at start (plan 069 decision 12): requested only now,
+    // after the session is published, so it never delays Record. The source
+    // joins the running mix when its capture delivers.
+    if let Some(active) = recording.as_ref() {
+        request_initial_system_audio(active, &params.audio);
+    }
     session_row_guard.disarm();
     published_session_start.disarm();
     drop(recording);
 
     Ok(running_status)
 }
+
+/// The session's System audio switch, on a bus that can mix system audio.
+fn spawn_session_system_audio(
+    state: &AppState,
+    session_id: &str,
+    audio: &NativeAudioCaptureSession,
+) -> Option<crate::system_audio_session::SessionSystemAudio> {
+    let open = crate::system_audio_session::platform_opener()?;
+    Some(start_session_system_audio(
+        state,
+        session_id,
+        audio.system_audio(),
+        open,
+    ))
+}
+
+fn start_session_system_audio(
+    state: &AppState,
+    session_id: &str,
+    handle: crate::session_audio::SystemAudioHandle,
+    open: crate::system_audio_session::SystemAudioOpen,
+) -> crate::system_audio_session::SessionSystemAudio {
+    let (events, receiver) = mpsc::unbounded_channel();
+    tokio::spawn(forward_system_audio_events(
+        state.clone(),
+        session_id.to_string(),
+        receiver,
+    ));
+    crate::system_audio_session::SessionSystemAudio::spawn(handle, open, events)
+}
+
+fn request_initial_system_audio(active: &ActiveRecording, audio: &AudioSettings) {
+    // The performance check measures the encoder; it never captures the
+    // computer's sound.
+    if audio.system_audio_enabled
+        && !active.performance_check
+        && let Some(system_audio) = active.system_audio.as_ref()
+    {
+        system_audio.request(true);
+    }
+}
+
+/// Turns the reconciler's outcomes into the session's status and health.
+/// Ends when the reconciler does.
+async fn forward_system_audio_events(
+    state: AppState,
+    session_id: String,
+    mut events: mpsc::UnboundedReceiver<crate::system_audio_session::SystemAudioSessionEvent>,
+) {
+    while let Some(event) = events.recv().await {
+        match event {
+            crate::system_audio_session::SystemAudioSessionEvent::MixChanged => {
+                reemit_active_recording_status(&state, &session_id).await;
+            }
+            crate::system_audio_session::SystemAudioSessionEvent::Unavailable(error) => {
+                emit_system_audio_unavailable_health_event(&state, &session_id, &error);
+            }
+        }
+    }
+}
+
+/// Re-publishes the running session's `recording.status` (its audio mix
+/// changed). Silent once the session is stopping or replaced: the stop edge
+/// owns the status from then on. It emits while holding the recording lock,
+/// so a Stop that marks the session after this check always publishes its
+/// Stopping status after this one, never before it.
+async fn reemit_active_recording_status(state: &AppState, session_id: &str) {
+    let recording = state.recording.lock().await;
+    if let Some(active) = recording
+        .as_ref()
+        .filter(|active| active.session_id == session_id && !active.stop_requested)
+    {
+        state.emit_event(
+            "recording.status",
+            active.status(
+                active.running_state(),
+                Some(format!("Running {} session.", active.mode)),
+            ),
+        );
+    }
+}
+
+fn emit_system_audio_unavailable_health_event(
+    state: &AppState,
+    session_id: &str,
+    error: &crate::system_audio_session::SystemAudioStartError,
+) {
+    let message = system_audio_unavailable_message(error);
+    state.emit_log(
+        "warn",
+        format!("System audio could not start: {}", error.detail),
+    );
+    let _ = emit_health_event(
+        state,
+        Some(session_id),
+        HealthLevel::Warn,
+        crate::system_audio_session::SYSTEM_AUDIO_UNAVAILABLE_CODE,
+        &message,
+    );
+}
+
+fn system_audio_unavailable_message(
+    error: &crate::system_audio_session::SystemAudioStartError,
+) -> String {
+    if error.permission_required {
+        "System audio needs the Screen Recording permission. Allow Videorc in Settings > Permissions (System Settings > Privacy & Security > Screen & System Audio Recording), then turn System audio on again. This session continues without it.".to_string()
+    } else {
+        format!(
+            "System audio could not start ({}). This session continues without it.",
+            error.detail
+        )
+    }
+}
+
+fn emit_system_audio_lost_health_event(
+    state: &AppState,
+    session_id: &str,
+    loss: &crate::session_audio::SystemAudioLoss,
+) {
+    state.emit_log(
+        "warn",
+        format!(
+            "System audio stopped at sample {}: {}",
+            loss.at_sample, loss.reason
+        ),
+    );
+    let _ = emit_health_event(
+        state,
+        Some(session_id),
+        HealthLevel::Warn,
+        crate::system_audio_session::SYSTEM_AUDIO_LOST_CODE,
+        SYSTEM_AUDIO_LOST_MESSAGE,
+    );
+}
+
+/// Kept free of device words ("microphone", "screen") so the health row
+/// links no unrelated permission pane (`permission_pane_for_log`).
+const SYSTEM_AUDIO_LOST_MESSAGE: &str = "System audio stopped during this session. The session continues without it; turn System audio off and on to try again.";
 
 /// Marks a freshly-created session row failed if session startup bails before
 /// the pipeline takes ownership (F-017 — phantom "running" Library rows).
@@ -5605,6 +5795,11 @@ async fn stop_recording_serialized(state: AppState) -> Result<RecordingStatus> {
         .release_native_session_output(&active.session_id);
     #[cfg(target_os = "windows")]
     release_direct_d3d11_consumer(&state, active);
+    // No new system-audio start from here on, and one still opening is
+    // cancelled; the bus retires an attached slot as it stops (bounded).
+    if let Some(system_audio) = active.system_audio.as_ref() {
+        system_audio.shutdown();
+    }
     if let Some(native_audio) = active.native_audio.as_ref() {
         native_audio.request_stop();
     }
@@ -7688,6 +7883,7 @@ async fn sample_native_audio_during_recording(state: AppState, session_id: Strin
                             observation.losses,
                             observation.selected_input,
                             observation.generation,
+                            system_audio_sample(active),
                         )
                     })
                 }
@@ -7705,10 +7901,22 @@ async fn sample_native_audio_during_recording(state: AppState, session_id: Strin
             source_loss_event_after_ms,
             selected_input,
             generation,
+            system_audio,
         )) = counters
         else {
             return;
         };
+
+        // Plan 069: a system-audio stream the platform stopped mid-session.
+        // The bus already ramped it out; the session keeps its microphone.
+        if let Some((_, losses)) = system_audio.as_ref()
+            && !losses.is_empty()
+        {
+            for loss in losses {
+                emit_system_audio_lost_health_event(&state, &session_id, loss);
+            }
+            reemit_active_recording_status(&state, &session_id).await;
+        }
 
         if generation != microphone_generation {
             microphone_generation = generation;
@@ -7761,12 +7969,15 @@ async fn sample_native_audio_during_recording(state: AppState, session_id: Strin
             });
         let diagnostic_stats = {
             let mut diagnostics = state.diagnostics.lock().await;
-            let next = apply_audio_stats(
-                diagnostics.clone(),
-                captured_frames,
-                dropped_frames,
-                coverage,
-                Some(live_peak),
+            let next = apply_system_audio_stats(
+                apply_audio_stats(
+                    diagnostics.clone(),
+                    captured_frames,
+                    dropped_frames,
+                    coverage,
+                    Some(live_peak),
+                ),
+                system_audio.as_ref().map(|(observation, _)| observation),
             );
             *diagnostics = next.clone();
             next
@@ -7776,6 +7987,20 @@ async fn sample_native_audio_during_recording(state: AppState, session_id: Strin
             apply_runtime_diagnostics_snapshot(diagnostic_stats, state.ffmpeg_work.snapshot()),
         );
     }
+}
+
+/// The session's system-audio meter and counters, plus any losses the bus
+/// reported since the last sample. `None` where the session cannot mix
+/// system audio (its `diagnostics.stats` omits every system field).
+fn system_audio_sample(
+    active: &ActiveRecording,
+) -> Option<(
+    crate::session_audio::SystemAudioObservation,
+    Vec<crate::session_audio::SystemAudioLoss>,
+)> {
+    let system_audio = active.system_audio.as_ref()?;
+    let losses = std::iter::from_fn(|| system_audio.claim_loss()).collect();
+    Some((system_audio.observation(), losses))
 }
 
 fn emit_microphone_input_lost_health_event(
@@ -8114,6 +8339,7 @@ async fn monitor_session(
                     input_state: observation.input_state,
                     source_loss_after_ms: observation.source_loss_after_ms,
                     unreported_source_loss_after_ms: observation.losses,
+                    system_audio: system_audio_sample(active),
                 }
             });
             MonitoredRecording {
@@ -8355,6 +8581,19 @@ async fn monitor_session(
                 // Session over: the live meter must fall silent, not freeze.
                 None,
             );
+            // The system meter falls silent too (a detached observation
+            // omits it); the final counters stay.
+            let final_system_audio =
+                native_audio_stats
+                    .system_audio
+                    .as_ref()
+                    .map(
+                        |(observation, _)| crate::session_audio::SystemAudioObservation {
+                            attached: false,
+                            ..observation.clone()
+                        },
+                    );
+            let next = apply_system_audio_stats(next, final_system_audio.as_ref());
             *diagnostics = next.clone();
             next
         };
@@ -8362,6 +8601,13 @@ async fn monitor_session(
             "diagnostics.stats",
             apply_runtime_diagnostics_snapshot(diagnostic_stats, state.ffmpeg_work.snapshot()),
         );
+        for loss in native_audio_stats
+            .system_audio
+            .iter()
+            .flat_map(|(_, losses)| losses)
+        {
+            emit_system_audio_lost_health_event(&state, &session_id, loss);
+        }
         for source_loss_after_ms in &native_audio_stats.unreported_source_loss_after_ms {
             emit_microphone_input_lost_health_event(
                 &state,
@@ -10360,6 +10606,12 @@ struct NativeAudioStats {
     input_state: NativeAudioInputState,
     source_loss_after_ms: Option<u64>,
     unreported_source_loss_after_ms: Vec<crate::session_audio::SourceLoss>,
+    /// Final system-audio counters and losses the sampler had not reported
+    /// (plan 069 S4); `None` where the session cannot mix system audio.
+    system_audio: Option<(
+        crate::session_audio::SystemAudioObservation,
+        Vec<crate::session_audio::SystemAudioLoss>,
+    )>,
 }
 
 impl NativeAudioStats {
@@ -15573,6 +15825,12 @@ fn bridge_compositor_ffmpeg_args_with_encoder(
     encoder: &ResolvedFfmpegH264Encoder,
 ) -> Result<Vec<String>> {
     validate_stream_targets_for_ffmpeg(stream_targets)?;
+    let session_params = ffmpeg_session_params(
+        capture,
+        params,
+        crate::system_audio_session::system_audio_capable(),
+    );
+    let params = session_params.as_ref();
     let mut args = vec![
         "-n".to_string(),
         "-hide_banner".to_string(),
@@ -15730,6 +15988,12 @@ fn bridge_compositor_split_output_ffmpeg_args(
     stream_output: CompositorAuxiliaryOutput,
 ) -> Result<Vec<String>> {
     validate_stream_targets_for_ffmpeg(stream_targets)?;
+    let session_params = ffmpeg_session_params(
+        capture,
+        params,
+        crate::system_audio_session::system_audio_capable(),
+    );
+    let params = session_params.as_ref();
     let simulcast_mode = stream_output.composes_simulcast_scene;
     // The caption/profile split exists to protect a local recording, so it
     // requires one; a dual-orientation session may be stream-only.
@@ -16267,6 +16531,12 @@ fn ffmpeg_args_with_encoder(
     encoder: &ResolvedFfmpegH264Encoder,
 ) -> Result<Vec<String>> {
     validate_stream_targets_for_ffmpeg(stream_targets)?;
+    let session_params = ffmpeg_session_params(
+        capture,
+        params,
+        crate::system_audio_session::system_audio_capable(),
+    );
+    let params = session_params.as_ref();
     let mut args = vec![
         "-n".to_string(),
         "-hide_banner".to_string(),
@@ -16816,6 +17086,77 @@ fn append_audio_encoding_with_video_clock(
     }
 }
 
+fn clamped_microphone_sync_offset_ms(audio: &AudioSettings) -> i32 {
+    audio
+        .microphone_sync_offset_ms
+        .clamp(MICROPHONE_SYNC_OFFSET_MIN_MS, MICROPHONE_SYNC_OFFSET_MAX_MS)
+}
+
+/// Plan 069 decision 8, fixed at session start: on a platform that can mix
+/// system audio, the microphone offset `o_mic` and the system offset `o_sys`
+/// split into one FFmpeg whole-track shift `min(o_mic, o_sys)` and a
+/// non-negative bus delay per source. `None` where sessions cannot mix system
+/// audio: the whole microphone offset stays in FFmpeg, exactly as before.
+fn session_audio_sync(
+    audio: &AudioSettings,
+    system_audio_capable: bool,
+) -> Option<crate::session_audio::SyncOffsetSplit> {
+    system_audio_capable.then(|| {
+        crate::session_audio::split_sync_offsets(
+            clamped_microphone_sync_offset_ms(audio),
+            crate::system_audio_session::SYSTEM_AUDIO_SYNC_OFFSET_MS,
+        )
+    })
+}
+
+/// The session audio bus timing (plan 069 decisions 8 and 13). Every session
+/// on a system-audio platform runs at the system-audio playout delay with the
+/// decision 8 delays, whether or not the switch is on, so a live toggle never
+/// needs an FFmpeg change. Elsewhere the bus keeps its defaults.
+fn session_audio_options(
+    audio: &AudioSettings,
+    system_audio_capable: bool,
+) -> crate::session_audio::SessionAudioOptions {
+    match session_audio_sync(audio, system_audio_capable) {
+        Some(split) => crate::session_audio::SessionAudioOptions {
+            playout_delay: crate::session_audio::SYSTEM_AUDIO_PLAYOUT_DELAY,
+            microphone_delay_frames: split.microphone_delay_frames,
+            system_delay_frames: split.system_delay_frames,
+            system_gain_db: audio.system_audio_gain_db,
+        },
+        None => crate::session_audio::SessionAudioOptions::default(),
+    }
+}
+
+/// FFmpeg's view of the session parameters (plan 069 decision 8). When the
+/// microphone reaches FFmpeg through the session audio bus on a platform that
+/// can mix system audio, the bus already delays it by `o_mic - min(o_mic,
+/// o_sys)`, so FFmpeg shifts the one track by `min(o_mic, o_sys)` only; every
+/// output (record, tee, copy fan-out, split and simulcast legs) derives from
+/// that, stream legs still adding their egress advance.
+///
+/// With `o_sys = 0` a non-positive `o_mic` is untouched (the arguments are
+/// unchanged). A positive `o_mic` moves from `adelay=o_mic` into the bus as
+/// `o_mic` ms of leading silence, the same PCM timing; the record leg then
+/// carries no shift and a stream leg `atrim` of its 130 ms advance alone.
+fn ffmpeg_session_params<'a>(
+    capture: &CaptureInputs,
+    params: &'a StartSessionParams,
+    system_audio_capable: bool,
+) -> std::borrow::Cow<'a, StartSessionParams> {
+    let track_shift_ms = session_audio_sync(&params.audio, system_audio_capable)
+        .filter(|_| microphone_uses_session_bus(capture.microphone.as_ref()))
+        .map(|split| split.track_shift_ms);
+    match track_shift_ms {
+        Some(shift) if shift != params.audio.microphone_sync_offset_ms => {
+            let mut adjusted = params.clone();
+            adjusted.audio.microphone_sync_offset_ms = shift;
+            std::borrow::Cow::Owned(adjusted)
+        }
+        _ => std::borrow::Cow::Borrowed(params),
+    }
+}
+
 fn capture_audio_filter(input_layout: &InputLayout, audio: &AudioSettings) -> String {
     let has_microphone = input_layout
         .audio_inputs
@@ -16828,9 +17169,7 @@ fn capture_audio_filter(input_layout: &InputLayout, audio: &AudioSettings) -> St
     let mut filters = Vec::new();
 
     if has_microphone {
-        let offset_ms = audio
-            .microphone_sync_offset_ms
-            .clamp(MICROPHONE_SYNC_OFFSET_MIN_MS, MICROPHONE_SYNC_OFFSET_MAX_MS);
+        let offset_ms = clamped_microphone_sync_offset_ms(audio);
         if offset_ms != 0 {
             if offset_ms > 0 {
                 filters.push(format!("adelay={offset_ms}:all=1"));
@@ -17061,8 +17400,27 @@ fn append_live_preview_output_args(args: &mut Vec<String>, jpeg_quality: u32) {
 }
 
 fn capture_audio_tracks(capture: &CaptureInputs) -> Vec<AudioTrack> {
+    capture_audio_tracks_for(capture, crate::system_audio_session::system_audio_capable())
+}
+
+/// The session's audio tracks. On a platform that can mix system audio, the
+/// track fed by the session audio bus reports `mix_sources` (plan 069 S4):
+/// the bus is one mixed track whose microphone slot is always present (paced
+/// silence when no microphone is selected, which is also the system-only
+/// session). Its id stays `microphone` and its label `Microphone`: the label
+/// is the file's audio title metadata, fixed when FFmpeg starts, while system
+/// audio can join or leave at any time. `mix_sources` is what tells them
+/// apart; [`with_system_audio_mix`] keeps it current.
+fn capture_audio_tracks_for(
+    capture: &CaptureInputs,
+    system_audio_capable: bool,
+) -> Vec<AudioTrack> {
     if capture.microphone.is_some() {
-        return vec![microphone_audio_track()];
+        let mut track = microphone_audio_track();
+        if system_audio_capable && microphone_uses_session_bus(capture.microphone.as_ref()) {
+            track.mix_sources = crate::system_audio_session::bus_mix_sources(false);
+        }
+        return vec![track];
     }
 
     if matches!(capture.video, VideoInput::TestPattern) {
@@ -17070,6 +17428,37 @@ fn capture_audio_tracks(capture: &CaptureInputs) -> Vec<AudioTrack> {
     }
 
     Vec::new()
+}
+
+/// Rewrites the bus track's `mix_sources` with the live system-audio state.
+/// `None` (no system-audio switch on this session) leaves tracks as they are.
+fn with_system_audio_mix(tracks: &[AudioTrack], system_attached: Option<bool>) -> Vec<AudioTrack> {
+    let mut tracks = tracks.to_vec();
+    if let Some(attached) = system_attached {
+        for track in tracks
+            .iter_mut()
+            .filter(|track| !track.mix_sources.is_empty())
+        {
+            track.mix_sources = crate::system_audio_session::bus_mix_sources(attached);
+        }
+    }
+    tracks
+}
+
+/// The microphone reaches FFmpeg as the session audio bus FIFO (every macOS
+/// microphone path, the paced-silence path, and the Windows capture worker),
+/// not as a device FFmpeg opens itself.
+fn microphone_uses_session_bus(microphone: Option<&MicrophoneInput>) -> bool {
+    matches!(
+        microphone,
+        Some(
+            MicrophoneInput::SessionPcm { .. }
+                | MicrophoneInput::CoreAudio {
+                    fifo_path: Some(_),
+                    ..
+                }
+        )
+    )
 }
 
 fn microphone_audio_track() -> AudioTrack {
@@ -20478,6 +20867,7 @@ mod tests {
             input_state: NativeAudioInputState::Stopped,
             source_loss_after_ms: None,
             unreported_source_loss_after_ms: vec![],
+            system_audio: None,
         };
         assert_eq!(stats.silence_verdict(), None);
         stats.selected_input = true;
@@ -23763,6 +24153,7 @@ mod tests {
             audio_tracks: Vec::new(),
             pipeline: RecordingPipeline::new(false, true, &[]),
             native_audio: None,
+            system_audio: None,
             ffmpeg_live_audio_session: None,
             screen_overlay: None,
             encoder_bridge: None,
@@ -29723,6 +30114,7 @@ mod tests {
             audio_tracks: audio_tracks.clone(),
             pipeline: RecordingPipeline::new(true, false, &audio_tracks),
             native_audio: None,
+            system_audio: None,
             ffmpeg_live_audio_session: Some(live_audio_session.clone()),
             screen_overlay: None,
             encoder_bridge: None,
@@ -33830,6 +34222,713 @@ mod tests {
             super::post_recording_repair_timeout(None),
             Duration::from_secs(1800)
         );
+    }
+
+    // ---- Plan 069 S4: sessions use system audio ----------------------------
+    mod system_audio_session_tests {
+        use super::*;
+        use crate::system_audio_session::test_support::FakeSystemAudio;
+        use crate::system_audio_session::{
+            SYSTEM_AUDIO_LOST_CODE, SYSTEM_AUDIO_SYNC_OFFSET_MS, SYSTEM_AUDIO_UNAVAILABLE_CODE,
+            system_audio_capable,
+        };
+
+        const BUS_FIFO: &str = "/tmp/videorc-system-audio-bus.f32le";
+
+        fn bus_capture(video: VideoInput) -> CaptureInputs {
+            CaptureInputs {
+                video,
+                camera_index: None,
+                microphone: Some(MicrophoneInput::SessionPcm {
+                    fifo_path: PathBuf::from(BUS_FIFO),
+                }),
+            }
+        }
+
+        fn params_with_offset(
+            record_enabled: bool,
+            stream_enabled: bool,
+            offset_ms: i32,
+        ) -> StartSessionParams {
+            let mut params = base_params(record_enabled, stream_enabled);
+            params.audio.microphone_sync_offset_ms = offset_ms;
+            params
+        }
+
+        fn all_values<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
+            args.windows(2)
+                .filter(|pair| pair[0] == name)
+                .map(|pair| pair[1].as_str())
+                .collect()
+        }
+
+        /// Every audio map in `args` reads the one bus input, and its index.
+        fn single_bus_audio_input(args: &[String]) -> String {
+            let bus_index = args.iter().filter(|arg| arg.as_str() == "-i").count();
+            let input_index = args
+                .windows(2)
+                .filter(|pair| pair[0] == "-i")
+                .position(|pair| pair[1] == BUS_FIFO)
+                .unwrap_or_else(|| panic!("the bus FIFO is an input: {args:?} ({bus_index})"));
+            assert_eq!(
+                args.iter().filter(|arg| arg.as_str() == BUS_FIFO).count(),
+                1,
+                "the bus FIFO is opened exactly once: {args:?}"
+            );
+            let maps = all_values(args, "-map")
+                .into_iter()
+                .filter(|map| map.ends_with(":a?"))
+                .collect::<Vec<_>>();
+            assert!(!maps.is_empty(), "audio is mapped: {args:?}");
+            let expected = format!("{input_index}:a?");
+            assert!(
+                maps.iter().all(|map| *map == expected),
+                "every leg maps the one bus input {expected}: {maps:?}"
+            );
+            expected
+        }
+
+        const NO_SHIFT: &str = "aresample=async=1:first_pts=0,apad";
+        const STREAM_ADVANCE_ONLY: &str =
+            "atrim=start=0.130,asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,apad";
+
+        fn filters_for(record_offset_ms: i32, stream_offset_ms: i32) -> (String, String) {
+            let chain = |offset: i32| {
+                let mut filters = Vec::new();
+                if offset > 0 {
+                    filters.push(format!("adelay={offset}:all=1"));
+                } else if offset < 0 {
+                    filters.push(format!(
+                        "atrim=start={:.3}",
+                        f64::from(offset.saturating_abs()) / 1000.0
+                    ));
+                    filters.push("asetpts=PTS-STARTPTS".to_string());
+                }
+                filters.push(NO_SHIFT.to_string());
+                filters.join(",")
+            };
+            (chain(record_offset_ms), chain(stream_offset_ms))
+        }
+
+        // -- offsets --------------------------------------------------------
+
+        #[test]
+        fn the_bus_runs_the_system_audio_timing_only_where_it_can_mix() {
+            let mut audio = AudioSettings::default();
+            audio.microphone_sync_offset_ms = 120;
+            audio.system_audio_gain_db = -9.0;
+            let capable = session_audio_options(&audio, true);
+            assert_eq!(
+                capable.playout_delay,
+                crate::session_audio::SYSTEM_AUDIO_PLAYOUT_DELAY
+            );
+            assert_eq!(capable.microphone_delay_frames, 120 * 48);
+            assert_eq!(capable.system_delay_frames, 0);
+            assert_eq!(capable.system_gain_db, -9.0);
+
+            // Elsewhere the bus keeps its pre-mixer defaults exactly.
+            assert_eq!(
+                session_audio_options(&audio, false),
+                crate::session_audio::SessionAudioOptions::default()
+            );
+
+            // A clamped offset splits from the clamped value.
+            audio.microphone_sync_offset_ms = 5_000;
+            assert_eq!(
+                session_audio_options(&audio, true).microphone_delay_frames,
+                MICROPHONE_SYNC_OFFSET_MAX_MS as u64 * 48
+            );
+            audio.microphone_sync_offset_ms = -5_000;
+            assert_eq!(
+                session_audio_options(&audio, true).microphone_delay_frames,
+                0
+            );
+        }
+
+        #[test]
+        fn non_positive_microphone_offsets_leave_the_ffmpeg_params_untouched() {
+            assert_eq!(SYSTEM_AUDIO_SYNC_OFFSET_MS, 0);
+            let capture = bus_capture(VideoInput::TestPattern);
+            for offset in (MICROPHONE_SYNC_OFFSET_MIN_MS..=0).step_by(10) {
+                let params = params_with_offset(true, true, offset);
+                assert!(
+                    matches!(
+                        ffmpeg_session_params(&capture, &params, true),
+                        std::borrow::Cow::Borrowed(_)
+                    ),
+                    "o_mic {offset} must reach FFmpeg unchanged"
+                );
+            }
+            // Only bus-fed microphones on a capable platform ever change.
+            let params = params_with_offset(true, true, 250);
+            let direct = CaptureInputs {
+                video: VideoInput::MacScreen { index: 3 },
+                camera_index: None,
+                microphone: Some(MicrophoneInput::AvFoundation { index: 1 }),
+            };
+            assert!(matches!(
+                ffmpeg_session_params(&direct, &params, true),
+                std::borrow::Cow::Borrowed(_)
+            ));
+            assert!(matches!(
+                ffmpeg_session_params(&capture, &params, false),
+                std::borrow::Cow::Borrowed(_)
+            ));
+            let moved = ffmpeg_session_params(&capture, &params, true);
+            assert_eq!(moved.audio.microphone_sync_offset_ms, 0);
+        }
+
+        /// The mic-offset change on macOS, pinned: a positive `o_mic` leaves
+        /// FFmpeg's `adelay` for a bus delay of the same length, so the audio
+        /// lands at the same time in every leg. Record: shift + bus delay ==
+        /// o_mic. Stream: its 130 ms egress advance is still applied on top.
+        #[test]
+        fn moving_a_positive_offset_into_the_bus_keeps_every_leg_timing() {
+            for offset in (MICROPHONE_SYNC_OFFSET_MIN_MS..=MICROPHONE_SYNC_OFFSET_MAX_MS).step_by(5)
+            {
+                let mut audio = AudioSettings::default();
+                audio.microphone_sync_offset_ms = offset;
+                let split = session_audio_sync(&audio, true).unwrap();
+                let bus_delay_ms = (split.microphone_delay_frames / 48) as i32;
+                assert_eq!(split.microphone_delay_frames % 48, 0);
+                assert!(bus_delay_ms >= 0);
+                assert_eq!(
+                    split.track_shift_ms + bus_delay_ms,
+                    offset,
+                    "record, o_mic {offset}"
+                );
+
+                let mut shifted = audio.clone();
+                shifted.microphone_sync_offset_ms = split.track_shift_ms;
+                let before = stream_output_audio_settings(&audio).microphone_sync_offset_ms;
+                let after = stream_output_audio_settings(&shifted).microphone_sync_offset_ms;
+                assert_eq!(after + bus_delay_ms, before, "stream, o_mic {offset}");
+            }
+        }
+
+        // -- legs -----------------------------------------------------------
+
+        #[test]
+        fn record_only_maps_the_bus_once_with_the_split_shift() {
+            for (offset, expected) in [
+                (120, if system_audio_capable() { 0 } else { 120 }),
+                (0, 0),
+                (-120, -120),
+            ] {
+                let params = params_with_offset(true, false, offset);
+                let args = bridge_recording_ffmpeg_args(
+                    &bus_capture(VideoInput::TestPattern),
+                    &params,
+                    Some(Path::new("/tmp/videorc-system-audio-record.mkv")),
+                    Path::new("/tmp/videorc-system-audio-record.ts"),
+                    select_encoder_bridge_video_output(None, true, false),
+                )
+                .unwrap();
+                single_bus_audio_input(&args);
+                let (record, _) = filters_for(expected, 0);
+                assert_eq!(
+                    all_values(&args, "-af"),
+                    vec![record.as_str()],
+                    "o_mic {offset}"
+                );
+            }
+        }
+
+        #[test]
+        fn legacy_tee_maps_the_bus_once_with_the_split_shift() {
+            let streaming = streaming_for(&[(
+                StreamPlatform::Youtube,
+                "rtmp://a.rtmp.youtube.com/live2",
+                "yt",
+            )]);
+            let targets = stream_targets_from_streaming(&streaming).unwrap();
+            for (offset, expected) in [
+                (120, if system_audio_capable() { 0 } else { 120 }),
+                (-120, -120),
+            ] {
+                let params = params_with_offset(true, true, offset);
+                let args = ffmpeg_args(
+                    &bus_capture(VideoInput::MacScreen { index: 3 }),
+                    &params,
+                    Some(Path::new("/tmp/videorc-system-audio-tee.mkv")),
+                    &targets,
+                    None,
+                )
+                .unwrap();
+                assert!(args.contains(&"tee".to_string()), "{args:?}");
+                single_bus_audio_input(&args);
+                let (record, _) = filters_for(expected, 0);
+                assert_eq!(
+                    all_values(&args, "-af"),
+                    vec![record.as_str()],
+                    "o_mic {offset}"
+                );
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn copy_fan_out_maps_the_bus_once_per_leg_with_the_split_shift() {
+            let streaming = streaming_for(&[
+                (
+                    StreamPlatform::Youtube,
+                    "rtmp://a.rtmp.youtube.com/live2",
+                    "yt",
+                ),
+                (StreamPlatform::Twitch, "rtmp://live.twitch.tv/app", "tw"),
+            ]);
+            let targets = stream_targets_from_streaming(&streaming).unwrap();
+            // Copy fan-out legs carry no stream egress advance: every leg
+            // uses the record shift.
+            for (offset, shift) in [(120, 0), (0, 0), (-120, -120)] {
+                let params = params_with_offset(true, true, offset);
+                let args = bridge_compositor_ffmpeg_args(
+                    &bus_capture(VideoInput::TestPattern),
+                    &params,
+                    Some(Path::new("/tmp/videorc-system-audio-fanout.mkv")),
+                    &targets,
+                    Path::new("/tmp/videorc-system-audio-fanout.ts"),
+                    EncoderBridgeVideoOutput::VideoToolboxH264MpegTs,
+                )
+                .unwrap();
+                assert!(!args.contains(&"tee".to_string()));
+                single_bus_audio_input(&args);
+                let (chain, _) = filters_for(shift, 0);
+                assert_eq!(
+                    all_values(&args, "-af"),
+                    vec![chain.as_str(), chain.as_str(), chain.as_str()],
+                    "file + two FLV legs, o_mic {offset}"
+                );
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn split_output_and_the_vertical_simulcast_leg_map_the_bus_once() {
+            for record_enabled in [true, false] {
+                let (mut params, targets) = simulcast_split_params(record_enabled);
+                params.audio.microphone_sync_offset_ms = 200;
+                let stream_output = recording_compositor_stream_output(
+                    &params,
+                    EncoderBridgeVideoOutput::VideoToolboxH264MpegTs,
+                )
+                .unwrap()
+                .expect("simulcast auxiliary output");
+                let args = bridge_compositor_split_output_ffmpeg_args(
+                    &bus_capture(VideoInput::TestPattern),
+                    &params,
+                    record_enabled.then_some(Path::new("/tmp/videorc-system-audio-split.mkv")),
+                    &targets,
+                    Path::new("/tmp/videorc-system-audio-split-recording.ts"),
+                    Path::new("/tmp/videorc-system-audio-split-stream.ts"),
+                    EncoderBridgeVideoOutput::VideoToolboxH264MpegTs,
+                    stream_output,
+                )
+                .unwrap();
+                assert_eq!(single_bus_audio_input(&args), "0:a?");
+                let mut expected = Vec::new();
+                if record_enabled {
+                    expected.push(NO_SHIFT);
+                }
+                // Before plan 069 a +200 ms offset streamed as adelay 200 -
+                // 130 = 70 ms; now the bus delays 200 ms and each stream leg
+                // trims its 130 ms advance alone.
+                expected.extend([STREAM_ADVANCE_ONLY, STREAM_ADVANCE_ONLY]);
+                assert_eq!(
+                    all_values(&args, "-af"),
+                    expected,
+                    "horizontal + vertical legs, record {record_enabled}"
+                );
+            }
+        }
+
+        // -- track list -----------------------------------------------------
+
+        #[test]
+        fn the_bus_track_reports_its_mix_and_keeps_its_id_and_title() {
+            let bus = capture_audio_tracks_for(&bus_capture(VideoInput::TestPattern), true);
+            assert_eq!(bus.len(), 1);
+            assert_eq!(bus[0].id, "microphone");
+            assert_eq!(bus[0].label, "Microphone");
+            assert_eq!(bus[0].source, AudioTrackSource::Microphone);
+            assert_eq!(bus[0].mix_sources, vec![AudioTrackSource::Microphone]);
+
+            let mixed = with_system_audio_mix(&bus, Some(true));
+            assert_eq!(
+                mixed[0].mix_sources,
+                vec![AudioTrackSource::Microphone, AudioTrackSource::SystemAudio]
+            );
+            assert_eq!(
+                with_system_audio_mix(&mixed, Some(false))[0].mix_sources,
+                vec![AudioTrackSource::Microphone]
+            );
+            let wire = serde_json::to_value(&mixed[0]).unwrap();
+            assert_eq!(wire["id"], "microphone");
+            assert_eq!(
+                wire["mixSources"],
+                serde_json::json!(["microphone", "system-audio"])
+            );
+
+            // No mix where the platform cannot mix, or FFmpeg opens the device.
+            let plain = capture_audio_tracks_for(&bus_capture(VideoInput::TestPattern), false);
+            assert_eq!(plain, vec![microphone_audio_track()]);
+            assert!(
+                with_system_audio_mix(&plain, None)[0]
+                    .mix_sources
+                    .is_empty()
+            );
+            let direct = capture_audio_tracks_for(
+                &CaptureInputs {
+                    video: VideoInput::MacScreen { index: 3 },
+                    camera_index: None,
+                    microphone: Some(MicrophoneInput::AvFoundation { index: 1 }),
+                },
+                true,
+            );
+            assert_eq!(direct, vec![microphone_audio_track()]);
+            let tone = capture_audio_tracks_for(
+                &CaptureInputs {
+                    video: VideoInput::TestPattern,
+                    camera_index: None,
+                    microphone: None,
+                },
+                true,
+            );
+            assert_eq!(tone, vec![test_tone_audio_track()]);
+        }
+
+        // -- live session ---------------------------------------------------
+
+        struct LiveSession {
+            state: AppState,
+            session_id: String,
+            fake: FakeSystemAudio,
+            _reader: std::thread::JoinHandle<()>,
+        }
+
+        /// A published session whose bus is the paced-silence path (no
+        /// microphone): the system-only shape.
+        async fn live_session(session_id: &str) -> LiveSession {
+            let state = test_state();
+            state
+                .database
+                .ensure_fake_live_chat_session(session_id)
+                .unwrap();
+            let path = crate::audio::native_audio_fifo_path(&format!(
+                "{session_id}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            crate::audio::create_native_audio_fifo(&path).unwrap();
+            let reader_path = path.clone();
+            let reader = std::thread::spawn(move || {
+                use std::io::Read;
+                let Ok(mut file) = std::fs::File::open(&reader_path) else {
+                    return;
+                };
+                let mut buffer = [0_u8; 16_384];
+                while matches!(file.read(&mut buffer), Ok(read) if read > 0) {}
+            });
+            let mut audio = AudioSettings::default();
+            audio.system_audio_enabled = false;
+            let session_audio = crate::session_audio::attach_prepared_with(
+                None,
+                path,
+                None,
+                AudioProcessingSettings::default(),
+                crate::audio::NATIVE_AUDIO_SOURCE_STALL_TIMEOUT,
+                session_audio_options(&audio, true),
+            );
+            let fake = FakeSystemAudio::default();
+            let system_audio = start_session_system_audio(
+                &state,
+                session_id,
+                session_audio.system_audio(),
+                fake.opener(),
+            );
+            let mut active = test_active_recording_stub(session_id);
+            active.audio_tracks =
+                capture_audio_tracks_for(&bus_capture(VideoInput::TestPattern), true);
+            active.native_audio = Some(session_audio);
+            active.system_audio = Some(system_audio);
+            *state.recording.lock().await = Some(active);
+            LiveSession {
+                state,
+                session_id: session_id.to_string(),
+                fake,
+                _reader: reader,
+            }
+        }
+
+        impl LiveSession {
+            async fn toggle(&self, enabled: Option<bool>) -> AudioProcessingUpdateResult {
+                update_active_audio_processing(
+                    &self.state,
+                    AudioProcessingUpdateParams {
+                        session_id: self.session_id.clone(),
+                        microphone_gain_db: 2.0,
+                        microphone_muted: false,
+                        system_audio_enabled: enabled,
+                        system_audio_gain_db: Some(-3.0),
+                    },
+                )
+                .await
+            }
+
+            async fn mix_sources(&self) -> Vec<AudioTrackSource> {
+                let recording = self.state.recording.lock().await;
+                let active = recording.as_ref().unwrap();
+                active.status(active.running_state(), None).audio_tracks[0]
+                    .mix_sources
+                    .clone()
+            }
+
+            async fn end(self) {
+                let active = self.state.recording.lock().await.take();
+                drop(active);
+            }
+        }
+
+        async fn next_status_with(
+            events: &mut broadcast::Receiver<crate::protocol::ServerEvent>,
+            session_id: &str,
+            system_audio: bool,
+        ) -> RecordingStatus {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = match events.recv().await {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(error) => panic!("event stream closed: {error}"),
+                    };
+                    if event.event != "recording.status" {
+                        continue;
+                    }
+                    let status: RecordingStatus = serde_json::from_value(event.payload).unwrap();
+                    let mixes_system = status
+                        .audio_tracks
+                        .iter()
+                        .any(|track| track.mix_sources.contains(&AudioTrackSource::SystemAudio));
+                    if status.session_id.as_deref() == Some(session_id)
+                        && mixes_system == system_audio
+                    {
+                        return status;
+                    }
+                }
+            })
+            .await
+            .expect("a recording.status with the expected mix")
+        }
+
+        async fn health_event(
+            state: &AppState,
+            session_id: &str,
+            code: &str,
+        ) -> crate::protocol::HealthEvent {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(event) = state
+                        .database
+                        .list_health_events(session_id)
+                        .unwrap()
+                        .into_iter()
+                        .find(|event| event.code == code)
+                    {
+                        return event;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("health event {code}"))
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_off_then_toggle_on_and_off_mid_session() {
+            let session = live_session("system-audio-toggle").await;
+            let mut events = session.state.events.subscribe();
+            assert_eq!(
+                session.mix_sources().await,
+                vec![AudioTrackSource::Microphone]
+            );
+
+            let result = session.toggle(Some(true)).await;
+            assert!(result.applied, "{result:?}");
+            assert_eq!(result.microphone_gain_db, 2.0);
+            let status = next_status_with(&mut events, &session.session_id, true).await;
+            assert!(matches!(status.state, RecordingState::Recording));
+            assert_eq!(
+                status.audio_tracks[0].mix_sources,
+                vec![AudioTrackSource::Microphone, AudioTrackSource::SystemAudio]
+            );
+            assert_eq!(status.audio_tracks[0].id, "microphone");
+            assert_eq!(session.fake.live(), 1);
+
+            // A mic-only update (system fields omitted) changes nothing.
+            session.toggle(None).await;
+            sleep(Duration::from_millis(100)).await;
+            assert_eq!(session.fake.opens(), 1);
+            assert!(
+                session
+                    .mix_sources()
+                    .await
+                    .contains(&AudioTrackSource::SystemAudio)
+            );
+
+            session.toggle(Some(false)).await;
+            next_status_with(&mut events, &session.session_id, false).await;
+            assert_eq!(
+                session.mix_sources().await,
+                vec![AudioTrackSource::Microphone]
+            );
+            timeout(Duration::from_secs(10), async {
+                while session.fake.live() != 0 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("Off closes the capture");
+            session.end().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_on_joins_after_publication_and_start_off_opens_nothing() {
+            let session = live_session("system-audio-start-on").await;
+            let mut events = session.state.events.subscribe();
+            let mut off = AudioSettings::default();
+            off.system_audio_enabled = false;
+            {
+                let recording = session.state.recording.lock().await;
+                request_initial_system_audio(recording.as_ref().unwrap(), &off);
+            }
+            sleep(Duration::from_millis(100)).await;
+            assert_eq!(session.fake.opens(), 0, "Off means not captured at all");
+
+            let mut on = AudioSettings::default();
+            on.system_audio_enabled = true;
+            {
+                let recording = session.state.recording.lock().await;
+                request_initial_system_audio(recording.as_ref().unwrap(), &on);
+            }
+            next_status_with(&mut events, &session.session_id, true).await;
+            assert_eq!(session.fake.opens(), 1);
+            session.end().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_missing_permission_is_a_health_event_and_the_session_continues() {
+            let session = live_session("system-audio-permission").await;
+            session
+                .fake
+                .deny_permission
+                .store(true, std::sync::atomic::Ordering::Release);
+            let result = session.toggle(Some(true)).await;
+            assert!(result.applied, "the mic update still applies: {result:?}");
+            let event = health_event(
+                &session.state,
+                &session.session_id,
+                SYSTEM_AUDIO_UNAVAILABLE_CODE,
+            )
+            .await;
+            assert_eq!(
+                event.session_id.as_deref(),
+                Some(session.session_id.as_str())
+            );
+            assert!(matches!(event.level, HealthLevel::Warn));
+            assert!(event.message.contains("Screen Recording"), "{event:?}");
+            assert!(
+                event.message.contains("Settings > Permissions"),
+                "{event:?}"
+            );
+            assert_eq!(
+                event.permission_pane,
+                Some(crate::protocol::PermissionPane::ScreenRecording)
+            );
+            assert!(!event.message.contains('\u{2014}'), "no em dashes");
+            assert!(session.state.recording.lock().await.is_some());
+            assert_eq!(
+                session.mix_sources().await,
+                vec![AudioTrackSource::Microphone]
+            );
+            assert_eq!(session.fake.live(), 0);
+            session.end().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_stream_lost_mid_session_is_reported_and_leaves_the_mix() {
+            let session = live_session("system-audio-lost").await;
+            let mut events = session.state.events.subscribe();
+            tokio::spawn(sample_native_audio_during_recording(
+                session.state.clone(),
+                session.session_id.clone(),
+            ));
+            session.toggle(Some(true)).await;
+            next_status_with(&mut events, &session.session_id, true).await;
+
+            // While attached, diagnostics carry the system meter.
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let stats = session.state.diagnostics.lock().await.clone();
+                    if stats.system_audio_active == Some(true) {
+                        assert!(stats.system_audio_live_peak_db.is_some());
+                        assert!(stats.system_audio_live_level.is_some());
+                        break;
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("diagnostics.stats reports the attached system source");
+
+            session
+                .fake
+                .fail_latest("The user revoked Screen Recording.");
+            let event =
+                health_event(&session.state, &session.session_id, SYSTEM_AUDIO_LOST_CODE).await;
+            assert_eq!(
+                event.session_id.as_deref(),
+                Some(session.session_id.as_str())
+            );
+            assert_eq!(event.permission_pane, None, "{event:?}");
+            let status = next_status_with(&mut events, &session.session_id, false).await;
+            assert_eq!(
+                status.audio_tracks[0].mix_sources,
+                vec![AudioTrackSource::Microphone]
+            );
+            assert!(session.state.recording.lock().await.is_some());
+            let lost = session
+                .state
+                .database
+                .list_health_events(&session.session_id)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.code == SYSTEM_AUDIO_LOST_CODE)
+                .count();
+            assert_eq!(lost, 1, "one event per loss");
+            session.end().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sessions_without_a_system_switch_ignore_the_system_fields() {
+            let state = test_state();
+            *state.recording.lock().await = Some(test_active_recording_stub("no-system"));
+            let result = update_active_audio_processing(
+                &state,
+                AudioProcessingUpdateParams {
+                    session_id: "no-system".into(),
+                    microphone_gain_db: 1.0,
+                    microphone_muted: true,
+                    system_audio_enabled: Some(true),
+                    system_audio_gain_db: Some(6.0),
+                },
+            )
+            .await;
+            // Exactly the pre-plan-069 reply for a session with no audio path.
+            assert!(!result.applied);
+            assert_eq!(
+                result.reason_code.as_deref(),
+                Some("live-audio-control-unavailable")
+            );
+        }
     }
 }
 

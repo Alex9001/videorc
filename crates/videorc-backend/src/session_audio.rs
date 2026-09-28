@@ -27,7 +27,6 @@ pub const PLAYOUT_DELAY: Duration = Duration::from_millis(50);
 /// headroom, fixed at session start whether or not the switch is on. System
 /// buffers arrive 22-52 ms after their last sample (S0), so 50 ms would place
 /// about 31% of them behind the cursor.
-#[allow(dead_code)] // wired in S4
 pub const SYSTEM_AUDIO_PLAYOUT_DELAY: Duration = Duration::from_millis(150);
 /// The enable/disable envelope for a mixed source and the microphone handoff
 /// ramp: 5 ms at 48 kHz.
@@ -84,6 +83,11 @@ pub struct AudioTimeline {
     packets: VecDeque<QueuedPcm>,
     counters: AudioBusCounters,
     losses: BusLosses,
+    /// How far past the cursor a packet may land: [`MAX_BUFFERED_FRAMES`]
+    /// plus the source's bus delay, which places every packet that much
+    /// further ahead (plan 069 decision 8). Without it a microphone offset
+    /// near its +1000 ms ceiling would land beyond the cap and record silence.
+    ahead_limit: u64,
 }
 
 /// Why captured audio did not reach the bus, split by cause. Diagnostics only:
@@ -133,7 +137,14 @@ impl AudioTimeline {
             packets: VecDeque::new(),
             counters: AudioBusCounters::default(),
             losses: BusLosses::default(),
+            ahead_limit: MAX_BUFFERED_FRAMES,
         }
+    }
+
+    /// Widens the ahead-of-cursor cap by the source's bus delay.
+    fn with_delay_headroom(mut self, delay_frames: u64) -> Self {
+        self.ahead_limit = MAX_BUFFERED_FRAMES.saturating_add(delay_frames);
+        self
     }
 
     pub fn cursor(&self) -> u64 {
@@ -198,7 +209,7 @@ impl AudioTimeline {
         let frames = frames - trim;
         // The only ceiling is time ahead of the cursor. A packet count would
         // give a 128-frame callback device a fraction of the headroom.
-        if start.saturating_add(frames) > self.cursor.saturating_add(MAX_BUFFERED_FRAMES) {
+        if start.saturating_add(frames) > self.cursor.saturating_add(self.ahead_limit) {
             self.counters.dropped_frames += frames;
             self.losses.dropped_ahead_of_cap += frames;
             return false;
@@ -350,6 +361,19 @@ impl SourceRole {
         }
     }
 }
+/// A producer pool is full because an earlier capture is still opening or
+/// closing. Typed so a caller can wait for that cleanup instead of failing
+/// (the System audio switch retries across a just-detached capture); the
+/// message is unchanged.
+#[derive(Debug)]
+pub struct ProducerPoolBusy(&'static str);
+impl std::fmt::Display for ProducerPoolBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+impl std::error::Error for ProducerPoolBusy {}
+
 static PRODUCER_CLOSED: OnceLock<(std::sync::Mutex<()>, std::sync::Condvar)> = OnceLock::new();
 fn wait_for_producer_cleanup(count: &AtomicU64, deadline: Instant) -> bool {
     let (mutex, closed) = PRODUCER_CLOSED.get_or_init(Default::default);
@@ -405,7 +429,7 @@ impl ProducerPermit {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < role.producer_limit()).then_some(count + 1)
             })
-            .map_err(|_| anyhow::anyhow!(role.busy_message()))?;
+            .map_err(|_| anyhow::Error::new(ProducerPoolBusy(role.busy_message())))?;
         if !Arc::ptr_eq(&local, &platform) {
             local.fetch_add(1, Ordering::AcqRel);
         }
@@ -564,7 +588,6 @@ impl ProducerSource {
     /// Windows) for [`SystemAudioHandle::prepare`]. The bus never retires it
     /// for silence; it retires only when `failure` is filled or the receiver
     /// disconnects.
-    #[allow(dead_code)] // wired in S4
     pub fn system(
         device_id: String,
         device_name: String,
@@ -622,7 +645,6 @@ fn spawn_owner(task: OwnerTask) -> io::Result<thread::JoinHandle<()>> {
         .name("microphone-owner".into())
         .spawn(task)
 }
-#[allow(dead_code)] // wired in S4
 fn spawn_system_owner(task: OwnerTask) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("system-audio-owner".into())
@@ -989,6 +1011,10 @@ impl std::fmt::Debug for InitialAudioSource {
     }
 }
 enum InitialInput {
+    /// A bare CoreAudio source adopted at attach. Only tests build one since
+    /// S4 moved every session onto `attach_prepared_with`; production hands
+    /// over `Owned` producers (including the warm standby).
+    #[cfg_attr(not(test), allow(dead_code))]
     Warm(NativeAudioSource),
     Owned {
         producer: ManagedProducer,
@@ -996,6 +1022,7 @@ enum InitialInput {
     },
 }
 impl InitialAudioSource {
+    #[cfg(test)]
     pub fn warm(source: NativeAudioSource) -> Self {
         Self {
             source: InitialInput::Warm(source),
@@ -1100,7 +1127,6 @@ pub async fn prepare_initial_adapter(
 pub struct SessionAudio {
     pub fifo_path: PathBuf,
     handle: AudioSwitchHandle,
-    #[allow(dead_code)] // wired in S4
     system: SystemAudioHandle,
     processing_settings: AudioProcessingSettingsHandle,
     writer: Option<thread::JoinHandle<()>>,
@@ -1174,21 +1200,16 @@ impl SessionAudio {
     }
     /// Plan 069: the session's system-audio slot (prepare, attach, detach,
     /// gain, observation, loss events).
-    #[allow(dead_code)] // wired in S4
     pub fn system_audio(&self) -> SystemAudioHandle {
         self.system.clone()
     }
-    #[allow(dead_code)] // wired in S4
+    #[cfg(test)]
     pub async fn attach_system(&self, producer: SystemAudioProducer) -> anyhow::Result<u64> {
         self.system.attach(producer).await
     }
-    #[allow(dead_code)] // wired in S4
+    #[cfg(test)]
     pub async fn detach_system(&self) -> anyhow::Result<Option<u64>> {
         self.system.detach().await
-    }
-    #[allow(dead_code)] // wired in S4
-    pub fn system_audio_observation(&self) -> SystemAudioObservation {
-        self.system.observation()
     }
     fn stats(&self) -> Arc<AudioCaptureStats> {
         self.handle
@@ -1483,6 +1504,7 @@ impl Drop for SessionAudio {
     }
 }
 
+#[cfg(test)]
 pub fn attach(
     source: Option<NativeAudioSource>,
     fifo_path: PathBuf,
@@ -1499,6 +1521,7 @@ pub fn attach(
     )
 }
 
+#[cfg(test)]
 pub fn attach_prepared(
     source: Option<InitialAudioSource>,
     fifo_path: PathBuf,
@@ -1961,6 +1984,7 @@ impl PendingHandoff {
     /// replaces (plan 069 decision 8).
     fn with_delay(mut self, delay_frames: u64) -> Self {
         self.delay_frames = delay_frames;
+        self.pcm.ahead_limit = MAX_BUFFERED_FRAMES.saturating_add(delay_frames);
         self
     }
 
@@ -2180,14 +2204,12 @@ fn mix_chunk(
 /// Plan 069 decision 8: each source's offset `o_s` (ms, positive delays) is
 /// split into one FFmpeg whole-track shift `min(o_mic, o_sys)`, fixed at
 /// session start, and a non-negative bus delay `o_s - min` per source.
-#[allow(dead_code)] // wired in S4
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncOffsetSplit {
     pub track_shift_ms: i32,
     pub microphone_delay_frames: u64,
     pub system_delay_frames: u64,
 }
-#[allow(dead_code)] // wired in S4
 pub fn split_sync_offsets(microphone_offset_ms: i32, system_offset_ms: i32) -> SyncOffsetSplit {
     let shift = microphone_offset_ms.min(system_offset_ms);
     let frames = |offset: i32| {
@@ -2241,16 +2263,11 @@ impl std::fmt::Debug for SystemAudioProducer {
     }
 }
 impl SystemAudioProducer {
-    #[allow(dead_code)] // wired in S4
-    pub fn device_id(&self) -> &str {
-        &self.producer.device_id
-    }
     pub fn device_name(&self) -> &str {
         &self.producer.device_name
     }
 }
 
-#[allow(dead_code)] // wired in S4
 async fn prepare_system_audio_in(
     open: impl FnOnce() -> anyhow::Result<ProducerSource> + Send + 'static,
     cancelled: Arc<AtomicBool>,
@@ -2284,7 +2301,6 @@ async fn prepare_system_audio_in(
 
 /// Live system-audio state for Diagnostics (`systemAudio*` and
 /// `audioMixClippedSamples` on `diagnostics.stats`).
-#[allow(dead_code)] // wired in S4
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemAudioObservation {
     /// A system slot is in the mix (including before its first buffer).
@@ -2319,7 +2335,6 @@ struct SystemShared {
     losses: VecDeque<SystemAudioLoss>,
 }
 
-#[allow(dead_code)] // wired in S4
 enum SystemCommand {
     Attach {
         producer: SystemAudioProducer,
@@ -2347,12 +2362,10 @@ fn refuse_system_command(command: SystemCommand, reason: &str) {
 
 /// Only an explicit acknowledgement lets a caller observe an attach. A caller
 /// that gave up waiting is refused rather than attached behind its back.
-#[allow(dead_code)] // wired in S4
 const SYSTEM_ATTACH_DEADLINE: Duration = WRITE_DEADLINE;
 
 /// Controls the session's system-audio slot. Cloneable; every call is
 /// non-blocking or bounded.
-#[allow(dead_code)] // wired in S4
 #[derive(Clone)]
 pub struct SystemAudioHandle {
     commands: mpsc::SyncSender<SystemCommand>,
@@ -2361,7 +2374,6 @@ pub struct SystemAudioHandle {
     count: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 }
-#[allow(dead_code)] // wired in S4
 impl SystemAudioHandle {
     /// Opens a system-audio capture on its own owner thread, inside the
     /// system pool (limit 1). `open` builds the source with
@@ -2462,6 +2474,7 @@ impl SystemAudioHandle {
     }
 
     /// System producers this session owns (open, attached or closing).
+    #[cfg(test)]
     pub fn owned_producer_count(&self) -> u64 {
         self.count.load(Ordering::Acquire)
     }
@@ -2513,7 +2526,7 @@ impl SourceSlot {
             .take()
             .unwrap_or_else(|| mpsc::channel().1);
         let previous_producer_drops = producer.stats.dropped_frames();
-        let mut timeline = AudioTimeline::new();
+        let mut timeline = AudioTimeline::new().with_delay_headroom(delay_frames);
         timeline.cursor = cursor;
         timeline.select_generation(0);
         Self {
@@ -2869,7 +2882,7 @@ fn run_bus_owned(
     if receiver.is_none() {
         stats.mark_silent();
     }
-    let mut timeline = AudioTimeline::new();
+    let mut timeline = AudioTimeline::new().with_delay_headroom(timing.microphone_delay_frames);
     timeline.select_generation(0);
     let mut generation = 0;
     let mut pending: Option<PendingHandoff> = None;
@@ -5240,6 +5253,44 @@ mod mix_tests {
             return;
         }
         panic!("every attempt lost PCM to scheduling");
+    }
+
+    /// S4: a microphone offset at its +1000 ms ceiling becomes a 48 000-frame
+    /// bus delay on a system-audio platform (decision 8). Every delayed packet
+    /// then lands a full second plus the playout delay ahead of the cursor, so
+    /// the ahead-of-cursor cap widens by the delay or the take records silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn microphone_bus_delay_at_the_offset_ceiling_keeps_every_frame() {
+        const FRAMES: usize = 24_000;
+        const DELAY: usize = 48_000;
+        let options = SessionAudioOptions {
+            playout_delay: SYSTEM_AUDIO_PLAYOUT_DELAY,
+            ..SessionAudioOptions::default()
+        };
+        let mut attempts = Vec::new();
+        for _ in 0..4 {
+            let (base, delayed) = tokio::join!(
+                run_fixture_mic_session_with(FRAMES + DELAY, options),
+                run_fixture_mic_session_with(
+                    FRAMES + DELAY,
+                    SessionAudioOptions {
+                        microphone_delay_frames: DELAY as u64,
+                        ..options
+                    },
+                ),
+            );
+            if !clean(&base) || !clean(&delayed) {
+                attempts.push((base.status.counters, delayed.status.counters));
+                continue;
+            }
+            assert!(delayed.bytes[..DELAY * 8].iter().all(|byte| *byte == 0));
+            assert_eq!(
+                &delayed.bytes[DELAY * 8..(DELAY + FRAMES) * 8],
+                &base.bytes[..FRAMES * 8]
+            );
+            return;
+        }
+        panic!("every attempt lost PCM: {attempts:?}");
     }
 
     async fn run_fixture_mic_session_with(frames: usize, options: SessionAudioOptions) -> BusRun {

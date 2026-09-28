@@ -335,7 +335,6 @@ impl AudioCaptureStats {
         self.dropped_frames.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)] // read by the system-audio observation, wired in S4
     pub(crate) fn generated_frames(&self) -> u64 {
         self.generated_frames.load(Ordering::Relaxed)
     }

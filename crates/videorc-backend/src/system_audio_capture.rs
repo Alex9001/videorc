@@ -471,7 +471,6 @@ pub(crate) enum SystemAudioPhase {
     Running,
 }
 
-#[allow(dead_code)] // wired in S4
 impl SystemAudioFailure {
     /// The `health.event` kind S4 emits for this failure.
     pub(crate) fn health_kind(&self) -> &'static str {
@@ -545,23 +544,42 @@ fn mentions_permission(description: &str) -> bool {
 
 /// Shared, first-wins failure record. The capture writes it from SCK
 /// callbacks; the consumer polls it.
+///
+/// The same failure is mirrored as text into a
+/// [`crate::session_audio::ProducerFailure`], the slot the session audio bus
+/// polls to retire a lost system source (S4). Both are written under the
+/// typed slot's lock, before the frame channel disconnects, so the bus always
+/// reads the reason together with the loss.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SystemAudioFailureSlot(Arc<Mutex<Option<SystemAudioFailure>>>);
+pub(crate) struct SystemAudioFailureSlot {
+    failure: Arc<Mutex<Option<SystemAudioFailure>>>,
+    reason: crate::session_audio::ProducerFailure,
+}
 
 impl SystemAudioFailureSlot {
     pub(crate) fn get(&self) -> Option<SystemAudioFailure> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Records `failure` unless one is already recorded. Returns whether it
     /// was recorded.
     pub(crate) fn record(&self, failure: SystemAudioFailure) -> bool {
-        let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slot = self.failure.lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_some() {
             return false;
         }
+        *self.reason.lock().unwrap_or_else(|p| p.into_inner()) = Some(failure.to_string());
         *slot = Some(failure);
         true
+    }
+
+    /// The bus-facing view of this slot: `Some(reason)` once a failure is
+    /// recorded.
+    pub(crate) fn producer_failure(&self) -> crate::session_audio::ProducerFailure {
+        Arc::clone(&self.reason)
     }
 }
 
@@ -589,8 +607,7 @@ pub(crate) fn parent_pid() -> i32 {
     unsafe { libc::getppid() }
 }
 
-#[allow(unused_imports)] // wired in S4
-pub(crate) use capture::{SystemAudioCapture, SystemAudioCaptureInfo, SystemAudioCaptureOptions};
+pub(crate) use capture::{SystemAudioCapture, SystemAudioCaptureOptions};
 
 mod capture {
     use std::ptr::{self, NonNull};
@@ -864,7 +881,6 @@ mod capture {
         owner: Option<thread::JoinHandle<()>>,
     }
 
-    #[allow(dead_code)] // wired in S4
     impl SystemAudioCapture {
         /// Starts an audio-only SCStream on the main display. Blocks for up to
         /// [`SYSTEM_AUDIO_START_BUDGET`]; the first frame usually arrives 100
@@ -1607,6 +1623,20 @@ mod tests {
             reader.get(),
             Some(SystemAudioFailure::StreamStopped("first".into()))
         );
+        // The bus reads the same first failure as text.
+        assert_eq!(
+            reader.producer_failure().lock().unwrap().as_deref(),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn system_audio_failure_slot_mirrors_nothing_until_a_failure() {
+        let slot = SystemAudioFailureSlot::default();
+        let bus_view = slot.producer_failure();
+        assert_eq!(*bus_view.lock().unwrap(), None);
+        slot.record(SystemAudioFailure::StreamStopped("revoked".into()));
+        assert_eq!(bus_view.lock().unwrap().as_deref(), Some("revoked"));
     }
 
     #[test]

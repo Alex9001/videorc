@@ -2159,7 +2159,6 @@ pub fn apply_audio_stats(
 /// Plan 069: the system-audio meter and mix counters from the session bus.
 /// The live meter is omitted (never null) while no system source is
 /// attached; `None` (no session bus) omits every system field.
-#[allow(dead_code)] // wired in S4
 pub fn apply_system_audio_stats(
     mut stats: DiagnosticStats,
     system: Option<&crate::session_audio::SystemAudioObservation>,
