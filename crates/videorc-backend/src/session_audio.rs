@@ -5153,13 +5153,14 @@ mod mix_tests {
     const FIXTURE_FRAMES: usize = 480_000; // 10 s at 48 kHz.
     const FIXTURE_PACKET: usize = 512;
     /// SHA-256 of the first 10 s the pre-S2 bus wrote for `fixture_sample`
-    /// at +3 dB (512-frame packets, 50 ms playout). Captured on the pre-change
-    /// writer; any mic-only byte change fails here.
+    /// at +3 dB (512-frame packets, 50 ms playout), captured on the pre-change
+    /// writer on macOS. The fixture uses `f32::sin`, whose last bits differ
+    /// between platform math libraries, so the pinned digest is checked on
+    /// macOS only. Every platform instead compares the real bus byte for byte
+    /// with `reference_writer_bytes`, the chunk-by-chunk writer path the
+    /// digest pins.
+    #[cfg(target_os = "macos")]
     const MIC_ONLY_GOLDEN_SHA256: &str =
-        "ed3f07a9b312bf01561301c02406f6c9827df05af98b1b720f19e59eee683fc7";
-    /// SHA-256 of the same fixture pushed through the timeline and
-    /// `write_chunk_with_clock`, chunk by chunk, without real time.
-    const MIC_ONLY_WRITER_GOLDEN_SHA256: &str =
         "ed3f07a9b312bf01561301c02406f6c9827df05af98b1b720f19e59eee683fc7";
 
     /// Deterministic stereo fixture addressed by absolute sample position:
@@ -5359,8 +5360,7 @@ mod mix_tests {
         for _ in 0..4 {
             let run = run_fixture_mic_session(FIXTURE_FRAMES).await;
             if clean(&run) {
-                let digest = sha256_hex(&run.bytes[..FIXTURE_FRAMES * 8]);
-                assert_eq!(digest, MIC_ONLY_GOLDEN_SHA256);
+                assert_matches_reference(&run.bytes);
                 return;
             }
             attempts.push(run.status.counters);
@@ -5368,8 +5368,9 @@ mod mix_tests {
         panic!("every attempt lost PCM to scheduling: {attempts:?}");
     }
 
-    #[test]
-    fn mic_only_writer_matches_the_pre_mixer_golden_bytes() {
+    /// The fixture pushed through the timeline and `write_chunk_with_clock`,
+    /// chunk by chunk, without real time.
+    fn reference_writer_bytes() -> Vec<u8> {
         let epoch = Instant::now();
         let mut timeline = AudioTimeline::new();
         timeline.select_generation(0);
@@ -5395,7 +5396,26 @@ mod mix_tests {
             assert_eq!(written.stale_from, None);
         }
         assert_eq!(bytes.len(), FIXTURE_FRAMES * 8);
-        assert_eq!(sha256_hex(&bytes), MIC_ONLY_WRITER_GOLDEN_SHA256);
+        bytes
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mic_only_writer_matches_the_pre_mixer_golden_bytes() {
+        assert_eq!(
+            sha256_hex(&reference_writer_bytes()),
+            MIC_ONLY_GOLDEN_SHA256
+        );
+    }
+
+    /// The real bus output must equal the reference writer bytes exactly.
+    fn assert_matches_reference(bytes: &[u8]) {
+        let reference = reference_writer_bytes();
+        assert_eq!(
+            sha256_hex(&bytes[..FIXTURE_FRAMES * 8]),
+            sha256_hex(&reference),
+            "mic-only bus bytes differ from the reference writer"
+        );
     }
 
     // ---- Plan 069 S2: the mixer ------------------------------------------
@@ -5415,8 +5435,7 @@ mod mix_tests {
             )
             .await;
             if clean(&run) {
-                let digest = sha256_hex(&run.bytes[..FIXTURE_FRAMES * 8]);
-                assert_eq!(digest, MIC_ONLY_GOLDEN_SHA256);
+                assert_matches_reference(&run.bytes);
                 return;
             }
             attempts.push(run.status.counters);
@@ -6182,9 +6201,12 @@ mod mix_tests {
 
     /// Finding 3: a system-audio start may take its 12 s start budget plus a
     /// 3 s stop, far past the microphone's 5 s open budget.
+    /// macOS only: it is the one platform in this build that opens a system
+    /// source, and elsewhere the microphone budget can equal the system one
+    /// (Windows allows 15 s), so the premise does not hold.
+    #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_slow_system_audio_start_gets_its_own_open_budget() {
-        #[cfg(target_os = "macos")]
         assert!(
             SourceRole::System.open_budget()
                 >= crate::system_audio_capture::SYSTEM_AUDIO_START_BUDGET
