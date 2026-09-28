@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 use crate::protocol::AudioTrackSource;
 use crate::session_audio::{
     ProducerPoolBusy, ProducerSource, SystemAudioHandle, SystemAudioLoss, SystemAudioObservation,
-    SystemAudioProducer,
+    SystemAudioProducer, SystemAudioRecovery,
 };
 
 /// Plan 069 decision 8: system audio's sync offset `o_sys` in ms (positive
@@ -39,6 +39,8 @@ pub(crate) const SYSTEM_AUDIO_SYNC_OFFSET_MS: i32 = 0;
 /// `health.event` codes (the renderer's `SYSTEM_AUDIO_*_CODE`).
 pub(crate) const SYSTEM_AUDIO_UNAVAILABLE_CODE: &str = "system-audio-unavailable";
 pub(crate) const SYSTEM_AUDIO_LOST_CODE: &str = "system-audio-lost";
+/// Plan 075: a timeline loss ended; the slot never left the mix.
+pub(crate) const SYSTEM_AUDIO_RECOVERED_CODE: &str = "system-audio-recovered";
 /// The session's microphone is a direct FFmpeg input (on Windows, the
 /// DirectShow fallback when the capture worker cannot open it, or a bundle
 /// without the worker), so the session audio bus that mixes system audio is
@@ -303,6 +305,11 @@ impl SessionSystemAudio {
     /// One loss per stream that stopped with an error (the bus ramped it out).
     pub(crate) fn claim_loss(&self) -> Option<SystemAudioLoss> {
         self.handle.claim_loss()
+    }
+
+    /// One recovery per timeline loss that ended (plan 075).
+    pub(crate) fn claim_recovery(&self) -> Option<SystemAudioRecovery> {
+        self.handle.claim_recovery()
     }
 
     /// Session stop: no more starts, and a start still opening is cancelled.

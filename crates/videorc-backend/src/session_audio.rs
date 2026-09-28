@@ -90,6 +90,20 @@ pub struct AudioTimeline {
     ahead_limit: u64,
 }
 
+/// What [`AudioTimeline::push_outcome`] did with one packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushOutcome {
+    Placed,
+    /// More than the ahead limit past the cursor. `end` is where the packet
+    /// ended on the bus timeline; `frames` were dropped.
+    AheadOfCap {
+        end: u64,
+        frames: u64,
+    },
+    /// Malformed, from another generation, or wholly overlapping.
+    Rejected,
+}
+
 /// Why captured audio did not reach the bus, split by cause. Diagnostics only:
 /// `AudioBusCounters` stays the renderer contract, this explains its totals in
 /// the log when a take loses microphone audio.
@@ -97,6 +111,10 @@ pub struct AudioTimeline {
 pub struct BusLosses {
     /// Refused because it landed more than `MAX_BUFFERED_FRAMES` past the cursor.
     pub dropped_ahead_of_cap: u64,
+    /// The part of `dropped_ahead_of_cap` that was on time by the wall clock
+    /// while the output had fallen behind (plan 075): the reader stalled, the
+    /// source did not.
+    pub dropped_output_behind: u64,
     /// Refused for a wrong generation, format, or non-finite samples.
     pub dropped_malformed: u64,
     /// The producer's own channel was full when CoreAudio delivered the frame.
@@ -118,6 +136,7 @@ pub struct BusLosses {
 impl BusLosses {
     fn merge(&mut self, other: BusLosses) {
         self.dropped_ahead_of_cap += other.dropped_ahead_of_cap;
+        self.dropped_output_behind += other.dropped_output_behind;
         self.dropped_malformed += other.dropped_malformed;
         self.producer_queue_full += other.producer_queue_full;
         self.discarded_stale += other.discarded_stale;
@@ -184,6 +203,11 @@ impl AudioTimeline {
     }
 
     pub fn push(&mut self, generation: u64, start: u64, frame: AudioFrame) -> bool {
+        self.push_outcome(generation, start, frame) == PushOutcome::Placed
+    }
+
+    /// [`Self::push`], saying why a packet did not reach the queue.
+    fn push_outcome(&mut self, generation: u64, start: u64, frame: AudioFrame) -> PushOutcome {
         let frames = frame.frame_count() as u64;
         if generation != self.generation
             || frame.sample_rate != NATIVE_AUDIO_SAMPLE_RATE
@@ -193,7 +217,7 @@ impl AudioTimeline {
         {
             self.counters.dropped_frames += frames;
             self.losses.dropped_malformed += frames;
-            return false;
+            return PushOutcome::Rejected;
         }
         let floor = self
             .packets
@@ -203,16 +227,17 @@ impl AudioTimeline {
         self.counters.discarded_frames += trim;
         self.losses.discarded_overlap += trim;
         if trim == frames {
-            return false;
+            return PushOutcome::Rejected;
         }
         let start = start + trim;
         let frames = frames - trim;
         // The only ceiling is time ahead of the cursor. A packet count would
         // give a 128-frame callback device a fraction of the headroom.
-        if start.saturating_add(frames) > self.cursor.saturating_add(self.ahead_limit) {
+        let end = start.saturating_add(frames);
+        if end > self.cursor.saturating_add(self.ahead_limit) {
             self.counters.dropped_frames += frames;
             self.losses.dropped_ahead_of_cap += frames;
-            return false;
+            return PushOutcome::AheadOfCap { end, frames };
         }
         let samples = &frame.samples[(trim as usize * 2)..];
         if let Some(back) = self.packets.back_mut()
@@ -226,6 +251,18 @@ impl AudioTimeline {
                 samples: samples.to_vec(),
             });
         }
+        PushOutcome::Placed
+    }
+
+    /// Plan 075: a packet refused ahead of the cursor, but whose end lies
+    /// within the ahead limit of where the cursor would be if the output kept
+    /// pace with the wall clock (`wall_cursor`), was on time. The output fell
+    /// behind, not the source. Counted as `dropped_output_behind`.
+    fn on_time_by_wall_clock(&mut self, end: u64, frames: u64, wall_cursor: u64) -> bool {
+        if end > wall_cursor.saturating_add(self.ahead_limit) {
+            return false;
+        }
+        self.losses.dropped_output_behind += frames;
         true
     }
 
@@ -937,6 +974,29 @@ pub struct SourceLoss {
     pub after_ms: u64,
 }
 
+/// A timeline loss that ended (plan 075): the source, which never stopped
+/// delivering, placed audio again. A placement loss never retires a source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRecovery {
+    pub generation: u64,
+    pub device_name: String,
+    /// Recording-window time of the recovery.
+    pub after_ms: u64,
+    /// From the source's last placed audio before the loss to its first after.
+    pub gap_ms: u64,
+}
+
+/// The output fell behind the wall clock and captured audio was replaced with
+/// silence (plan 075): the FIFO reader stopped draining, the sources did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputStallReport {
+    pub duration_ms: u64,
+    pub max_lag_ms: u64,
+    /// Captured audio (microphone and system) replaced with silence.
+    pub lost_ms: u64,
+}
+
+#[derive(Debug)]
 pub struct AudioObservation {
     pub generation: u64,
     pub device_name: String,
@@ -949,6 +1009,8 @@ pub struct AudioObservation {
     pub input_state: NativeAudioInputState,
     pub source_loss_after_ms: Option<u64>,
     pub losses: Vec<SourceLoss>,
+    pub recoveries: Vec<SourceRecovery>,
+    pub output_stalls: Vec<OutputStallReport>,
 }
 
 /// Test-only view of every frame the bus offers the caption tap.
@@ -964,6 +1026,8 @@ struct AudioShared {
     ever_selected: bool,
     last_selected_name: String,
     losses: VecDeque<SourceLoss>,
+    recoveries: VecDeque<SourceRecovery>,
+    output_stalls: VecDeque<OutputStallReport>,
     system: SystemShared,
     system_stats: Arc<AudioCaptureStats>,
     mix_clipped_samples: u64,
@@ -1269,6 +1333,8 @@ impl SessionAudio {
             input_state: shared.stats.input_state(),
             source_loss_after_ms: shared.stats.source_loss_after_ms(),
             losses: shared.losses.drain(..).collect(),
+            recoveries: shared.recoveries.drain(..).collect(),
+            output_stalls: shared.output_stalls.drain(..).collect(),
         }
     }
     pub fn switch_handle(&self) -> AudioSwitchHandle {
@@ -1312,6 +1378,15 @@ impl SessionAudio {
     #[cfg(test)]
     pub fn source_loss_after_ms(&self) -> Option<u64> {
         self.stats().source_loss_after_ms()
+    }
+    /// The microphone producer is still owned: never retired (plan 075).
+    #[cfg(test)]
+    pub fn microphone_owner_present(&self) -> bool {
+        self.handle
+            .shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .owner_present
     }
     #[cfg(test)]
     pub fn claim_source_loss_event(&self) -> Option<SourceLoss> {
@@ -1668,6 +1743,8 @@ pub fn attach_prepared_with(
             .as_ref()
             .map_or_else(|| "No microphone".into(), |source| source.device_name()),
         losses: VecDeque::new(),
+        recoveries: VecDeque::new(),
+        output_stalls: VecDeque::new(),
         system: SystemShared::default(),
         system_stats: Arc::new(AudioCaptureStats::default()),
         mix_clipped_samples: 0,
@@ -1841,6 +1918,275 @@ fn microphone_loss_reason(
     }
 }
 
+/// Where the cursor would be if the output kept pace with the wall clock.
+fn wall_cursor_at(now: Instant, epoch: Instant, playout_delay: Duration) -> u64 {
+    (now.saturating_duration_since(epoch)
+        .saturating_sub(playout_delay)
+        .as_nanos()
+        * u128::from(NATIVE_AUDIO_SAMPLE_RATE)
+        / 1_000_000_000) as u64
+}
+
+/// How the bus judges a packet refused ahead of its cursor (plan 075).
+#[derive(Debug, Clone, Copy)]
+struct Placement {
+    epoch: Instant,
+    playout_delay: Duration,
+    /// The output is in a stall episode ([`OutputStall`]): a packet that is
+    /// on time by the wall clock is not its source's fault.
+    output_behind: bool,
+}
+impl Placement {
+    fn wall_cursor(&self, now: Instant) -> u64 {
+        wall_cursor_at(now, self.epoch, self.playout_delay)
+    }
+}
+
+/// When a source last delivered a buffer, was live, and placed audio (plan
+/// 075). Live includes buffers refused only because the output fell behind:
+/// the source kept time, so it is not lost.
+#[derive(Debug, Clone, Copy)]
+struct SourceActivity {
+    arrival: Instant,
+    live: Instant,
+    placed: Instant,
+}
+impl SourceActivity {
+    fn new(now: Instant) -> Self {
+        Self {
+            arrival: now,
+            live: now,
+            placed: now,
+        }
+    }
+}
+
+/// A source can only be re-anchored this often while its buffers keep
+/// failing to place (plan 075).
+const REANCHOR_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A source whose buffers keep arriving but cannot be placed (plan 075). It
+/// is reported once, re-anchored at most every [`REANCHOR_INTERVAL`], never
+/// retired, and reported recovered at its next placed buffer. Only a stopped
+/// capture (EOF, a stall, a platform failure) retires a source.
+#[derive(Debug, Default)]
+struct TimelineFault {
+    /// When the fault began, and the source's last placement before it.
+    since: Option<(Instant, Instant)>,
+    last_reanchor: Option<Instant>,
+}
+impl TimelineFault {
+    /// `true` the first time: the loss is reported once per fault.
+    fn begin(&mut self, now: Instant, last_placed: Instant) -> bool {
+        if self.since.is_some() {
+            return false;
+        }
+        self.since = Some((now, last_placed));
+        true
+    }
+
+    /// Whether to drop the source clock now, so its next buffer maps from its
+    /// capture time against the epoch, as it did at session start.
+    fn reanchor_due(&mut self, now: Instant) -> bool {
+        if self.since.is_none()
+            || self
+                .last_reanchor
+                .is_some_and(|at| now.saturating_duration_since(at) < REANCHOR_INTERVAL)
+        {
+            return false;
+        }
+        self.last_reanchor = Some(now);
+        true
+    }
+
+    /// The silent gap, once a placement after the fault began ends it.
+    fn recovered(&mut self, placed: Instant) -> Option<Duration> {
+        let (since, last_placed) = self.since?;
+        if placed <= since {
+            return None;
+        }
+        self.since = None;
+        Some(placed.saturating_duration_since(last_placed))
+    }
+}
+
+/// A stall episode starts when the cursor trails the wall clock by this much
+/// (250 ms), and ends once it is back within [`OUTPUT_CAUGHT_UP_FRAMES`].
+const OUTPUT_STALL_START_FRAMES: u64 = 12_000;
+/// 50 ms: a bus paces one 10 ms chunk behind the wall clock at most.
+const OUTPUT_CAUGHT_UP_FRAMES: u64 = 2_400;
+/// An episode excuses its sources this long. An output that stays behind
+/// longer is stuck, not stalled, and its sources report the loss.
+const OUTPUT_STALL_FORGIVENESS: Duration = Duration::from_secs(15);
+
+/// Output-stall bookkeeping (plan 075). The cursor advances only as the FIFO
+/// reader drains; the wall clock does not wait. A bus that has kept pace and
+/// then falls behind is in a stall episode: the reader stopped (FFmpeg pauses
+/// its audio input while its video input is late), and a buffer that is on
+/// time by the wall clock is not its source's fault. A bus that never kept
+/// pace has a timeline fault instead (plan 070), which its sources report.
+#[derive(Debug, Default)]
+struct OutputStall {
+    kept_pace: bool,
+    episode: Option<StallEpisode>,
+}
+#[derive(Debug, Clone, Copy)]
+struct StallEpisode {
+    started: Instant,
+    max_lag: u64,
+    lost_before: u64,
+}
+impl OutputStall {
+    /// `lag` is how far the cursor trails the wall clock; `lost` is the
+    /// running count of captured frames lost to a stalled output.
+    fn observe(&mut self, now: Instant, lag: u64, lost: u64) -> Option<OutputStallReport> {
+        if lag <= OUTPUT_CAUGHT_UP_FRAMES {
+            self.kept_pace = true;
+            return self.finish(now, lost);
+        }
+        match self.episode.as_mut() {
+            Some(episode) => episode.max_lag = episode.max_lag.max(lag),
+            None if self.kept_pace && lag >= OUTPUT_STALL_START_FRAMES => {
+                // The reader stopped about `lag` ago.
+                let behind = Duration::from_nanos(lag * 1_000_000_000 / 48_000);
+                self.episode = Some(StallEpisode {
+                    started: now.checked_sub(behind).unwrap_or(now),
+                    max_lag: lag,
+                    lost_before: lost,
+                });
+            }
+            None => {}
+        }
+        None
+    }
+
+    fn output_behind(&self, now: Instant) -> bool {
+        self.episode.is_some_and(|episode| {
+            now.saturating_duration_since(episode.started) < OUTPUT_STALL_FORGIVENESS
+        })
+    }
+
+    fn finish(&mut self, now: Instant, lost: u64) -> Option<OutputStallReport> {
+        let episode = self.episode.take()?;
+        Some(OutputStallReport {
+            duration_ms: now.saturating_duration_since(episode.started).as_millis() as u64,
+            max_lag_ms: episode.max_lag * 1_000 / 48_000,
+            lost_ms: lost.saturating_sub(episode.lost_before) * 1_000 / 48_000,
+        })
+    }
+}
+
+/// Captured frames a source lost to a stalled output: refused on time,
+/// discarded once the wall clock passed them, or written as stale silence.
+fn output_stall_losses(losses: &BusLosses) -> u64 {
+    losses.dropped_output_behind + losses.discarded_behind_cap + losses.stale_written
+}
+
+/// Logs one stall episode; one that cost audio is queued for a health event.
+fn publish_output_stall(shared: &std::sync::Mutex<AudioShared>, report: OutputStallReport) {
+    if report.lost_ms == 0 {
+        tracing::info!(
+            duration_ms = report.duration_ms,
+            max_lag_ms = report.max_lag_ms,
+            "Session audio output fell behind and caught up without losing audio."
+        );
+        return;
+    }
+    tracing::warn!(
+        duration_ms = report.duration_ms,
+        max_lag_ms = report.max_lag_ms,
+        lost_ms = report.lost_ms,
+        "Session audio output stalled (the FIFO reader stopped draining); captured audio in the gap was replaced with silence and every source kept running."
+    );
+    shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .output_stalls
+        .push_back(report);
+}
+
+/// Every source's frames lost to a stalled output so far.
+fn bus_output_stall_losses(timeline: &AudioTimeline, system: Option<&SourceSlot>) -> u64 {
+    output_stall_losses(&timeline.losses())
+        + system.map_or(0, |slot| output_stall_losses(&slot.timeline.losses()))
+}
+
+/// Queues the microphone's loss event, once per loss (the stats claim it).
+fn push_microphone_loss(
+    shared: &std::sync::Mutex<AudioShared>,
+    stats: &AudioCaptureStats,
+    reason: SourceLossReason,
+    generation: u64,
+) {
+    if let Some(after_ms) = stats.claim_source_loss_event() {
+        let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let device_name = shared.status.device_name.clone();
+        // Admission backpressure bounds losses without dropping an
+        // unreported generation's event during rapid replacement.
+        shared.losses.push_back(SourceLoss {
+            reason,
+            generation,
+            device_name,
+            after_ms,
+        });
+    }
+}
+
+/// Acts on one system-slot observation at bus sample `cursor` (plan 075). A
+/// stopped capture ramps out; a timeline loss is reported while the slot
+/// stays in the mix, and so is its recovery.
+fn handle_slot_health(
+    slot: &mut SourceSlot,
+    health: SlotHealth,
+    cursor: u64,
+    shared: &std::sync::Mutex<AudioShared>,
+) {
+    match health {
+        SlotHealth::Healthy => {}
+        SlotHealth::Stopped(reason) => {
+            if slot.exit.is_none() {
+                tracing::warn!(
+                    "System audio source lost at sample {cursor}; the session continues on the microphone: {reason}"
+                );
+                slot.begin_exit(SlotExit::Lost {
+                    cutover_sample: cursor,
+                    kind: SourceLossReason::CaptureStopped,
+                    reason,
+                });
+            }
+        }
+        SlotHealth::TimelineLost(reason) => {
+            tracing::warn!(
+                "System audio could not be placed at sample {cursor}; it stays in the mix and re-anchors: {reason}"
+            );
+            shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .system
+                .losses
+                .push_back(SystemAudioLoss {
+                    device_name: slot.producer.device_name.clone(),
+                    kind: SourceLossReason::TimelineRejected,
+                    reason,
+                    at_sample: cursor,
+                });
+        }
+        SlotHealth::Recovered { gap } => {
+            let gap_ms = gap.as_millis() as u64;
+            tracing::info!(gap_ms, "System audio is placed again at sample {cursor}.");
+            shared
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .system
+                .recoveries
+                .push_back(SystemAudioRecovery {
+                    gap_ms,
+                    at_sample: cursor,
+                });
+        }
+    }
+}
+
 /// Drains every pending producer frame into the timeline. Returns `true` when
 /// the producer channel is disconnected. Called from the pacing loop and from
 /// inside a blocked FIFO write, so a bursty reader never starves ingestion.
@@ -1850,17 +2196,17 @@ fn ingest_pending(
     timeline: &mut AudioTimeline,
     clock: &mut Option<SourceClock>,
     generation: u64,
-    epoch: Instant,
+    placement: Placement,
     delay_frames: u64,
     stats: &AudioCaptureStats,
-    last_source_frame: &mut Instant,
-    last_source_arrival: &mut Instant,
+    activity: &mut SourceActivity,
 ) -> bool {
+    let epoch = placement.epoch;
     loop {
         match receiver.try_recv() {
             Ok(frame) => {
                 let now = Instant::now();
-                *last_source_arrival = now;
+                activity.arrival = now;
                 if !valid_fresh_frame(&frame, now) {
                     let frames = frame.frame_count() as u64;
                     timeline.counters.discarded_frames += frames;
@@ -1889,9 +2235,24 @@ fn ingest_pending(
                     timeline.losses.discarded_duplicate += frames;
                     continue;
                 };
-                if timeline.push(generation, start, resample_frame(frame, frames)) {
-                    *last_source_frame = now;
-                    stats.mark_live();
+                match timeline.push_outcome(generation, start, resample_frame(frame, frames)) {
+                    PushOutcome::Placed => {
+                        activity.placed = now;
+                        activity.live = now;
+                        stats.mark_live();
+                    }
+                    PushOutcome::AheadOfCap { end, frames } => {
+                        if placement.output_behind
+                            && timeline.on_time_by_wall_clock(
+                                end,
+                                frames,
+                                placement.wall_cursor(now),
+                            )
+                        {
+                            activity.live = now;
+                        }
+                    }
+                    PushOutcome::Rejected => {}
                 }
             }
             Err(mpsc::TryRecvError::Empty) => return false,
@@ -1917,8 +2278,8 @@ fn log_bus_summary(timeline: &AudioTimeline, diagnostics: &BusDiagnostics, outco
     let message = format!(
         "Session audio bus {outcome}: cursor={} captured={} generated={} discarded={} \
          (stale={}, before-epoch={}, overlap={}, duplicate={}, behind-cap={}) dropped={} \
-         (ahead-of-cap={}, malformed={}, producer-queue-full={}) stale-written={} \
-         max-write-stall={}ms max-lateness={}ms",
+         (ahead-of-cap={}, output-behind={}, malformed={}, producer-queue-full={}) \
+         stale-written={} max-write-stall={}ms max-lateness={}ms",
         counters.captured_frames + counters.generated_frames,
         counters.captured_frames,
         counters.generated_frames,
@@ -1930,6 +2291,7 @@ fn log_bus_summary(timeline: &AudioTimeline, diagnostics: &BusDiagnostics, outco
         losses.discarded_behind_cap,
         counters.dropped_frames,
         losses.dropped_ahead_of_cap,
+        losses.dropped_output_behind,
         losses.dropped_malformed,
         losses.producer_queue_full,
         losses.stale_written,
@@ -2568,8 +2930,17 @@ pub struct SystemAudioObservation {
     pub mix_clipped_samples: u64,
 }
 
+/// System audio placed again after a timeline loss (plan 075). The slot never
+/// left the mix; `gap_ms` of it was silence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemAudioRecovery {
+    pub gap_ms: u64,
+    pub at_sample: u64,
+}
+
 /// A system source the platform reported lost mid-session. The bus ramped it
-/// out and keeps running on the microphone.
+/// out and keeps running on the microphone. A timeline loss (plan 075) is
+/// reported the same way, but its slot stays in the mix and re-anchors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemAudioLoss {
     pub device_name: String,
@@ -2584,6 +2955,7 @@ struct SystemShared {
     device_name: Option<String>,
     cutover_sample: Option<u64>,
     losses: VecDeque<SystemAudioLoss>,
+    recoveries: VecDeque<SystemAudioRecovery>,
 }
 
 enum SystemCommand {
@@ -2730,6 +3102,16 @@ impl SystemAudioHandle {
             .pop_front()
     }
 
+    /// One `system-audio-recovered` event per timeline loss that ended.
+    pub fn claim_recovery(&self) -> Option<SystemAudioRecovery> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .system
+            .recoveries
+            .pop_front()
+    }
+
     /// System producers this session owns (open, attached or closing).
     #[cfg(test)]
     pub fn owned_producer_count(&self) -> u64 {
@@ -2768,19 +3150,54 @@ struct SourceSlot {
     ramp: EnableRamp,
     accounted: AudioBusCounters,
     exit: Option<SlotExit>,
-    /// Arrival of the first buffer in the current run of buffers that
-    /// placed no sample; `None` once one did.
+    /// The bus's playout delay: where the cursor would be by the wall clock.
+    playout_delay: Duration,
+    /// Set by the bus before every ingest pass (plan 075): the output is in
+    /// a stall episode, so a buffer on time by the wall clock is not refused
+    /// by this source's fault.
+    output_behind: bool,
+    /// Arrival of the first buffer in the current run of buffers that placed
+    /// no sample (and were not excused by a stalled output); `None` once one
+    /// did.
     unplayable_since: Option<Instant>,
-    /// That run lasted [`SYSTEM_UNPLAYABLE_LOSS_AFTER`]: a sticky loss, like
-    /// a failure or EOF.
-    unplayable_lost: bool,
+    last_placed: Instant,
+    /// That run lasted [`SYSTEM_UNPLAYABLE_LOSS_AFTER`]: reported once, then
+    /// re-anchored until a buffer places again (plan 075). Never an exit.
+    fault: TimelineFault,
 }
+
+/// What one ingest pass of a mixed source observed (plan 075).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlotHealth {
+    Healthy,
+    /// The platform reported a failure or the stream ended: the slot leaves.
+    Stopped(String),
+    /// Buffers kept arriving but none could be placed. Reported once; the
+    /// slot stays in the mix and re-anchors.
+    TimelineLost(String),
+    /// The first placed buffer after a timeline loss.
+    Recovered {
+        gap: Duration,
+    },
+}
+
+/// What [`SourceSlot::place`] did with one buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaceOutcome {
+    Placed,
+    /// Refused ahead of a cursor that fell behind the wall clock, while the
+    /// buffer itself was on time.
+    OnTime,
+    Refused,
+}
+
 impl SourceSlot {
     fn new(
         role: SourceRole,
         producer: SystemAudioProducer,
         cursor: u64,
         delay_frames: u64,
+        playout_delay: Duration,
     ) -> Self {
         let SystemAudioProducer {
             mut producer,
@@ -2807,51 +3224,60 @@ impl SourceSlot {
             ramp: EnableRamp::default(),
             accounted: AudioBusCounters::default(),
             exit: None,
+            playout_delay,
+            output_behind: false,
             unplayable_since: None,
-            unplayable_lost: false,
+            last_placed: Instant::now(),
+            fault: TimelineFault::default(),
         }
     }
 
     /// Drains every pending frame into the slot timeline: stale and pre-epoch
     /// frames are discarded, and a first burst whose early frames already lie
     /// behind the cursor is trimmed as overlap, never queued late. Returns the
-    /// loss reason once the platform reported a failure, the stream ended, or
-    /// buffers kept arriving that could not be placed for
+    /// reason once the platform reported a failure, the stream ended, or (once
+    /// per fault) buffers kept arriving that could not be placed for
     /// [`SYSTEM_UNPLAYABLE_LOSS_AFTER`]. Silence, including no buffers at all,
     /// is never loss (decision 11).
+    #[cfg(test)]
     fn ingest(&mut self, epoch: Instant) -> Option<String> {
         self.ingest_at(epoch, Instant::now())
     }
 
     /// [`Self::ingest`] with every drained buffer arriving at `now`.
+    #[cfg(test)]
     fn ingest_at(&mut self, epoch: Instant, now: Instant) -> Option<String> {
-        self.ingest_loss_at(epoch, now).map(|(_, reason)| reason)
+        match self.ingest_health_at(epoch, now) {
+            SlotHealth::Stopped(reason) | SlotHealth::TimelineLost(reason) => Some(reason),
+            SlotHealth::Healthy | SlotHealth::Recovered { .. } => None,
+        }
     }
 
-    /// [`Self::ingest`], keeping whether capture stopped or the timeline
-    /// rejected buffers that did arrive.
-    fn ingest_loss(&mut self, epoch: Instant) -> Option<(SourceLossReason, String)> {
-        self.ingest_loss_at(epoch, Instant::now())
+    fn ingest_health(&mut self, epoch: Instant) -> SlotHealth {
+        self.ingest_health_at(epoch, Instant::now())
     }
 
-    fn ingest_loss_at(
-        &mut self,
-        epoch: Instant,
-        now: Instant,
-    ) -> Option<(SourceLossReason, String)> {
+    /// [`Self::ingest`], keeping what happened: a stopped capture (EOF and
+    /// platform failure are sticky, so every pass sees them), or the edges of
+    /// a timeline loss and its recovery (each reported once).
+    fn ingest_health_at(&mut self, epoch: Instant, now: Instant) -> SlotHealth {
         let mut disconnected = false;
+        let mut newly_lost = false;
         loop {
             match self.receiver.try_recv() {
-                Ok(frame) => {
-                    let placed = self.place(frame, epoch, now);
-                    if placed {
+                Ok(frame) => match self.place(frame, epoch, now) {
+                    PlaceOutcome::Placed => {
                         self.unplayable_since = None;
-                    } else {
-                        let since = *self.unplayable_since.get_or_insert(now);
-                        self.unplayable_lost |=
-                            now.saturating_duration_since(since) >= SYSTEM_UNPLAYABLE_LOSS_AFTER;
+                        self.last_placed = now;
                     }
-                }
+                    PlaceOutcome::OnTime => self.unplayable_since = None,
+                    PlaceOutcome::Refused => {
+                        let since = *self.unplayable_since.get_or_insert(now);
+                        if now.saturating_duration_since(since) >= SYSTEM_UNPLAYABLE_LOSS_AFTER {
+                            newly_lost |= self.fault.begin(now, self.last_placed);
+                        }
+                    }
+                },
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -2863,33 +3289,36 @@ impl SourceSlot {
             .failure
             .as_ref()
             .and_then(|failure| failure.lock().unwrap_or_else(|p| p.into_inner()).clone());
-        failure
-            .map(|reason| (SourceLossReason::CaptureStopped, reason))
-            .or_else(|| {
-                disconnected.then(|| {
-                    (
-                        SourceLossReason::CaptureStopped,
-                        format!("{} stopped delivering audio.", self.role.label()),
-                    )
-                })
-            })
-            .or_else(|| {
-                // Buffers kept arriving; the timeline refused every one.
-                self.unplayable_lost.then(|| {
-                    (
-                        SourceLossReason::TimelineRejected,
-                        format!(
-                            "{} timestamps drifted out of range; no buffer could be placed for {}s.",
-                            self.role.label(),
-                            SYSTEM_UNPLAYABLE_LOSS_AFTER.as_secs()
-                        ),
-                    )
-                })
-            })
+        if let Some(reason) = failure {
+            return SlotHealth::Stopped(reason);
+        }
+        if disconnected {
+            return SlotHealth::Stopped(format!("{} stopped delivering audio.", self.role.label()));
+        }
+        if self.fault.reanchor_due(now) {
+            // The next buffer maps from its capture time, as at session start.
+            self.clock = None;
+            tracing::warn!(
+                "{} timeline re-anchored: its buffers keep arriving but none could be placed.",
+                self.role.label()
+            );
+        }
+        if newly_lost {
+            // Buffers kept arriving; the timeline refused every one.
+            return SlotHealth::TimelineLost(format!(
+                "{} timestamps drifted out of range; no buffer could be placed for {}s.",
+                self.role.label(),
+                SYSTEM_UNPLAYABLE_LOSS_AFTER.as_secs()
+            ));
+        }
+        match self.fault.recovered(self.last_placed) {
+            Some(gap) => SlotHealth::Recovered { gap },
+            None => SlotHealth::Healthy,
+        }
     }
 
-    /// Places one buffer; `false` when none of its samples reached the mix.
-    fn place(&mut self, frame: AudioFrame, epoch: Instant, now: Instant) -> bool {
+    /// Places one buffer and says whether any of its samples reached the mix.
+    fn place(&mut self, frame: AudioFrame, epoch: Instant, now: Instant) -> PlaceOutcome {
         let fresh = match self.role {
             SourceRole::System => valid_system_frame(&frame, now),
             SourceRole::Microphone => valid_fresh_frame(&frame, now),
@@ -2898,13 +3327,13 @@ impl SourceSlot {
             let frames = frame.frame_count() as u64;
             self.timeline.counters.discarded_frames += frames;
             self.timeline.losses.discarded_stale += frames;
-            return false;
+            return PlaceOutcome::Refused;
         }
         let trimmed = crate::audio::trim_audio_frame_before_epoch(frame, epoch);
         self.timeline.counters.discarded_frames += trimmed.discarded_frames;
         self.timeline.losses.discarded_before_epoch += trimmed.discarded_frames;
         let Some(frame) = trimmed.frame else {
-            return false;
+            return PlaceOutcome::Refused;
         };
         let delay_frames = self.delay_frames;
         let clock = self
@@ -2914,9 +3343,27 @@ impl SourceSlot {
             let frames = frame.frame_count() as u64;
             self.timeline.counters.discarded_frames += frames;
             self.timeline.losses.discarded_duplicate += frames;
-            return false;
+            return PlaceOutcome::Refused;
         };
-        self.timeline.push(0, start, resample_frame(frame, frames))
+        match self
+            .timeline
+            .push_outcome(0, start, resample_frame(frame, frames))
+        {
+            PushOutcome::Placed => PlaceOutcome::Placed,
+            PushOutcome::AheadOfCap { end, frames } => {
+                let wall_cursor = wall_cursor_at(now, epoch, self.playout_delay);
+                if self.output_behind
+                    && self
+                        .timeline
+                        .on_time_by_wall_clock(end, frames, wall_cursor)
+                {
+                    PlaceOutcome::OnTime
+                } else {
+                    PlaceOutcome::Refused
+                }
+            }
+            PushOutcome::Rejected => PlaceOutcome::Refused,
+        }
     }
 
     fn account_producer_drops(&mut self) {
@@ -2945,7 +3392,7 @@ fn accept_system_commands(
     commands: &mpsc::Receiver<SystemCommand>,
     system: &mut Option<SourceSlot>,
     cursor: u64,
-    delay_frames: u64,
+    timing: BusTiming,
     stop: &AtomicBool,
     draining: &AtomicBool,
     shared: &std::sync::Mutex<AudioShared>,
@@ -2993,7 +3440,13 @@ fn accept_system_commands(
                     continue;
                 }
                 let device_name = producer.device_name().to_string();
-                let slot = SourceSlot::new(SourceRole::System, producer, cursor, delay_frames);
+                let slot = SourceSlot::new(
+                    SourceRole::System,
+                    producer,
+                    cursor,
+                    timing.system_delay_frames,
+                    timing.playout_delay,
+                );
                 // Publish before acknowledging, so a caller that sees Ok sees
                 // the attached state; withdraw if the caller already left.
                 let publish = |attached: bool| {
@@ -3319,7 +3772,7 @@ fn run_bus_owned(
                 system_commands,
                 &mut system,
                 0,
-                timing.system_delay_frames,
+                timing,
                 stop,
                 draining,
                 shared,
@@ -3347,8 +3800,9 @@ fn run_bus_owned(
     let mut generation = 0;
     let mut pending: Option<PendingHandoff> = None;
     let mut observe: Option<OutputObservation> = None;
-    let mut last_source_frame = Instant::now();
-    let mut last_source_arrival = last_source_frame;
+    let mut activity = SourceActivity::new(Instant::now());
+    let mut microphone_fault = TimelineFault::default();
+    let mut stall = OutputStall::default();
     let mut clock = None;
     let mut accounted = AudioBusCounters::default();
     let mut diagnostics = BusDiagnostics::default();
@@ -3389,7 +3843,7 @@ fn run_bus_owned(
             system_commands,
             &mut system,
             timeline.cursor(),
-            timing.system_delay_frames,
+            timing,
             stop,
             draining,
             shared,
@@ -3419,84 +3873,112 @@ fn run_bus_owned(
             timeline.losses.producer_queue_full += new_drops;
             previous_producer_drops = drops;
         }
-        let mut source_lost = false;
+        let placement = Placement {
+            epoch,
+            playout_delay,
+            output_behind: stall.output_behind(Instant::now()),
+        };
         let mut loss_reason = None;
         if let Some(receiver) = receiver.as_ref() {
-            source_lost = ingest_pending(
+            let disconnected = ingest_pending(
                 receiver,
                 &mut timeline,
                 &mut clock,
                 generation,
-                epoch,
+                placement,
                 timing.microphone_delay_frames,
                 &stats,
-                &mut last_source_frame,
-                &mut last_source_arrival,
+                &mut activity,
             );
             loss_reason = microphone_loss_reason(
-                source_lost,
-                last_source_arrival.elapsed(),
-                last_source_frame.elapsed(),
+                disconnected,
+                activity.arrival.elapsed(),
+                activity.live.elapsed(),
                 source_stall_timeout,
             );
-            source_lost = loss_reason.is_some();
         }
-        if source_lost {
-            receiver = None;
-            {
-                let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
-                shared.owner_present = false;
-                if let Some(old) = producer.take() {
-                    let id = old.device_id.clone();
-                    let completion = old.retire();
-                    shared.retiring.push((id, completion.state.clone()));
-                    retired.push(completion);
+        match loss_reason {
+            Some(SourceLossReason::CaptureStopped) => {
+                receiver = None;
+                microphone_fault = TimelineFault::default();
+                {
+                    let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+                    shared.owner_present = false;
+                    if let Some(old) = producer.take() {
+                        let id = old.device_id.clone();
+                        let completion = old.retire();
+                        shared.retiring.push((id, completion.state.clone()));
+                        retired.push(completion);
+                    }
+                    stats.mark_source_lost_at(Instant::now());
                 }
-                stats.mark_source_lost_at(Instant::now());
+                producer_stats = None;
+                push_microphone_loss(shared, &stats, SourceLossReason::CaptureStopped, generation);
             }
-            producer_stats = None;
-            if let Some(after_ms) = stats.claim_source_loss_event() {
-                let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
-                let device_name = shared.status.device_name.clone();
-                // Admission backpressure bounds losses without dropping an
-                // unreported generation's event during rapid replacement.
-                shared.losses.push_back(SourceLoss {
-                    reason: loss_reason.expect("lost microphone has a reason"),
-                    generation,
-                    device_name,
-                    after_ms,
-                });
+            // Plan 075: buffers keep arriving but none place. The input is
+            // healthy, so it stays open: reported once, re-anchored, and
+            // reported again when it places.
+            Some(SourceLossReason::TimelineRejected) => {
+                let now = Instant::now();
+                if microphone_fault.begin(now, activity.placed) {
+                    stats.mark_source_lost_at(now);
+                    tracing::warn!(
+                        "Microphone buffers keep arriving but none could be placed for {}s; the input stays open.",
+                        source_stall_timeout.as_secs_f32()
+                    );
+                    push_microphone_loss(
+                        shared,
+                        &stats,
+                        SourceLossReason::TimelineRejected,
+                        generation,
+                    );
+                }
+                if microphone_fault.reanchor_due(now) {
+                    // The next buffer maps from its capture time, as it did
+                    // at session start.
+                    clock = None;
+                    tracing::warn!("Microphone timeline re-anchored.");
+                }
             }
+            None => {}
+        }
+        if let Some(gap) = microphone_fault.recovered(activity.placed) {
+            stats.mark_recovered();
+            let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+            let recovery = SourceRecovery {
+                generation,
+                device_name: shared.status.device_name.clone(),
+                after_ms: (stats.recording_window_elapsed_secs().unwrap_or_default() * 1_000.0)
+                    as u64,
+                gap_ms: gap.as_millis() as u64,
+            };
+            tracing::info!(
+                gap_ms = recovery.gap_ms,
+                "Microphone audio is placed again; its timeline loss ended."
+            );
+            shared.recoveries.push_back(recovery);
         }
         if let Some(slot) = system.as_mut() {
             slot.account_producer_drops();
+            slot.output_behind = placement.output_behind;
             // No stall rule here (decision 11): only the platform's failure
             // signal or the end of the stream retires a system source.
-            if let Some((kind, reason)) = slot.ingest_loss(epoch)
-                && slot.exit.is_none()
-            {
-                let cutover_sample = timeline.cursor();
-                tracing::warn!(
-                    "System audio source lost at sample {cutover_sample} ({kind:?}); the session continues on the microphone: {reason}"
-                );
-                slot.begin_exit(SlotExit::Lost {
-                    cutover_sample,
-                    kind,
-                    reason,
-                });
-            }
+            let health = slot.ingest_health(epoch);
+            handle_slot_health(slot, health, timeline.cursor(), shared);
         }
         let now = Instant::now();
-        let wall_cursor = now
-            .saturating_duration_since(epoch)
-            .saturating_sub(playout_delay)
-            .as_nanos()
-            * u128::from(NATIVE_AUDIO_SAMPLE_RATE)
-            / 1_000_000_000;
-        timeline.discard_before((wall_cursor as u64).saturating_sub(MAX_BUFFERED_FRAMES));
+        let wall_cursor = wall_cursor_at(now, epoch, playout_delay);
+        if let Some(report) = stall.observe(
+            now,
+            wall_cursor.saturating_sub(timeline.cursor()),
+            bus_output_stall_losses(&timeline, system.as_ref()),
+        ) {
+            publish_output_stall(shared, report);
+        }
+        timeline.discard_before(wall_cursor.saturating_sub(MAX_BUFFERED_FRAMES));
         if let Some(slot) = system.as_mut() {
             slot.timeline
-                .discard_before((wall_cursor as u64).saturating_sub(MAX_BUFFERED_FRAMES));
+                .discard_before(wall_cursor.saturating_sub(MAX_BUFFERED_FRAMES));
         }
         let next = epoch
             + playout_delay
@@ -3615,8 +4097,8 @@ fn run_bus_owned(
                             .as_ref()
                             .map_or(0, |stats| stats.dropped_frames());
                         clock = handoff.clock.take();
-                        last_source_frame = Instant::now();
-                        last_source_arrival = last_source_frame;
+                        activity = SourceActivity::new(Instant::now());
+                        microphone_fault = TimelineFault::default();
                         stats = Arc::new(AudioCaptureStats::default());
                         stats.reset_recording_window();
                         if producer.is_none() {
@@ -3729,6 +4211,7 @@ fn run_bus_owned(
         });
         let mixing = system_raw.is_some() || !limiter.idle();
         let write_started = Instant::now();
+        let mut deferred_health = Vec::new();
         let mut wait = || {
             // A stop that arrives mid-write drains too, until its deadline.
             if stop.load(Ordering::Acquire)
@@ -3742,24 +4225,43 @@ fn run_bus_owned(
                 producer_stats = None;
             }
             // The FIFO reader is behind. Keep ingesting so a bursty reader
-            // never pushes the microphone into the timeline's drop path.
+            // never pushes the microphone into the timeline's drop path, and
+            // keep the stall episode current (plan 075): a reader that stops
+            // for seconds is the output's fault, not the sources'.
+            let now = Instant::now();
+            if let Some(report) = stall.observe(
+                now,
+                wall_cursor_at(now, epoch, playout_delay).saturating_sub(timeline.cursor()),
+                bus_output_stall_losses(&timeline, system.as_ref()),
+            ) {
+                publish_output_stall(shared, report);
+            }
+            let placement = Placement {
+                epoch,
+                playout_delay,
+                output_behind: stall.output_behind(now),
+            };
             if let Some(receiver) = receiver.as_ref() {
                 ingest_pending(
                     receiver,
                     &mut timeline,
                     &mut clock,
                     generation,
-                    epoch,
+                    placement,
                     timing.microphone_delay_frames,
                     &stats,
-                    &mut last_source_frame,
-                    &mut last_source_arrival,
+                    &mut activity,
                 );
             }
             if let Some(slot) = system.as_mut() {
-                // A loss is sticky (failure slot or EOF): the next pacing
-                // pass observes it again and ramps the slot out.
-                let _ = slot.ingest(epoch);
+                // A stop is sticky (failure slot or EOF): the next pacing
+                // pass observes it again and ramps the slot out. The edges
+                // of a timeline loss are kept for that pass.
+                slot.output_behind = placement.output_behind;
+                match slot.ingest_health(epoch) {
+                    SlotHealth::Healthy | SlotHealth::Stopped(_) => {}
+                    health => deferred_health.push(health),
+                }
             }
             thread::sleep(Duration::from_millis(1));
         };
@@ -3819,6 +4321,12 @@ fn run_bus_owned(
             }
         };
         diagnostics.max_write_stall = diagnostics.max_write_stall.max(write_started.elapsed());
+        if let Some(slot) = system.as_mut() {
+            let cursor = timeline.cursor();
+            for health in deferred_health {
+                handle_slot_health(slot, health, cursor, shared);
+            }
+        }
         timeline.account_stale_chunk(&raw, stale_from);
         if let Some(from) = stale_from {
             timeline.losses.stale_written += (CHUNK_FRAMES - from) as u64;
@@ -3943,6 +4451,12 @@ fn run_bus_owned(
         }
         retired.retain(CompletionTicket::running);
         system_retired.retain(CompletionTicket::running);
+    }
+    if let Some(report) = stall.finish(
+        Instant::now(),
+        bus_output_stall_losses(&timeline, system.as_ref()),
+    ) {
+        publish_output_stall(shared, report);
     }
     if let Some(slot) = system.take() {
         retire_system_slot(slot, shared, &system_stats, system_retired, &diagnostics);
@@ -4149,22 +4663,32 @@ mod tests {
         let mut timeline = AudioTimeline::new();
         let mut clock = None;
         let stats = AudioCaptureStats::default();
-        let mut placed = old;
-        let mut arrived = old;
+        let mut activity = SourceActivity {
+            arrival: old,
+            live: old,
+            placed: old,
+        };
+        // A bus that never kept pace (plan 070's old epoch): the refusal is
+        // the timeline's, never excused as a stalled output.
         assert!(!ingest_pending(
             &receiver,
             &mut timeline,
             &mut clock,
             0,
-            now - Duration::from_secs(9),
+            Placement {
+                epoch: now - Duration::from_secs(9),
+                playout_delay: PLAYOUT_DELAY,
+                output_behind: false,
+            },
             0,
             &stats,
-            &mut placed,
-            &mut arrived
+            &mut activity,
         ));
         assert_eq!(timeline.losses().dropped_ahead_of_cap, 480);
-        assert_eq!(placed, old);
-        assert!(arrived >= now);
+        assert_eq!(timeline.losses().dropped_output_behind, 0);
+        assert_eq!(activity.placed, old);
+        assert_eq!(activity.live, old);
+        assert!(activity.arrival >= now);
         assert_eq!(
             microphone_loss_reason(
                 false,
@@ -6101,6 +6625,19 @@ mod mix_tests {
         thread::JoinHandle<Vec<u8>>,
         tokio::sync::watch::Receiver<usize>,
     ) {
+        spawn_fifo_reader_with_stall(path, None)
+    }
+
+    /// A reader that, once it has read `stall.0` frames, stops draining the
+    /// FIFO for `stall.1`: FFmpeg pausing its audio input while its video
+    /// input is late (plan 075).
+    fn spawn_fifo_reader_with_stall(
+        path: PathBuf,
+        mut stall: Option<(usize, Duration)>,
+    ) -> (
+        thread::JoinHandle<Vec<u8>>,
+        tokio::sync::watch::Receiver<usize>,
+    ) {
         use std::io::Read;
         let (progress_tx, progress_rx) = tokio::sync::watch::channel(0_usize);
         let reader = thread::spawn(move || {
@@ -6126,6 +6663,13 @@ mod mix_tests {
             let mut buffer = vec![0_u8; 64 * 1024];
             let mut last_data = Instant::now();
             loop {
+                if let Some((after, pause)) = stall
+                    && bytes.len() / 8 >= after
+                {
+                    stall = None;
+                    thread::sleep(pause);
+                    last_data = Instant::now();
+                }
                 match file.read(&mut buffer) {
                     Ok(0) => return bytes,
                     Ok(count) => {
@@ -6453,6 +6997,16 @@ mod mix_tests {
         settings: AudioProcessingSettings,
         options: SessionAudioOptions,
     ) -> Bus {
+        start_bus_with_stall(epoch, microphone, settings, options, None).await
+    }
+
+    async fn start_bus_with_stall(
+        epoch: Instant,
+        microphone: Option<Vec<AudioFrame>>,
+        settings: AudioProcessingSettings,
+        options: SessionAudioOptions,
+        reader_stall: Option<(usize, Duration)>,
+    ) -> Bus {
         let source = match microphone {
             Some(packets) => {
                 let count = Arc::new(AtomicU64::new(0));
@@ -6475,7 +7029,7 @@ mod mix_tests {
         let path =
             crate::audio::native_audio_fifo_path(&format!("mix-bus-{}", uuid::Uuid::new_v4()));
         crate::audio::create_native_audio_fifo(&path).unwrap();
-        let (reader, progress) = spawn_fifo_reader(path.clone());
+        let (reader, progress) = spawn_fifo_reader_with_stall(path.clone(), reader_stall);
         let video_epoch = Arc::new(OnceLock::new());
         video_epoch.set(epoch).unwrap();
         let session = attach_prepared_with(
@@ -6483,7 +7037,7 @@ mod mix_tests {
             path,
             Some(video_epoch),
             settings,
-            Duration::from_secs(2),
+            crate::audio::NATIVE_AUDIO_SOURCE_STALL_TIMEOUT,
             options,
         );
         Bus {
@@ -6550,6 +7104,164 @@ mod mix_tests {
 
     fn quiet_failure() -> ProducerFailure {
         Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// Frames in `from..to` whose left sample is exactly `value`.
+    fn frames_at(samples: &[f32], from: usize, to: usize, value: f32) -> usize {
+        (from..to.min(samples.len() / 2))
+            .filter(|frame| samples[frame * 2] == value)
+            .count()
+    }
+
+    /// Plan 075, the owner's stream 1: FFmpeg stopped draining the audio
+    /// FIFO for about 3 s (its audio input paused while video was late). The
+    /// microphone kept delivering, so it is never retired: the stretch the
+    /// reader missed is silent, the microphone is back as soon as the reader
+    /// is, and the gap is reported as an output stall, not a source loss.
+    /// On 0.9.121 this retired the microphone for the rest of the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_output_stall_never_retires_a_healthy_microphone() {
+        for options in [SessionAudioOptions::default(), system_options()] {
+            let epoch = Instant::now() + Duration::from_millis(100);
+            let microphone = signal_packets(epoch, 0, 48_000 * 9, 480, |_| (0.2, 0.2));
+            let bus = start_bus_with_stall(
+                epoch,
+                Some(microphone),
+                AudioProcessingSettings::default(),
+                options,
+                Some((72_000, Duration::from_secs(3))),
+            )
+            .await;
+            bus.wait_for_frames(48_000 * 8).await;
+            let observation = bus.session.observation(false);
+            assert!(bus.session.microphone_owner_present(), "never retired");
+            let (bytes, _) = bus.finish();
+            let samples = decode(&bytes);
+            assert_eq!(observation.losses, vec![], "not a source loss");
+            assert_eq!(observation.input_state, NativeAudioInputState::Live);
+            assert_eq!(observation.output_stalls.len(), 1, "one stall episode");
+            let stall = &observation.output_stalls[0];
+            assert!(stall.duration_ms >= 2_500, "{stall:?}");
+            assert!(stall.lost_ms >= 1_000, "{stall:?}");
+            assert_eq!(frames_at(&samples, 24_000, 72_000, 0.2), 48_000, "before");
+            assert_eq!(
+                frames_at(&samples, 312_000, 384_000, 0.2),
+                72_000,
+                "the microphone is back after the stall"
+            );
+        }
+    }
+
+    /// The same stall with system audio mixed: neither source is lost, and
+    /// both are back after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_output_stall_keeps_system_audio_in_the_mix() {
+        let epoch = Instant::now() + Duration::from_millis(100);
+        let microphone = signal_packets(epoch, 0, 48_000 * 9, 480, |_| (0.2, 0.2));
+        let bus = start_bus_with_stall(
+            epoch,
+            Some(microphone),
+            AudioProcessingSettings::default(),
+            system_options(),
+            Some((72_000, Duration::from_secs(3))),
+        )
+        .await;
+        let system = bus.session.system_audio();
+        let producer = prepare_system(
+            &system,
+            signal_packets(epoch, 0, 48_000 * 9, 960, |_| (0.5, 0.25)),
+            quiet_failure(),
+        )
+        .await;
+        bus.session.attach_system(producer).await.unwrap();
+        bus.wait_for_frames(48_000 * 8).await;
+        let observation = bus.session.observation(false);
+        assert!(system.observation().attached, "still in the mix");
+        assert_eq!(system.claim_loss(), None, "no system loss");
+        let (bytes, _) = bus.finish();
+        let samples = decode(&bytes);
+        assert_eq!(observation.losses, vec![]);
+        assert_eq!(observation.output_stalls.len(), 1);
+        assert_eq!(
+            frames_at(&samples, 312_000, 384_000, 0.7),
+            72_000,
+            "microphone plus system after the stall"
+        );
+    }
+
+    /// A device clock that jumps 5 s ahead mid-session (a genuine timeline
+    /// fault, with the output keeping pace): the loss is reported once, the
+    /// source re-anchors from its capture times, and its recovery is
+    /// reported. The producer is never retired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_clock_jump_re_anchors_and_recovers_without_retiring() {
+        let epoch = Instant::now() + Duration::from_millis(100);
+        let mut microphone = signal_packets(epoch, 0, 48_000 * 9, 480, |_| (0.2, 0.2));
+        for packet in microphone.iter_mut().skip(200) {
+            packet.timestamp_micros += 5_000_000;
+        }
+        let bus = start_bus(
+            epoch,
+            Some(microphone),
+            AudioProcessingSettings::default(),
+            SessionAudioOptions::default(),
+        )
+        .await;
+        bus.wait_for_frames(48_000 * 8).await;
+        let observation = bus.session.observation(false);
+        assert!(bus.session.microphone_owner_present(), "never retired");
+        let (bytes, _) = bus.finish();
+        let samples = decode(&bytes);
+        assert_eq!(
+            observation
+                .losses
+                .iter()
+                .map(|loss| loss.reason)
+                .collect::<Vec<_>>(),
+            vec![SourceLossReason::TimelineRejected],
+            "reported once"
+        );
+        assert_eq!(observation.recoveries.len(), 1, "{observation:?}");
+        let gap = observation.recoveries[0].gap_ms;
+        assert!((1_900..=3_000).contains(&gap), "gap {gap} ms");
+        assert_eq!(observation.input_state, NativeAudioInputState::Live);
+        assert!(observation.output_stalls.is_empty(), "the output kept pace");
+        assert_eq!(
+            frames_at(&samples, 288_000, 384_000, 0.2),
+            96_000,
+            "placed again from its capture times"
+        );
+    }
+
+    #[test]
+    fn a_stall_is_excused_only_after_the_bus_kept_pace_and_only_for_a_while() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut stall = OutputStall::default();
+        // Never kept pace (plan 070's old epoch): no episode, nothing excused.
+        assert_eq!(stall.observe(t0, 480_000, 0), None);
+        assert!(!stall.output_behind(t0));
+        // Kept pace, then 250 ms behind: an episode that began 250 ms ago.
+        assert_eq!(stall.observe(t0, 480, 0), None);
+        assert_eq!(stall.observe(t0 + ms(100), 12_000, 10), None);
+        assert!(stall.output_behind(t0 + ms(200)));
+        assert_eq!(stall.observe(t0 + ms(2_000), 96_000, 20_000), None);
+        assert!(
+            !stall.output_behind(t0 + Duration::from_secs(16)),
+            "stuck, not stalled"
+        );
+        let report = stall
+            .observe(t0 + ms(3_100), 480, 48_010)
+            .expect("caught up ends the episode");
+        assert_eq!(
+            report,
+            OutputStallReport {
+                duration_ms: 3_250,
+                max_lag_ms: 2_000,
+                lost_ms: 1_000,
+            }
+        );
+        assert!(!stall.output_behind(t0 + ms(3_200)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7442,19 +8154,21 @@ mod mix_tests {
         let reason = feed(&mut slot, restart + Duration::from_secs(2), far)
             .expect("2 s of unplaceable buffers is a loss");
         assert!(reason.contains("drifted out of range"), "{reason}");
-        // The buffers kept arriving: a placement loss, never a stopped capture.
+        // Plan 075: the buffers kept arriving, so this is a placement loss,
+        // reported once. The slot stays in the mix and re-anchors; it never
+        // exits for it.
+        assert!(slot.exit.is_none());
+        assert!(slot.clock.is_none(), "re-anchored at the loss");
         assert_eq!(
-            slot.ingest_loss_at(epoch, restart + Duration::from_secs(3))
-                .map(|(kind, _)| kind),
-            Some(SourceLossReason::TimelineRejected),
-            "sticky"
+            feed(&mut slot, restart + Duration::from_secs(3), far),
+            None,
+            "reported once, not sticky"
         );
         drop(sender);
         assert_eq!(
-            slot.ingest_loss_at(epoch, restart + Duration::from_secs(4))
-                .map(|(kind, _)| kind),
-            Some(SourceLossReason::CaptureStopped),
-            "an ended stream outranks placement"
+            slot.ingest_health_at(epoch, restart + Duration::from_secs(4)),
+            SlotHealth::Stopped("System audio stopped delivering audio.".into()),
+            "an ended stream still retires the slot"
         );
     }
 
@@ -7784,7 +8498,13 @@ mod mix_tests {
             failure: Some(failure.clone()),
         };
         (
-            SourceSlot::new(SourceRole::System, producer, 0, delay_frames),
+            SourceSlot::new(
+                SourceRole::System,
+                producer,
+                0,
+                delay_frames,
+                SYSTEM_AUDIO_PLAYOUT_DELAY,
+            ),
             sender,
             failure,
         )
