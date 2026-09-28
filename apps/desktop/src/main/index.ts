@@ -136,6 +136,7 @@ import {
   MAX_COMMENTS_SNAPSHOT_MESSAGES
 } from '../shared/comments-snapshot-delta'
 import { normalizeLiveDashboardState, type LiveDashboardState } from '../shared/live-dashboard'
+import { TWITCH_AUDIENCE_SCOPES } from '../shared/platform-scopes'
 import {
   migrateStreamManagerFrame,
   STREAM_MANAGER_DEFAULT_SIZE,
@@ -8728,7 +8729,9 @@ const MAIN_BACKEND_ADMIN_METHODS = new Set([
   'sessions.audience.get',
   'sessions.delete.resolve',
   'sessions.delete.complete',
-  'liveChat.sendOperations.latest'
+  'liveChat.sendOperations.latest',
+  // Show who followed from the Stream Manager (plan 071, S2).
+  'platformAccounts.oauth.startProvider'
 ])
 
 async function requestBackendAdmin<T>(
@@ -13672,6 +13675,33 @@ app.whenReady().then(async () => {
     (event, resolution: CommentsCommandResolution<ClipMarkedEvent>) => {
       if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false
       return commentsCommandBroker.resolve(resolution)
+    }
+  )
+  // Show who followed (plan 071, S2): main starts the Twitch reconnect with
+  // the follow and sub permissions over its admin socket and opens the
+  // browser. The callback completes it like any connect, and none of this
+  // rides in the main window's eager bundle.
+  secureIpcHandle(
+    'comments-window:follow-names',
+    async (event, value: unknown): Promise<boolean> => {
+      if (!commentsWindow || event.sender.id !== commentsWindow.webContents.id) {
+        throw new Error('Only the Chat window can ask to show who followed.')
+      }
+      commentsCommandRequestId(value)
+      if ((value as { platform?: unknown }).platform !== 'twitch') {
+        throw new Error('Only Twitch needs a reconnect to show who followed.')
+      }
+      const redirectUri = oauthCallbackRedirectUri('twitch')
+      const { authUrl } = await requestBackendAdmin<{ authUrl: string }>(
+        'platformAccounts.oauth.startProvider',
+        {
+          platform: 'twitch',
+          ...(redirectUri ? { redirectUri } : {}),
+          optionalScopes: [...TWITCH_AUDIENCE_SCOPES]
+        }
+      )
+      await openOAuthUrl(authUrl)
+      return true
     }
   )
   secureIpcHandle('captions-window:open', () => openCaptionsWindow())
