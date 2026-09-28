@@ -27,6 +27,7 @@
 //   VIDEORC_BASELINE_SCREEN_MOTION_STIMULUS=1  launch a visible animated browser window and require motion
 //   VIDEORC_BASELINE_AV_SYNC_STIMULUS=1        launch a visible flash+click browser window for lip-sync measurement
 //   VIDEORC_BASELINE_MIC_SYNC_OFFSET_MS        microphone sync offset to pass through to the recording session
+//   VIDEORC_BASELINE_SYSTEM_AUDIO=1            turn System audio on for the session (plan 069; measure:av-sync --system-audio)
 //   VIDEORC_BASELINE_STREAM=1                  enable record+stream (RTMP) for this session
 //   VIDEORC_BASELINE_STREAM_SERVER_URL         RTMP server URL (e.g. rtmp://127.0.0.1:19501/live)
 //   VIDEORC_BASELINE_STREAM_KEY                RTMP stream key (never printed; local sinks use a dummy key)
@@ -183,6 +184,7 @@ const config = {
     process.env.VIDEORC_BASELINE_NOTES_MAX_MARKER_RATIO ?? 0.002
   ),
   microphoneSyncOffsetMs: Number(process.env.VIDEORC_BASELINE_MIC_SYNC_OFFSET_MS ?? 0),
+  systemAudio: process.env.VIDEORC_BASELINE_SYSTEM_AUDIO === '1',
   screenMotionFocusIntervalMs: Number(process.env.VIDEORC_SCREEN_MOTION_FOCUS_INTERVAL_MS ?? 1000),
   requireMotion:
     process.env.VIDEORC_BASELINE_REQUIRE_MOTION === '1' ||
@@ -466,6 +468,7 @@ async function main() {
   })
 
   const ws = await connectBackend(launched.connections['backend-ready'], config.timeoutMs)
+  if (config.systemAudio) await seedRendererSystemAudio()
   const diagnosticsEvents = []
   const healthEvents = []
   const recordingStatusEvents = []
@@ -564,13 +567,6 @@ async function main() {
         )
       }
     }
-    if (config.avSyncStimulus) {
-      console.log('Launching visible flash+click A/V sync stimulus.')
-      avSyncStimulus = await launchAvSyncStimulus({ screenSource: sources.screen })
-      console.log(
-        `A/V sync stimulus window ${avSyncStimulus.width}x${avSyncStimulus.height} @ ${avSyncStimulus.x},${avSyncStimulus.y}.`
-      )
-    }
     if (config.notesOverlay) {
       notesOverlayState = await setupNotesOverlay(sources.screen)
       console.log(
@@ -637,6 +633,19 @@ async function main() {
     try {
       await waitForPreviewSourceReadiness(ws, sources, screenPreviewParams)
       await requireMotionStimulusVisibleBeforeRecording()
+      if (config.avSyncStimulus) {
+        // Launched after the Studio and preview windows so the flash+click
+        // window opens in front of them: a stimulus behind the app records
+        // no flashes.
+        console.log('Launching visible flash+click A/V sync stimulus.')
+        avSyncStimulus = await launchAvSyncStimulus({
+          screenSource: sources.screen,
+          waitForReady: true
+        })
+        console.log(
+          `A/V sync stimulus window ${avSyncStimulus.width}x${avSyncStimulus.height} @ ${avSyncStimulus.x},${avSyncStimulus.y}.`
+        )
+      }
     } catch (error) {
       return await writeBlockedBeforeEncoding({
         ws,
@@ -2007,6 +2016,7 @@ function writeBaselineReport(
     `- Motion required: ${config.requireMotion ? 'yes' : 'no'}${config.screenMotionStimulus ? ' (screen stimulus)' : ''}`
   )
   lines.push(`- Microphone sync offset: ${config.microphoneSyncOffsetMs}ms`)
+  lines.push(`- System audio: ${config.systemAudio ? 'on' : 'off'}`)
   if (config.avSyncStimulus) {
     lines.push(
       '- A/V sync stimulus: preview cadence FPS/interval gates relaxed; use the motion stimulus gate for preview smoothness.'
@@ -2555,6 +2565,7 @@ function realSourceGateRequest() {
     notesOverlay: config.notesOverlay,
     notesOverlayMaxMarkerPixelRatio: config.notesOverlayMaxMarkerPixelRatio,
     microphoneSyncOffsetMs: config.microphoneSyncOffsetMs,
+    systemAudio: config.systemAudio,
     noPreviewSurface: config.noPreviewSurface,
     fallbackLivePreview: config.fallbackLivePreview,
     requestedOutput: requestedOutputSettings(),
@@ -3404,7 +3415,8 @@ function sessionParams(sources, outputDirectoryCapability) {
     audio: {
       microphoneGainDb: 0,
       microphoneMuted: false,
-      microphoneSyncOffsetMs: config.microphoneSyncOffsetMs
+      microphoneSyncOffsetMs: config.microphoneSyncOffsetMs,
+      ...(config.systemAudio ? { systemAudioEnabled: true, systemAudioGainDb: -6 } : {})
     }
   }
 }
@@ -3665,6 +3677,33 @@ async function applyPendingNativePreviewHostCommands() {
   // credential. The public backend-ready marker intentionally contains only
   // the renderer token, so the harness asks main to perform the bounded drain.
   return await smokeCommand(smoke, 'drain-native-preview-host-commands')
+}
+
+/**
+ * The renderer syncs its System audio switch into every live session (plan
+ * 069 S5: it sends its setting to a session it did not start), so a
+ * backend-started session with System audio On is turned Off by a renderer
+ * whose switch is Off. Turn the renderer's switch On first (its persisted
+ * capture config, then a reload), before any preview or session work.
+ */
+async function seedRendererSystemAudio() {
+  const smoke = launched?.connections?.['preview-motion-ready']
+  if (config.packagedExecutable || !smoke) {
+    throw new Error('VIDEORC_BASELINE_SYSTEM_AUDIO=1 needs the dev app smoke command server.')
+  }
+  await smokeCommand(smoke, 'eval-js', {
+    code: `
+      const key = 'videorc.captureConfig';
+      let current = {};
+      try { current = JSON.parse(localStorage.getItem(key) ?? '{}') ?? {}; } catch {}
+      const audio = { ...(current.audio ?? {}), systemAudioEnabled: true, systemAudioGainDb: -6 };
+      localStorage.setItem(key, JSON.stringify({ ...current, audio }));
+      setTimeout(() => location.reload(), 50);
+      return true;
+    `
+  })
+  await new Promise((resolveWait) => setTimeout(resolveWait, 2500))
+  console.log('Renderer System audio switch seeded On.')
 }
 
 async function smokeCommand(smoke, command, params = {}, timeoutMs = config.timeoutMs) {

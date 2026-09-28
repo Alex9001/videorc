@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -66,6 +67,13 @@ export async function launchAvSyncStimulus(options = {}) {
   const htmlPath = join(dir, 'stimulus.html')
   const profileDir = join(dir, 'profile')
   writeFileSync(htmlPath, stimulusHtml(), 'utf8')
+  // Opt-in readiness channel: the page reports every pulse (audio state,
+  // focus, visibility) to a loopback beacon, and launch waits for a running,
+  // focused, visible pulse instead of a fixed settle. A browser that starts
+  // slowly, or opens behind other windows, records no flashes otherwise.
+  const readiness = options.waitForReady ? await startReadinessBeacon() : null
+  const pageUrl = new URL(pathToFileURL(htmlPath).href)
+  if (readiness) pageUrl.searchParams.set('beacon', readiness.url)
 
   const child = spawn(
     browserPath,
@@ -75,11 +83,18 @@ export async function launchAvSyncStimulus(options = {}) {
       '--no-default-browser-check',
       '--disable-background-networking',
       '--disable-extensions',
+      ...(readiness
+        ? [
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding'
+          ]
+        : []),
       '--autoplay-policy=no-user-gesture-required',
       '--force-device-scale-factor=1',
       `--window-position=${x},${y}`,
       `--window-size=${width},${height}`,
-      `--app=${pathToFileURL(htmlPath).href}`
+      `--app=${pageUrl.href}`
     ],
     {
       detached: true,
@@ -96,10 +111,22 @@ export async function launchAvSyncStimulus(options = {}) {
     x,
     y,
     width,
-    height
+    height,
+    readiness
   }
   try {
-    await sleep(settleMs)
+    if (readiness) {
+      const timeoutMs = Number(
+        options.readyTimeoutMs ?? process.env.VIDEORC_AV_SYNC_READY_TIMEOUT_MS ?? 30000
+      )
+      stimulus.ready = await readiness.waitFor(avSyncStimulusPulseReady, timeoutMs, () => {
+        if (child.exitCode !== null) {
+          throw new Error(`A/V sync stimulus browser exited early with code ${child.exitCode}.`)
+        }
+      })
+    } else {
+      await sleep(settleMs)
+    }
     if (child.exitCode !== null) {
       throw new Error(`A/V sync stimulus browser exited early with code ${child.exitCode}.`)
     }
@@ -111,7 +138,60 @@ export async function launchAvSyncStimulus(options = {}) {
 }
 
 export async function stopAvSyncStimulus(stimulus, options = {}) {
+  stimulus?.readiness?.close()
   return await stopStimulusBrowserTree(stimulus, options)
+}
+
+/** A pulse proves the stimulus is live: audio running, window focused and visible. */
+export function avSyncStimulusPulseReady(pulse) {
+  return pulse?.state === 'running' && pulse?.focus === '1' && pulse?.visible === 'visible'
+}
+
+/** Parses one beacon request (`/pulse?n=..&state=..&focus=..&visible=..`). */
+export function parseAvSyncStimulusPulse(requestUrl) {
+  const url = new URL(requestUrl, 'http://127.0.0.1')
+  if (url.pathname !== '/pulse') return null
+  return {
+    count: Number(url.searchParams.get('n') ?? 0),
+    state: url.searchParams.get('state'),
+    focus: url.searchParams.get('focus'),
+    visible: url.searchParams.get('visible')
+  }
+}
+
+function startReadinessBeacon() {
+  return new Promise((resolveBeacon, rejectBeacon) => {
+    const pulses = []
+    const server = createServer((request, response) => {
+      const pulse = parseAvSyncStimulusPulse(request.url ?? '/')
+      if (pulse) pulses.push({ ...pulse, at: Date.now() })
+      response.writeHead(204, { 'access-control-allow-origin': '*' })
+      response.end()
+    })
+    server.on('error', rejectBeacon)
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address()
+      resolveBeacon({
+        url: `http://127.0.0.1:${port}/`,
+        pulses,
+        close: () => server.close(),
+        async waitFor(predicate, timeoutMs, check) {
+          const deadline = Date.now() + timeoutMs
+          for (;;) {
+            const pulse = pulses.find(predicate)
+            if (pulse) return pulse
+            check?.()
+            if (Date.now() > deadline) {
+              throw new Error(
+                `A/V sync stimulus was not live, focused and visible within ${timeoutMs}ms (last pulse: ${JSON.stringify(pulses.at(-1) ?? null)}).`
+              )
+            }
+            await sleep(100)
+          }
+        }
+      })
+    })
+  })
 }
 
 function sleep(ms) {
@@ -215,6 +295,19 @@ function stimulusHtml() {
       osc.stop(now + 0.07);
     }
 
+    const beacon = new URLSearchParams(location.search).get('beacon');
+
+    function report() {
+      if (!beacon) return;
+      const query = new URLSearchParams({
+        n: String(count),
+        state: audio.state,
+        focus: document.hasFocus() ? '1' : '0',
+        visible: document.visibilityState
+      });
+      new Image().src = beacon + 'pulse?' + query.toString();
+    }
+
     function pulse() {
       audio.resume();
       count += 1;
@@ -222,6 +315,7 @@ function stimulusHtml() {
       stage.classList.add('flash');
       click();
       setTimeout(() => stage.classList.remove('flash'), 50);
+      report();
     }
 
     setTimeout(() => {

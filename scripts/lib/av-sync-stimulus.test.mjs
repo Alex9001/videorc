@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { resolveAvSyncStimulusBrowser, stopAvSyncStimulus } from './av-sync-stimulus.mjs'
+import {
+  avSyncStimulusPulseReady,
+  parseAvSyncStimulusPulse,
+  resolveAvSyncStimulusBrowser,
+  stopAvSyncStimulus
+} from './av-sync-stimulus.mjs'
 
 describe('resolveAvSyncStimulusBrowser', () => {
   it('uses the shared Windows resolver and reports the exact audible-stimulus executable', () => {
@@ -60,5 +65,25 @@ describe('stopAvSyncStimulus', () => {
     assert.equal(result.forced, false)
     assert.equal(result.treeExited, true)
     assert.equal(result.directoryRemoved, true)
+  })
+})
+
+describe('A/V sync stimulus readiness beacon', () => {
+  it('parses a pulse report', () => {
+    assert.deepEqual(parseAvSyncStimulusPulse('/pulse?n=3&state=running&focus=1&visible=visible'), {
+      count: 3,
+      state: 'running',
+      focus: '1',
+      visible: 'visible'
+    })
+    assert.equal(parseAvSyncStimulusPulse('/favicon.ico'), null)
+  })
+
+  it('is ready only while audio runs and the window is focused and visible', () => {
+    const live = { state: 'running', focus: '1', visible: 'visible' }
+    assert.equal(avSyncStimulusPulseReady(live), true)
+    assert.equal(avSyncStimulusPulseReady({ ...live, state: 'suspended' }), false)
+    assert.equal(avSyncStimulusPulseReady({ ...live, focus: '0' }), false)
+    assert.equal(avSyncStimulusPulseReady({ ...live, visible: 'hidden' }), false)
   })
 })

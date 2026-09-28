@@ -1,6 +1,10 @@
 # System Audio Capture Plan
 
-Status: follow-up feature plan.
+> **Superseded by [plan 069](../plans/069-system-audio-on-off.md)**
+> (2026-09-27; macOS implemented 2026-09-28). This document predates the
+> session audio bus and is kept for history only. Do not implement from it.
+
+Status: superseded by plans/069-system-audio-on-off.md.
 
 Created: 2026-06-11.
 

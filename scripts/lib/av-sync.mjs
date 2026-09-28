@@ -228,9 +228,25 @@ export async function runSignalstats(filePath, { ffmpegPath = 'ffmpeg' } = {}) {
   return parseSignalstatsYavg(stderr)
 }
 
+/**
+ * The click-onset audio filter. `bandpassHz` narrows detection to the
+ * stimulus's 1 kHz click, for recordings that carry other sound (System
+ * audio captures everything the computer plays). The two-pole band-pass
+ * delays onsets by about 1 ms, far under the gates.
+ */
+export function clickOnsetFilter({
+  noiseDb = DEFAULT_AV_SYNC_GATES.clickNoiseDb,
+  bandpassHz
+} = {}) {
+  const detect = `silencedetect=noise=${noiseDb}dB:d=0.02`
+  return Number.isFinite(bandpassHz)
+    ? `bandpass=f=${bandpassHz}:width_type=h:w=300,${detect}`
+    : detect
+}
+
 export async function runClickOnsets(
   filePath,
-  { ffmpegPath = 'ffmpeg', noiseDb = DEFAULT_AV_SYNC_GATES.clickNoiseDb } = {}
+  { ffmpegPath = 'ffmpeg', noiseDb = DEFAULT_AV_SYNC_GATES.clickNoiseDb, bandpassHz } = {}
 ) {
   const stderr = await run(ffmpegPath, [
     '-hide_banner',
@@ -240,7 +256,7 @@ export async function runClickOnsets(
     '-map',
     '0:a:0',
     '-af',
-    `silencedetect=noise=${noiseDb}dB:d=0.02`,
+    clickOnsetFilter({ noiseDb, bandpassHz }),
     '-f',
     'null',
     '-'
@@ -261,7 +277,11 @@ export async function measureAvSync(filePath, options = {}) {
     : 0
   const [frames, clicks] = await Promise.all([
     runSignalstats(filePath, { ffmpegPath }),
-    runClickOnsets(filePath, { ffmpegPath, noiseDb: gates.clickNoiseDb })
+    runClickOnsets(filePath, {
+      ffmpegPath,
+      noiseDb: gates.clickNoiseDb,
+      bandpassHz: options.clickBandpassHz
+    })
   ])
   const flashes = clusterFlashes(frames, gates.flashLumaThreshold)
   const measurement = measureAvOffset(flashes, clicks, gates.pairWindowMs)

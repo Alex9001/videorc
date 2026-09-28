@@ -205,6 +205,16 @@ export function buildRecordingStudioGateSteps({
         env: {
           VIDEORC_BASELINE_SOURCE_READINESS_MS: '60000'
         }
+      },
+      {
+        // Plan 069: System audio through the real ScreenCaptureKit capture:
+        // the tone in the file and the stream, a live Off/On at the bus
+        // cutover, Off captures nothing, Videorc's own sound excluded. Like
+        // the real SCK screen smoke it needs the dev app's Screen Recording
+        // grant and fails without it.
+        label: 'system audio capture smoke',
+        command: 'pnpm',
+        args: ['smoke:system-audio']
       }
     )
   }

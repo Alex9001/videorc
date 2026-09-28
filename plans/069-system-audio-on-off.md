@@ -8,10 +8,18 @@
 
 ## Status and decisions
 
-- Status: **PLANNED 2026-09-27**. Priority P1. Effort L+ (about 7 agent-days
-  over 9 slices; S8 Windows is its own PR). Risk HIGH: S2 changes the session
-  audio bus that every macOS session and every Windows worker session writes
-  through.
+- Status: **IMPLEMENTED (macOS) 2026-09-28** on `feat/069-system-audio`, S0 to
+  S7. The S7 gates are green: `pnpm smoke:system-audio` passed 3 runs in a row,
+  and end-to-end o_sys is within gate, so `SYSTEM_AUDIO_SYNC_OFFSET_MS` stays 0.
+  Owner acceptance on the packaged app is owed:
+  `docs/acceptance/2026-09-28-system-audio.md`. That doc also lists two findings:
+  - Library Play opens the default external player, so System audio records it.
+  - Orcle has no voice output today.
+
+  Windows S8 is in progress on `feat/069-windows-system-audio`. Planned
+  2026-09-27. Priority P1. Effort L+ (about 7 agent-days over 9 slices; S8
+  Windows is its own PR). Risk HIGH: S2 changes the session audio bus that every
+  macOS session and every Windows worker session writes through.
 - Planned against desktop `origin/main` `5aa38286` (0.9.118). Paths are
   relative to `crates/videorc-backend/src/` (Rust) or
   `apps/desktop/src/renderer/src/` (renderer, "R/") unless they start with
@@ -201,6 +209,14 @@ placeholder is still on the wire.
    - S5 and S7 re-check Library playback, the mic meter and Orcle with the
      flag on. If the flag breaks any of them, STOP: the only other route is
      CoreAudio process taps (macOS 14.2+).
+   - **S7 re-check (2026-09-28): the flag breaks nothing.**
+     - With the flag, no out-of-process audio service runs.
+     - Renderer `getUserMedia`, WebAudio analysers and media elements all work,
+       and renderer audio is excluded (`smoke:system-audio` case `self`).
+     - But the Library's Play button opens the default external player, which
+       is not Videorc, so it IS recorded.
+     - Orcle has no voice output.
+     - See `docs/acceptance/2026-09-28-system-audio.md`.
 10. **Platforms.**
     - macOS 13+ ships first, through ScreenCaptureKit.
     - Windows 11 follows in S8 through WASAPI process loopback.
