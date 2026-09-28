@@ -12,10 +12,18 @@ const toastSpies = vi.hoisted(() => ({
 }))
 vi.mock('sonner', () => ({ toast: toastSpies }))
 // The highlight card is painted on an OffscreenCanvas, which the node test
-// environment lacks. Only the painter is stubbed; layout stays real elsewhere.
+// environment lacks. Only the painter (and the card pair it paints, whose
+// vertical card exists exactly when a vertical canvas is passed) is stubbed;
+// layout stays real elsewhere.
 vi.mock('@/lib/caption-overlay', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/caption-overlay')>()),
-  renderCommentHighlightPng: async () => 'cG5n'
+  renderCommentHighlightPng: async () => 'cG5n',
+  renderCommentHighlightCards: async (
+    _message: unknown,
+    _avatarUrl: unknown,
+    _stream: unknown,
+    vertical?: unknown
+  ) => (vertical ? { pngBase64: 'cG5n', verticalPngBase64: 'cG5n' } : { pngBase64: 'cG5n' })
 }))
 
 import { revealInFileManagerLabel } from '@/lib/platform'
