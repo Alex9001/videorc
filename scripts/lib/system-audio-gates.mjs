@@ -275,6 +275,27 @@ export function parseSystemAudioMixCutover(line) {
   return { kind: match[1] === 'joined' ? 'attach' : 'detach', sample: Number(match[2]) }
 }
 
+/**
+ * The backend's one-shot startup record ("Recording audio epoch established
+ * from first video presentation"), or null. The dev backend colours tracing
+ * field names, so ANSI escapes are stripped before the fields are read.
+ */
+export function parseRecordingEpochLine(line) {
+  // eslint-disable-next-line no-control-regex
+  const plain = String(line ?? '').replace(/\u001b\[[0-9;]*m/g, '')
+  if (!plain.includes('Recording audio epoch established from first video presentation'))
+    return null
+  const field = (name) => {
+    const match = new RegExp(`\\b${name}=(\\d+)`).exec(plain)
+    return match ? Number(match[1]) : undefined
+  }
+  return {
+    sourceAgeMs: field('source_age_ms'),
+    presentationAgeMs: field('presentation_age_ms'),
+    epochAgeMs: field('epoch_age_ms')
+  }
+}
+
 export function cutoverFileSeconds(
   sample,
   { sampleRate = SYSTEM_AUDIO_SAMPLE_RATE, audioStartSeconds = 0, videoStartSeconds = 0 } = {}
@@ -438,8 +459,8 @@ export function evaluateMixedToneCapturedCase(
 
 /**
  * Plan 070: a static screen keeps its old content time (honest freshness), but
- * the recording epoch comes from the current composition, bounded by the
- * backend's 100 ms live-latency allowance, so no audio lands ahead of the cap.
+ * the recording epoch comes from the current composition (half a tick before
+ * it), so no audio lands ahead of the cap or late in the file.
  */
 export function evaluateStaticScreenEpoch({
   sourceAgeMs,
@@ -452,7 +473,7 @@ export function evaluateStaticScreenEpoch({
     failures.push('first recorded frame did not retain the held static content')
   if (!(presentationAgeMs >= 0 && presentationAgeMs < 250))
     failures.push('first recorded frame is not a current compositor presentation')
-  if (!(epochAgeMs >= 0 && epochAgeMs < 250))
+  if (!(epochAgeMs >= 0 && epochAgeMs < 100))
     failures.push('recording epoch follows the held content age, not the presentation')
   if (aheadCapDrops !== 0) failures.push('audio samples were rejected ahead of the timeline cap')
   return verdict(failures, { sourceAgeMs, presentationAgeMs, epochAgeMs, aheadCapDrops })

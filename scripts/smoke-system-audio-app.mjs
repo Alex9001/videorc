@@ -90,6 +90,7 @@ import {
   evaluateToneCapturedCase,
   evaluateMixedToneCapturedCase,
   evaluateStaticScreenEpoch,
+  parseRecordingEpochLine,
   mixSourcesIncludeSystemAudio,
   parseSystemAudioMixCutover,
   reportDbfs,
@@ -270,14 +271,8 @@ const audioSummaries = []
 const microphoneSummaries = []
 
 function onAppLine(line) {
-  if (line.includes('Recording audio epoch established from first video presentation')) {
-    startupEpochs.push({
-      at: performance.now(),
-      sourceAgeMs: Number(/source_age_ms=(\d+)/.exec(line)?.[1]),
-      presentationAgeMs: Number(/presentation_age_ms=(\d+)/.exec(line)?.[1]),
-      epochAgeMs: Number(/epoch_age_ms=(\d+)/.exec(line)?.[1])
-    })
-  }
+  const epoch = parseRecordingEpochLine(line)
+  if (epoch) startupEpochs.push({ at: performance.now(), ...epoch })
   const mic =
     /Native microphone capture ended for (.+): state=([^,]+), sourceLossAfterMs=([^,]+), (\d+) frames captured, (\d+) frames dropped/.exec(
       line
@@ -1272,6 +1267,14 @@ try {
         { preset: 'screen-only', settleMs: 600 },
         { timeoutMs }
       )
+      // A seeded source does not survive the device refresh; pin the display.
+      if (staticScreenId)
+        await requestSmokeCommand(
+          smoke,
+          'select-screen-device',
+          { sourceId: staticScreenId, settleMs: 1000 },
+          { timeoutMs }
+        )
     }
     await waitForBackendState(
       renderer,

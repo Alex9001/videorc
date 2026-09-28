@@ -11501,14 +11501,18 @@ function smokeRendererScript(command: string, params: Record<string, unknown>): 
       if (${JSON.stringify(command)} === 'select-screen-device') {
         const deadline = Date.now() + Number(params.timeoutMs ?? 15000);
         while (Date.now() < deadline) {
-          const source = window.__videorcSmokeSelectFirstScreen?.() ?? null;
+          const source = window.__videorcSmokeSelectFirstScreen?.(params.sourceId) ?? null;
           if (source) {
             await sleep(Number(params.settleMs ?? 1000));
             return source;
           }
           await sleep(200);
         }
-        throw new Error('No available ScreenCaptureKit screen/window source to select.');
+        throw new Error(
+          params.sourceId
+            ? \`ScreenCaptureKit source \${params.sourceId} is not available to select.\`
+            : 'No available ScreenCaptureKit screen/window source to select.'
+        );
       }
 
       if (${JSON.stringify(command)} === 'select-layout-preset') {
