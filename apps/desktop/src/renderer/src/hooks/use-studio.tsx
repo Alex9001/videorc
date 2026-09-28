@@ -2005,6 +2005,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     sessionId: string
     issue: SystemAudioIssue
   } | null>(null)
+  const [systemAudioRetry, retrySystemAudio] = useState(0)
   const [streamHealth, setStreamHealth] = useState<StreamHealth | null>(null)
   const [streamTargets, setStreamTargets] = useState<StreamTargetRuntime[]>([])
   const [diagnosticStats, setDiagnosticStats] = useState<DiagnosticStats>(idleDiagnosticStats)
@@ -3104,7 +3105,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     sessionId: string
     lastApplied: LiveAudioProcessingValues
     /** System audio as last sent to this session (start request or update);
-     * null until known. Confirmation comes from `recording.status`. */
+     * null until known, and again after an update the session did not apply,
+     * so it is sent again. Confirmation comes from `recording.status`. */
     systemAudioSent: LiveSystemAudioValues | null
     authoritative: boolean
     disabled: boolean
@@ -9520,12 +9522,21 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
   const systemAudioStatus = deviceList.devices.find(
     (device) => device.kind === 'system-audio'
   )?.status
-  const systemAudioShown = systemAudioConfirmed ?? captureConfig.audio.systemAudioEnabled
-  const setSystemAudioEnabled = (systemAudioEnabled: boolean): void =>
+  // With an issue the switch stays as the user set it, so a toggle turns it
+  // Off (PR #477 review).
+  const systemAudioShown =
+    (systemAudioIssue ? null : systemAudioConfirmed) ?? captureConfig.audio.systemAudioEnabled
+  // A shortcut or remote request is sent even when it repeats the last one:
+  // the retry after a failed start or a lost update.
+  const setSystemAudioEnabled = (systemAudioEnabled: boolean): void => {
+    if (liveAudioProcessingSyncRef.current)
+      liveAudioProcessingSyncRef.current.systemAudioSent = null
+    retrySystemAudio((count) => count + 1)
     setCaptureConfig((current) => ({
       ...current,
       audio: { ...current.audio, systemAudioEnabled }
     }))
+  }
 
   const currentStreamOutputTopologyRequest = useMemo(
     () =>
@@ -9767,6 +9778,8 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
             )
             return true
           }
+          // Not applied: send the system audio fields again (PR #477 review).
+          latest.systemAudioSent = null
           if (validResult?.reasonCode === 'session-ended') {
             failLiveMicrophoneWaiters(requested.sessionId)
             return false
@@ -9888,11 +9901,10 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     // System audio rides the same latest-wins queue, carrying only the fields
     // this session does not already hold (plan 069): a mic edit never re-sends
     // the switch, and a switch flip never needs a mic change.
-    const systemAudioDesired = {
-      systemAudioEnabled: captureConfig.audio.systemAudioEnabled,
-      systemAudioGainDb: captureConfig.audio.systemAudioGainDb
-    }
-    const systemAudioDelta = systemAudioProcessingDelta(systemAudioDesired, sync.systemAudioSent)
+    // The deps below hold the same values; the ref only avoids a dep on the
+    // whole audio object.
+    const systemAudio = captureConfigRef.current.audio
+    const systemAudioDelta = systemAudioProcessingDelta(systemAudio, sync.systemAudioSent)
     const systemAudioChanged = Object.keys(systemAudioDelta).length > 0
     const desiredMatchesLastApplied =
       params.microphoneGainDb === sync.lastApplied.microphoneGainDb &&
@@ -9906,7 +9918,9 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
       return
     }
 
-    sync.systemAudioSent = systemAudioDesired
+    // A new switch state supersedes the last issue (PR #477 review).
+    if (systemAudioDelta.systemAudioEnabled !== undefined) setSystemAudioIssueEvent(null)
+    sync.systemAudioSent = systemAudio
     sync.queue.enqueue({ ...params, ...systemAudioDelta })
   }, [
     client,
@@ -9916,6 +9930,7 @@ export function StudioProvider({ children }: { children: ReactNode }): ReactElem
     captureConfig.audio.microphoneMuted,
     captureConfig.audio.systemAudioEnabled,
     captureConfig.audio.systemAudioGainDb,
+    systemAudioRetry,
     commitLiveAudioProcessingApplied,
     failLiveMicrophoneWaiters,
     reportError,

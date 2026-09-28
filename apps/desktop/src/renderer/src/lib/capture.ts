@@ -1236,8 +1236,6 @@ export const defaultCaptureConfig: CaptureConfig = {
     // -750ms constant is gone — it could never fit every resolution at once.
     microphoneSyncOffsetMs: 0,
     microphoneSyncOffsetUserSet: false,
-    // Plan 069: Off means not captured at all (notifications and calls are
-    // private); -6 dB keeps a voice on top of games and music.
     systemAudioEnabled: false,
     systemAudioGainDb: SYSTEM_AUDIO_GAIN_DB_DEFAULT
   },
@@ -1412,6 +1410,12 @@ export function normalizeAudioSettings(audio: unknown): AudioSettings {
       )
     : defaultCaptureConfig.audio.microphoneSyncOffsetMs
 
+  // System audio (plan 069): anything but an explicit `true` is Off, so a
+  // stored config from before plan 069 never starts capturing the computer's
+  // sound. Off is the default too: not captured at all (notifications and
+  // calls are private), and -6 dB keeps a voice on top of games and music.
+  // (Comments stay out of these object literals: the bundler keeps those in
+  // the eager Studio chunk.)
   return {
     microphoneGainDb: clampNumber(
       candidate.microphoneGainDb,
@@ -1425,8 +1429,6 @@ export function normalizeAudioSettings(audio: unknown): AudioSettings {
         : defaultCaptureConfig.audio.microphoneMuted,
     microphoneSyncOffsetMs,
     microphoneSyncOffsetUserSet: offsetUserSet,
-    // Anything but an explicit `true` is Off: a stored config from before plan
-    // 069 must never start capturing the computer's sound.
     systemAudioEnabled: candidate.systemAudioEnabled === true,
     systemAudioGainDb: normalizeSystemAudioGainDb(candidate.systemAudioGainDb)
   }
