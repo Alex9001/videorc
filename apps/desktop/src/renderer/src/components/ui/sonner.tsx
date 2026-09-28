@@ -26,25 +26,15 @@ const Toaster = ({ closeButton = true, toastOptions, ...props }: ToasterProps) =
         loading: <SpinnerIcon className="size-4 animate-spin" />,
         close: <CloseIcon className="size-3.5" />
       }}
-      style={
-        {
-          '--normal-bg': 'var(--popover)',
-          '--normal-text': 'var(--popover-foreground)',
-          '--normal-border': 'var(--border)',
-          '--border-radius': 'var(--radius)'
-        } as React.CSSProperties
-      }
       toastOptions={{
         ...toastOptions,
         closeButtonAriaLabel: toastOptions?.closeButtonAriaLabel ?? 'Dismiss notification',
         classNames: {
           ...toastOptions?.classNames,
-          // Toasts are floating surfaces (plan 050, D5): the near-opaque
-          // popover token, one soft shadow, and a hairline ring. No backdrop
-          // blur: it wedges the compositor on the vibrancy window.
-          toast: ['cn-toast', 'shadow-soft', toastOptions?.classNames?.toast]
-            .filter(Boolean)
-            .join(' ')
+          // Toasts are floating surfaces (plan 072): the float glass and the
+          // typed tints live in styles.css (the sonner block), because sonner
+          // injects unlayered CSS that a layered utility cannot beat.
+          toast: ['cn-toast', toastOptions?.classNames?.toast].filter(Boolean).join(' ')
         }
       }}
       {...props}
