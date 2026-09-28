@@ -327,7 +327,7 @@ impl LoopbackRoot {
 }
 
 #[cfg(windows)]
-#[allow(unused_imports)] // re-exported by system_audio_capture; wired in S8b
+#[allow(unused_imports)] // `SystemAudioCaptureInfo` and `parent_pid` serve the tests
 pub(crate) use capture::{
     SystemAudioCapture, SystemAudioCaptureInfo, SystemAudioCaptureOptions, parent_pid,
 };
@@ -501,7 +501,6 @@ mod capture {
         owner: Option<thread::JoinHandle<()>>,
     }
 
-    #[allow(dead_code)] // wired in S8b
     impl SystemAudioCapture {
         /// Activates and starts a process-loopback client that excludes
         /// `options.root`'s process tree. Blocks for up to

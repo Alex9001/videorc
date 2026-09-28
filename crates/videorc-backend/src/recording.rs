@@ -1911,8 +1911,13 @@ pub struct ActiveRecording {
     pub pipeline: RecordingPipeline,
     pub native_audio: Option<NativeAudioCaptureSession>,
     /// The session's System audio switch (plan 069 S4), on every session whose
-    /// bus can mix system audio (macOS). It opens nothing until turned on.
+    /// bus can mix system audio (macOS, and Windows 11 since S8). It opens
+    /// nothing until turned on.
     system_audio: Option<crate::system_audio_session::SessionSystemAudio>,
+    /// The platform can mix system audio but this session's microphone
+    /// bypasses the bus (plan 069 S8: the Windows DirectShow fallback or a
+    /// legacy direct input), so System audio On is reported, never mixed.
+    system_audio_bypassed: bool,
     ffmpeg_live_audio_session: Option<SharedFfmpegLiveAudioSession>,
     pub screen_overlay: Option<ScreenOverlaySession>,
     pub encoder_bridge: Option<EncoderBridgeRecordingSession>,
@@ -2046,6 +2051,7 @@ pub(crate) fn test_active_recording_stub(session_id: &str) -> ActiveRecording {
         pipeline: RecordingPipeline::new(false, true, &[]),
         native_audio: None,
         system_audio: None,
+        system_audio_bypassed: false,
         ffmpeg_live_audio_session: None,
         screen_overlay: None,
         encoder_bridge: None,
@@ -2514,6 +2520,7 @@ pub async fn update_active_audio_processing(
         confirmed_microphone_muted: None,
     };
 
+    let mut system_audio_bypass_requested = false;
     let (ffmpeg_live_audio_session, ffmpeg_pid) = {
         let recording = state.recording.lock().await;
         let Some(active) = recording.as_ref() else {
@@ -2540,6 +2547,12 @@ pub async fn update_active_audio_processing(
             if let Some(enabled) = params.system_audio_enabled {
                 system_audio.request(enabled);
             }
+        } else {
+            // A bypassed microphone (plan 069 S8): say why On does nothing,
+            // after the lock. The mic update below is unaffected; the FFmpeg
+            // live control skips a command whose mic values did not change.
+            system_audio_bypass_requested =
+                system_audio_bypass_to_report(active, params.system_audio_enabled);
         }
 
         if let Some(native_audio) = active.native_audio.as_ref() {
@@ -2550,6 +2563,9 @@ pub async fn update_active_audio_processing(
 
         (active.ffmpeg_live_audio_session.clone(), active.pid)
     };
+    if system_audio_bypass_requested {
+        emit_system_audio_mic_fallback_bypass_health_event(state, &params.session_id);
+    }
 
     let Some(ffmpeg_live_audio_session) = ffmpeg_live_audio_session else {
         result.reason_code = Some("live-audio-control-unavailable".to_string());
@@ -4597,6 +4613,12 @@ async fn start_session_with_timeline(
     let session_system_audio = attached_native_audio
         .as_ref()
         .and_then(|audio| spawn_session_system_audio(&state, &session_id, audio));
+    // Plan 069 S8: a microphone FFmpeg opens itself (the Windows DirectShow
+    // fallback, or a bundle without the capture worker) bypasses the bus, so
+    // this session cannot mix system audio; On is reported once published.
+    let system_audio_bypassed = session_system_audio.is_none()
+        && session_system_audio_mix(system_audio_capable, capture.microphone.as_ref())
+            == SessionSystemAudioMix::MicrophoneBypassesBus;
     // Declare the uncommitted process guard after every blocking FIFO writer.
     // Rust drops locals in reverse declaration order, so even cancellation or
     // a future unhandled early return starts terminating FFmpeg before native
@@ -5164,6 +5186,7 @@ async fn start_session_with_timeline(
         pipeline,
         native_audio: attached_native_audio,
         system_audio: session_system_audio,
+        system_audio_bypassed,
         ffmpeg_live_audio_session,
         screen_overlay,
         encoder_bridge,
@@ -5440,12 +5463,15 @@ async fn start_session_with_timeline(
     // System audio On at start (plan 069 decision 12): requested only now,
     // after the session is published, so it never delays Record. The source
     // joins the running mix when its capture delivers.
-    if let Some(active) = recording.as_ref() {
-        request_initial_system_audio(active, &params.audio);
-    }
+    let report_system_audio_bypass = recording
+        .as_ref()
+        .is_some_and(|active| request_initial_system_audio(active, &params.audio));
     session_row_guard.disarm();
     published_session_start.disarm();
     drop(recording);
+    if report_system_audio_bypass {
+        emit_system_audio_mic_fallback_bypass_health_event(&state, &session_id);
+    }
 
     Ok(running_status)
 }
@@ -5480,15 +5506,47 @@ fn start_session_system_audio(
     crate::system_audio_session::SessionSystemAudio::spawn(handle, open, events)
 }
 
-fn request_initial_system_audio(active: &ActiveRecording, audio: &AudioSettings) {
+/// Requests System audio On for a session that starts with it on. Returns
+/// true when the session cannot mix it because its microphone bypasses the
+/// bus: the caller reports that once the recording lock is released.
+fn request_initial_system_audio(active: &ActiveRecording, audio: &AudioSettings) -> bool {
     // The performance check measures the encoder; it never captures the
     // computer's sound.
-    if audio.system_audio_enabled
-        && !active.performance_check
-        && let Some(system_audio) = active.system_audio.as_ref()
-    {
-        system_audio.request(true);
+    if !audio.system_audio_enabled || active.performance_check {
+        return false;
     }
+    match active.system_audio.as_ref() {
+        Some(system_audio) => {
+            system_audio.request(true);
+            false
+        }
+        None => system_audio_bypass_to_report(active, Some(true)),
+    }
+}
+
+/// Whether a System audio request on this session must be answered with the
+/// bypass health event: On was asked for, and the platform could mix it but
+/// the session's microphone bypasses the bus. Off, a level change, or a
+/// platform without system audio say nothing.
+fn system_audio_bypass_to_report(active: &ActiveRecording, enabled: Option<bool>) -> bool {
+    enabled == Some(true)
+        && active.system_audio.is_none()
+        && active.system_audio_bypassed
+        && !active.performance_check
+}
+
+fn emit_system_audio_mic_fallback_bypass_health_event(state: &AppState, session_id: &str) {
+    state.emit_log(
+        "warn",
+        "System audio is not mixed: the microphone is a direct fallback input that bypasses the session audio bus.",
+    );
+    let _ = emit_health_event(
+        state,
+        Some(session_id),
+        HealthLevel::Warn,
+        crate::system_audio_session::SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_CODE,
+        crate::system_audio_session::SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_MESSAGE,
+    );
 }
 
 /// Turns the reconciler's outcomes into the session's status and health.
@@ -17411,13 +17469,19 @@ fn capture_audio_tracks(capture: &CaptureInputs) -> Vec<AudioTrack> {
 /// is the file's audio title metadata, fixed when FFmpeg starts, while system
 /// audio can join or leave at any time. `mix_sources` is what tells them
 /// apart; [`with_system_audio_mix`] keeps it current.
+///
+/// A microphone that bypasses the bus (plan 069 S8) reports the same
+/// microphone-only mix on a capable platform, so the renderer sees that this
+/// session does not mix system audio rather than falling back to the switch.
 fn capture_audio_tracks_for(
     capture: &CaptureInputs,
     system_audio_capable: bool,
 ) -> Vec<AudioTrack> {
     if capture.microphone.is_some() {
         let mut track = microphone_audio_track();
-        if system_audio_capable && microphone_uses_session_bus(capture.microphone.as_ref()) {
+        if session_system_audio_mix(system_audio_capable, capture.microphone.as_ref())
+            != SessionSystemAudioMix::Unsupported
+        {
             track.mix_sources = crate::system_audio_session::bus_mix_sources(false);
         }
         return vec![track];
@@ -17443,6 +17507,35 @@ fn with_system_audio_mix(tracks: &[AudioTrack], system_attached: Option<bool>) -
         }
     }
     tracks
+}
+
+/// Whether a session can mix system audio, from its platform and microphone
+/// input (plan 069 S8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSystemAudioMix {
+    /// The microphone (or the paced silence standing in for none) reaches
+    /// FFmpeg through the session audio bus, which mixes system audio.
+    Bus,
+    /// FFmpeg opens the microphone device itself (the Windows DirectShow
+    /// fallback when the capture worker cannot open it, or a bundle without
+    /// the worker), so the bus is bypassed and the session stays mic-only.
+    MicrophoneBypassesBus,
+    /// This platform cannot mix system audio at all.
+    Unsupported,
+}
+
+fn session_system_audio_mix(
+    system_audio_capable: bool,
+    microphone: Option<&MicrophoneInput>,
+) -> SessionSystemAudioMix {
+    if !system_audio_capable {
+        SessionSystemAudioMix::Unsupported
+    } else if microphone.is_none() || microphone_uses_session_bus(microphone) {
+        // No microphone becomes the paced-silence bus at session start.
+        SessionSystemAudioMix::Bus
+    } else {
+        SessionSystemAudioMix::MicrophoneBypassesBus
+    }
 }
 
 /// The microphone reaches FFmpeg as the session audio bus FIFO (every macOS
@@ -24154,6 +24247,7 @@ mod tests {
             pipeline: RecordingPipeline::new(false, true, &[]),
             native_audio: None,
             system_audio: None,
+            system_audio_bypassed: false,
             ffmpeg_live_audio_session: None,
             screen_overlay: None,
             encoder_bridge: None,
@@ -30115,6 +30209,7 @@ mod tests {
             pipeline: RecordingPipeline::new(true, false, &audio_tracks),
             native_audio: None,
             system_audio: None,
+            system_audio_bypassed: false,
             ffmpeg_live_audio_session: Some(live_audio_session.clone()),
             screen_overlay: None,
             encoder_bridge: None,
@@ -34569,7 +34664,7 @@ mod tests {
                 serde_json::json!(["microphone", "system-audio"])
             );
 
-            // No mix where the platform cannot mix, or FFmpeg opens the device.
+            // No mix where the platform cannot mix.
             let plain = capture_audio_tracks_for(&bus_capture(VideoInput::TestPattern), false);
             assert_eq!(plain, vec![microphone_audio_track()]);
             assert!(
@@ -34577,6 +34672,10 @@ mod tests {
                     .mix_sources
                     .is_empty()
             );
+            // A microphone FFmpeg opens itself bypasses the bus (plan 069 S8):
+            // on a capable platform it reports a microphone-only mix, so the
+            // renderer sees System audio is not mixed. It has no switch, so
+            // the mix never changes.
             let direct = capture_audio_tracks_for(
                 &CaptureInputs {
                     video: VideoInput::MacScreen { index: 3 },
@@ -34585,7 +34684,19 @@ mod tests {
                 },
                 true,
             );
-            assert_eq!(direct, vec![microphone_audio_track()]);
+            assert_eq!(direct.len(), 1);
+            assert_eq!(direct[0].id, "microphone");
+            assert_eq!(direct[0].mix_sources, vec![AudioTrackSource::Microphone]);
+            assert_eq!(with_system_audio_mix(&direct, None), direct);
+            let direct_elsewhere = capture_audio_tracks_for(
+                &CaptureInputs {
+                    video: VideoInput::MacScreen { index: 3 },
+                    camera_index: None,
+                    microphone: Some(MicrophoneInput::AvFoundation { index: 1 }),
+                },
+                false,
+            );
+            assert_eq!(direct_elsewhere, vec![microphone_audio_track()]);
             let tone = capture_audio_tracks_for(
                 &CaptureInputs {
                     video: VideoInput::TestPattern,
@@ -34928,6 +35039,210 @@ mod tests {
                 result.reason_code.as_deref(),
                 Some("live-audio-control-unavailable")
             );
+        }
+
+        // -- plan 069 S8: a microphone that bypasses the bus -----------------
+
+        fn windows_dshow() -> MicrophoneInput {
+            MicrophoneInput::WindowsDshow {
+                device_name: "Microphone (USB Audio Device)".into(),
+            }
+        }
+
+        #[test]
+        fn only_a_bus_fed_microphone_can_mix_system_audio() {
+            let bus_fed = [
+                // Windows capture worker, macOS native and worker mics.
+                Some(MicrophoneInput::SessionPcm {
+                    fifo_path: PathBuf::from(BUS_FIFO),
+                }),
+                Some(MicrophoneInput::CoreAudio {
+                    device_id: 7,
+                    fifo_path: Some(PathBuf::from(BUS_FIFO)),
+                }),
+                // No microphone: the paced-silence bus.
+                None,
+            ];
+            for microphone in &bus_fed {
+                assert_eq!(
+                    session_system_audio_mix(true, microphone.as_ref()),
+                    SessionSystemAudioMix::Bus,
+                    "{microphone:?}"
+                );
+            }
+            // Inputs FFmpeg opens itself: the Windows DirectShow fallback (and
+            // a bundle without the worker), and the legacy direct inputs.
+            let bypassing = [
+                windows_dshow(),
+                MicrophoneInput::AvFoundation { index: 1 },
+                MicrophoneInput::AvFoundationUid {
+                    uid_hex: "00".into(),
+                },
+                MicrophoneInput::CoreAudio {
+                    device_id: 7,
+                    fifo_path: None,
+                },
+                MicrophoneInput::LinuxPulse {
+                    source_name: "alsa_input".into(),
+                },
+            ];
+            for microphone in &bypassing {
+                assert_eq!(
+                    session_system_audio_mix(true, Some(microphone)),
+                    SessionSystemAudioMix::MicrophoneBypassesBus,
+                    "{microphone:?}"
+                );
+            }
+            // A platform that cannot mix system audio never reports a bypass.
+            for microphone in bus_fed.iter().cloned().chain(bypassing.map(Some)) {
+                assert_eq!(
+                    session_system_audio_mix(false, microphone.as_ref()),
+                    SessionSystemAudioMix::Unsupported
+                );
+            }
+        }
+
+        #[test]
+        fn the_bypass_copy_is_one_plain_sentence() {
+            use crate::system_audio_session::{
+                SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_CODE, SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_MESSAGE,
+            };
+            assert_eq!(
+                SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_CODE,
+                "system-audio-mic-fallback-bypass"
+            );
+            assert_eq!(
+                SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_MESSAGE,
+                "System audio is off for this session because the microphone is on a fallback input."
+            );
+            assert!(!SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_MESSAGE.contains('\u{2014}'));
+            // No screen words: the health row never points at the Screen
+            // Recording pane. Like the worker-fallback event it follows, it
+            // links the Microphone pane (the code itself names the mic).
+            assert_eq!(
+                crate::diagnostics::permission_pane_for_log(
+                    SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_CODE,
+                    SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_MESSAGE
+                ),
+                Some(crate::protocol::PermissionPane::Microphone)
+            );
+        }
+
+        /// A published Windows fallback session: the worker could not open
+        /// the microphone, so FFmpeg records DirectShow directly with its
+        /// stdin live mic control, and there is no bus and no system switch.
+        fn bypassed_active(session_id: &str) -> ActiveRecording {
+            let mut active = test_active_recording_stub(session_id);
+            active.audio_tracks = capture_audio_tracks_for(
+                &CaptureInputs {
+                    video: VideoInput::TestPattern,
+                    camera_index: None,
+                    microphone: Some(windows_dshow()),
+                },
+                true,
+            );
+            active.system_audio_bypassed = true;
+            active
+        }
+
+        #[test]
+        fn system_audio_on_at_start_reports_the_bypass_once_and_never_for_off() {
+            let mut audio = AudioSettings::default();
+            let active = bypassed_active("bypass-start");
+            audio.system_audio_enabled = false;
+            assert!(!request_initial_system_audio(&active, &audio));
+            audio.system_audio_enabled = true;
+            assert!(request_initial_system_audio(&active, &audio));
+
+            // The performance check never captures system audio.
+            let mut check = bypassed_active("bypass-check");
+            check.performance_check = true;
+            assert!(!request_initial_system_audio(&check, &audio));
+            // A session without the bypass (a platform without system
+            // audio) says nothing.
+            let plain = test_active_recording_stub("plain");
+            assert!(!request_initial_system_audio(&plain, &audio));
+
+            // Only On is answered.
+            assert!(system_audio_bypass_to_report(&active, Some(true)));
+            assert!(!system_audio_bypass_to_report(&active, Some(false)));
+            assert!(!system_audio_bypass_to_report(&active, None));
+        }
+
+        #[tokio::test]
+        async fn a_bypassed_session_reports_on_without_disturbing_the_ffmpeg_mic_control() {
+            let session_id = "system-audio-bypass";
+            let state = test_state();
+            state
+                .database
+                .ensure_fake_live_chat_session(session_id)
+                .unwrap();
+            let (mut child, stdin) = spawn_test_stdin_sink().await;
+            let (_reply_sender, replies) = mpsc::unbounded_channel();
+            let (dispatch_sender, mut dispatches) = mpsc::unbounded_channel();
+            let live_audio_session = Arc::new(FfmpegLiveAudioSessionHandle::new(
+                stdin,
+                FfmpegLiveAudioControl::new(1, replies, AudioProcessingSettings::default())
+                    .with_dispatch_sender(dispatch_sender),
+            ));
+            assert!(live_audio_session.mark_command_ready());
+            let mut active = bypassed_active(session_id);
+            active.ffmpeg_live_audio_session = Some(live_audio_session.clone());
+            *state.recording.lock().await = Some(active);
+
+            // The renderer's System audio toggle carries the unchanged mic
+            // values: no FFmpeg command, and the reply is a success.
+            let update = |enabled: Option<bool>| AudioProcessingUpdateParams {
+                session_id: session_id.into(),
+                microphone_gain_db: 0.0,
+                microphone_muted: false,
+                system_audio_enabled: enabled,
+                system_audio_gain_db: Some(-3.0),
+            };
+            let result = update_active_audio_processing(&state, update(Some(true))).await;
+            assert!(result.applied, "{result:?}");
+            assert_eq!(result.reason_code, None);
+            assert!(
+                dispatches.try_recv().is_err(),
+                "an unchanged mic sends FFmpeg nothing"
+            );
+            let bypass = |state: &AppState| {
+                state
+                    .database
+                    .list_health_events(session_id)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|event| {
+                        event.code
+                            == crate::system_audio_session::SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_CODE
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let events = bypass(&state);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0].session_id.as_deref(), Some(session_id));
+            assert!(matches!(events[0].level, HealthLevel::Warn));
+
+            // Off and a level change say nothing more.
+            let result = update_active_audio_processing(&state, update(Some(false))).await;
+            assert!(result.applied);
+            let result = update_active_audio_processing(&state, update(None)).await;
+            assert!(result.applied);
+            assert_eq!(bypass(&state).len(), 1);
+
+            // The session stays mic-only, and says so.
+            {
+                let recording = state.recording.lock().await;
+                let active = recording.as_ref().unwrap();
+                assert_eq!(
+                    active.status(active.running_state(), None).audio_tracks[0].mix_sources,
+                    vec![AudioTrackSource::Microphone]
+                );
+            }
+
+            state.recording.lock().await.take();
+            live_audio_session.close_stdin().await.unwrap();
+            wait_for_test_stdin_sink(&mut child).await;
         }
     }
 }

@@ -47,6 +47,25 @@ describe('Sources System audio settings (plan 069)', () => {
     expect(render({}, false)).not.toContain('volume and mute')
   })
 
+  it('keeps Windows copy free of Mac and Screen Recording wording', () => {
+    const idle = render({}, false)
+    expect(idle).toContain('Everything your computer plays, except Videorc.')
+    expect(idle).not.toContain('Screen Recording')
+    const failed = render(
+      { requested: true, sessionActive: true, confirmed: false, issue: 'unavailable' },
+      false
+    )
+    expect(failed).toContain('System audio could not start.')
+    expect(failed).not.toContain('Open Settings')
+    const bypassed = render(
+      { requested: true, sessionActive: true, confirmed: false, issue: 'bypassed' },
+      false
+    )
+    expect(bypassed).toContain(
+      'System audio is off for this session because the microphone is on a fallback input.'
+    )
+  })
+
   it('disables the switch and the level without Screen Recording permission', () => {
     const markup = render({ device: { status: 'permission-required' } })
     expect(markup).toContain('Needs Screen Recording permission')

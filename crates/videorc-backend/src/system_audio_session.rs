@@ -39,9 +39,19 @@ pub(crate) const SYSTEM_AUDIO_SYNC_OFFSET_MS: i32 = 0;
 /// `health.event` codes (the renderer's `SYSTEM_AUDIO_*_CODE`).
 pub(crate) const SYSTEM_AUDIO_UNAVAILABLE_CODE: &str = "system-audio-unavailable";
 pub(crate) const SYSTEM_AUDIO_LOST_CODE: &str = "system-audio-lost";
+/// The session's microphone is a direct FFmpeg input (on Windows, the
+/// DirectShow fallback when the capture worker cannot open it, or a bundle
+/// without the worker), so the session audio bus that mixes system audio is
+/// bypassed and the session stays microphone-only (plan 069 S8).
+pub(crate) const SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_CODE: &str = "system-audio-mic-fallback-bypass";
+/// Free of "screen" words, so the health row never points at the Screen
+/// Recording pane; like the worker-fallback event it follows, it links the
+/// Microphone pane.
+pub(crate) const SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_MESSAGE: &str =
+    "System audio is off for this session because the microphone is on a fallback input.";
 
 /// The one system-audio device (`devices.rs`).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 const SYSTEM_AUDIO_DEVICE_NAME: &str = "System audio";
 
 /// How long a start waits for this session's previous capture (just turned
@@ -51,14 +61,28 @@ const PREVIOUS_CAPTURE_CLEANUP_WAIT: Duration = Duration::from_secs(5);
 const CLEANUP_POLL: Duration = Duration::from_millis(50);
 
 /// Whether sessions on this platform can mix system audio. It is a platform
-/// fact, not a permission: the Screen Recording grant is checked when a
-/// capture starts, and a missing grant is a `system-audio-unavailable` event.
-/// Every session on a capable platform runs the bus with the system-audio
-/// playout delay and the decision 8 offset split, whether or not the switch
-/// is on, so a live toggle never changes FFmpeg. Windows joins in S8; Linux is
-/// out of scope.
-pub(crate) const fn system_audio_capable() -> bool {
-    cfg!(target_os = "macos")
+/// fact, not a permission: on macOS the Screen Recording grant is checked when
+/// a capture starts, and a missing grant is a `system-audio-unavailable`
+/// event. On Windows it is WASAPI process loopback (build 20348 and later,
+/// every Windows 11), the same probe that makes the device row Available;
+/// loopback needs no grant. Every session on a capable platform runs the bus
+/// with the system-audio playout delay and the decision 8 offset split,
+/// whether or not the switch is on, so a live toggle never changes FFmpeg. A
+/// session whose microphone bypasses the bus cannot mix it
+/// ([`SYSTEM_AUDIO_MIC_FALLBACK_BYPASS_CODE`]). Linux is out of scope.
+pub(crate) fn system_audio_capable() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(windows)]
+    {
+        crate::devices::windows_system_audio_supported()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        false
+    }
 }
 
 /// The sources one bus track currently mixes (`AudioTrack::mix_sources`). The
@@ -106,24 +130,26 @@ pub(crate) type SystemAudioOpen = Arc<dyn Fn() -> anyhow::Result<ProducerSource>
 /// The platform's system-audio capture, or `None` where sessions cannot mix
 /// system audio.
 pub(crate) fn platform_opener() -> Option<SystemAudioOpen> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
-        Some(Arc::new(open_screen_capture_kit))
+        system_audio_capable().then(|| Arc::new(open_platform_capture) as SystemAudioOpen)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         None
     }
 }
 
-/// S3's audio-only SCStream as a bus producer. Its failure slot is mirrored
-/// into the bus's `ProducerFailure`, so a stream that stops with an error is
-/// retired as lost; a deliberate stop (detach, session end) closes the channel
-/// with no failure. Dropping the producer's owner stops the stream within
-/// S3's bounded stop budget, and logs (then leaves to finish) a stream that
-/// does not answer in time.
-#[cfg(target_os = "macos")]
-fn open_screen_capture_kit() -> anyhow::Result<ProducerSource> {
+/// The platform capture as a bus producer: S3's audio-only SCStream on macOS,
+/// S8a's WASAPI process-loopback client on Windows (the same
+/// `SystemAudioCapture` API). Its failure slot is mirrored into the bus's
+/// `ProducerFailure`, so a stream that stops with an error (on Windows,
+/// `AUDCLNT_E_DEVICE_INVALIDATED` included) is retired as lost; a deliberate
+/// stop (detach, session end) closes the channel with no failure. Dropping the
+/// producer's owner stops the stream within the bounded stop budget, and logs
+/// (then leaves to finish) a stream that does not answer in time.
+#[cfg(any(target_os = "macos", windows))]
+fn open_platform_capture() -> anyhow::Result<ProducerSource> {
     use crate::protocol::DeviceStatus;
     use crate::system_audio_capture::{SystemAudioCapture, SystemAudioCaptureOptions};
 
@@ -151,19 +177,19 @@ fn open_screen_capture_kit() -> anyhow::Result<ProducerSource> {
         receiver,
         stats,
         failure,
-        Box::new(ScreenCaptureKitOwner(Some(capture))),
+        Box::new(PlatformCaptureOwner(Some(capture))),
     ))
 }
 
-/// Owns the SCStream for the bus. Dropped on the system pool's owner thread
-/// when the slot detaches, is lost, or the session ends: it stops the stream
-/// within S3's bounded budget and says how it ended. A stream that does not
-/// answer in time is left to finish on its own thread (never a hang).
-#[cfg(target_os = "macos")]
-struct ScreenCaptureKitOwner(Option<crate::system_audio_capture::SystemAudioCapture>);
+/// Owns the platform capture for the bus. Dropped on the system pool's owner
+/// thread when the slot detaches, is lost, or the session ends: it stops the
+/// stream within the bounded budget and says how it ended. A stream that does
+/// not answer in time is left to finish on its own thread (never a hang).
+#[cfg(any(target_os = "macos", windows))]
+struct PlatformCaptureOwner(Option<crate::system_audio_capture::SystemAudioCapture>);
 
-#[cfg(target_os = "macos")]
-impl Drop for ScreenCaptureKitOwner {
+#[cfg(any(target_os = "macos", windows))]
+impl Drop for PlatformCaptureOwner {
     fn drop(&mut self) {
         let Some(capture) = self.0.take() else {
             return;
@@ -648,7 +674,18 @@ mod tests {
 
     #[test]
     fn capability_is_the_platform_and_the_mix_always_names_the_microphone_slot() {
-        assert_eq!(system_audio_capable(), cfg!(target_os = "macos"));
+        // macOS always; Windows where process loopback exists (the device
+        // row's own probe, so the row shows exactly where sessions mix it);
+        // Linux is out of scope.
+        #[cfg(target_os = "macos")]
+        assert!(system_audio_capable());
+        #[cfg(windows)]
+        assert_eq!(
+            system_audio_capable(),
+            crate::devices::windows_system_audio_supported()
+        );
+        #[cfg(not(any(target_os = "macos", windows)))]
+        assert!(!system_audio_capable());
         assert_eq!(platform_opener().is_some(), system_audio_capable());
         assert_eq!(bus_mix_sources(false), vec![AudioTrackSource::Microphone]);
         assert_eq!(

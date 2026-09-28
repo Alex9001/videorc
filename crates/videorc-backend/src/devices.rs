@@ -352,8 +352,8 @@ enum SystemAudioSupport {
     Ready,
     /// macOS: system audio rides the Screen Recording grant, which is missing.
     ScreenRecordingPermissionMissing,
-    /// No system audio capture on this platform yet (Windows arrives in plan
-    /// 069 S8; Linux is out of scope).
+    /// No system audio capture here: Windows before build 20348 (no process
+    /// loopback), or Linux (out of scope).
     UnsupportedPlatform,
 }
 
@@ -362,12 +362,13 @@ enum SystemAudioSupport {
 #[cfg(any(windows, test))]
 const WINDOWS_PROCESS_LOOPBACK_MIN_BUILD: u32 = 20_348;
 
-/// Product gate for Windows system audio (plan 069). The producer exists
-/// (S8a, `system_audio_capture_windows.rs`), but sessions do not route it
-/// into the bus until S8b; until then the row stays Unavailable (hidden), so
-/// the switch never promises audio a session would drop. S8b flips this.
+/// Product gate for Windows system audio (plan 069). S8a added the producer
+/// (`system_audio_capture_windows.rs`) and S8b routes it into the session
+/// audio bus. Setting it false hides the row again and makes Windows sessions
+/// ignore the switch (`system_audio_session::system_audio_capable`), so it is
+/// the one switch to pull if Windows system audio has to be withdrawn.
 #[cfg(any(windows, test))]
-const WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED: bool = false;
+const WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED: bool = true;
 
 /// The Windows probe: Ready when the OS build supports process loopback and
 /// sessions can use it. No grant exists to miss; loopback needs none.
@@ -397,6 +398,21 @@ fn windows_os_build_number() -> Option<u32> {
     status.is_ok().then_some(info.dwBuildNumber)
 }
 
+/// Whether this Windows machine can capture system audio: the device row's
+/// probe, read once (the OS build cannot change while the app runs). Sessions
+/// use the same answer (`system_audio_session::system_audio_capable`), so the
+/// row is shown exactly where a session can mix it.
+#[cfg(windows)]
+pub(crate) fn windows_system_audio_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        windows_system_audio_support(
+            windows_os_build_number(),
+            WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED,
+        ) == SystemAudioSupport::Ready
+    })
+}
+
 fn system_audio_support() -> SystemAudioSupport {
     #[cfg(target_os = "macos")]
     {
@@ -411,10 +427,11 @@ fn system_audio_support() -> SystemAudioSupport {
     }
     #[cfg(windows)]
     {
-        windows_system_audio_support(
-            windows_os_build_number(),
-            WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED,
-        )
+        if windows_system_audio_supported() {
+            SystemAudioSupport::Ready
+        } else {
+            SystemAudioSupport::UnsupportedPlatform
+        }
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -1413,16 +1430,25 @@ mod tests {
                 "build {build:?}"
             );
         }
-        // Until S8b wires sessions, every build reports Unavailable (S8b
-        // flips the gate and this expectation together).
+        // S8b wired sessions: the shipped gate is on, so a Windows 11 build
+        // reports Available and the row appears.
+        const { assert!(WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED) };
         assert_eq!(
             system_audio_device_for(windows_system_audio_support(
                 Some(26_100),
                 WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED
             ))
             .status,
-            DeviceStatus::Unavailable
+            DeviceStatus::Available
         );
+        // Pulling the gate hides the row on every build.
+        for build in [20_348, 26_100] {
+            assert_eq!(
+                windows_system_audio_support(Some(build), false),
+                SystemAudioSupport::UnsupportedPlatform,
+                "build {build}"
+            );
+        }
     }
 
     #[test]
@@ -1438,9 +1464,20 @@ mod tests {
             ),
             "macOS reports the Screen Recording preflight, never a permanent Unavailable: {device:?}"
         );
-        // Windows stays Unavailable until S8b sets
-        // WINDOWS_SYSTEM_AUDIO_SESSIONS_WIRED; Linux is out of scope.
-        #[cfg(not(target_os = "macos"))]
+        // Windows: Available on process-loopback builds (20348+, every
+        // Windows 11), hidden before; loopback has no grant to ask for.
+        #[cfg(windows)]
+        assert_eq!(
+            device.status,
+            match windows_os_build_number() {
+                Some(build) if build >= WINDOWS_PROCESS_LOOPBACK_MIN_BUILD =>
+                    DeviceStatus::Available,
+                _ => DeviceStatus::Unavailable,
+            },
+            "{device:?}"
+        );
+        // Linux is out of scope: the row stays hidden.
+        #[cfg(not(any(target_os = "macos", windows)))]
         assert_eq!(device.status, DeviceStatus::Unavailable);
     }
 

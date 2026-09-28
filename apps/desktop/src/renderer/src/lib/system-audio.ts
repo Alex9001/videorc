@@ -110,7 +110,9 @@ export function systemAudioSwitchView(input: SystemAudioSwitchInput): SystemAudi
 export function systemAudioIssueCopy(issue: SystemAudioIssue): string {
   return issue === 'lost'
     ? 'System audio stopped. The session keeps going.'
-    : 'System audio could not start.'
+    : issue === 'bypassed'
+      ? 'System audio is off for this session because the microphone is on a fallback input.'
+      : 'System audio could not start.'
 }
 
 /**

@@ -45,4 +45,17 @@ describe('Studio inputs System audio row (plan 069)', () => {
     expect(markup).toContain('title="System audio stopped. The session keeps going."')
     expect(markup).toContain('aria-checked="true"')
   })
+
+  it('says a fallback microphone keeps system audio out of this session', () => {
+    const markup = render({
+      requested: true,
+      sessionActive: true,
+      confirmed: false,
+      issue: 'bypassed'
+    })
+    expect(markup).toContain('>Off for this session<')
+    expect(markup).toContain(
+      'title="System audio is off for this session because the microphone is on a fallback input."'
+    )
+  })
 })

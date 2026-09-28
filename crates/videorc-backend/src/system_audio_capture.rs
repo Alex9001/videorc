@@ -681,9 +681,8 @@ pub(crate) fn parent_pid() -> i32 {
 pub(crate) use capture::{SystemAudioCapture, SystemAudioCaptureOptions};
 
 #[cfg(windows)]
-#[allow(unused_imports)] // wired in S8b
 pub(crate) use crate::system_audio_capture_windows::{
-    SystemAudioCapture, SystemAudioCaptureInfo, SystemAudioCaptureOptions,
+    SystemAudioCapture, SystemAudioCaptureOptions,
 };
 
 #[cfg(target_os = "macos")]
