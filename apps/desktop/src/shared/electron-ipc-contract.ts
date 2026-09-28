@@ -36,6 +36,7 @@ import {
   arraySchema,
   booleanSchema,
   enumSchema,
+  literalSchema,
   nullableSchema,
   numberSchema,
   objectSchema,
@@ -45,6 +46,7 @@ import {
   stringSchema,
   tupleSchema,
   undefinedSchema,
+  unionSchema,
   RuntimeSchemaError,
   type RuntimeSchema
 } from './runtime-schema'
@@ -929,10 +931,17 @@ const videorcAccountSnapshotSchema = objectSchema(
   },
   { allowUnknown: false }
 )
+const videorcAccountRefreshResultSchema = unionSchema([
+  objectSchema(
+    { outcome: literalSchema('refreshed'), snapshot: videorcAccountSnapshotSchema },
+    { allowUnknown: false }
+  ),
+  objectSchema({ outcome: literalSchema('deferred') }, { allowUnknown: false })
+])
 const boundedFallbackInvokeContract = invokeContract(boundedIpcArgsSchema)
 const specificRuntimeInvokeContracts = {
   'account:begin-sign-in': invokeContract(tupleSchema([accountAuthorizeUrl])),
-  'account:refresh': invokeContract(noArgs, videorcAccountSnapshotSchema),
+  'account:refresh': invokeContract(noArgs, videorcAccountRefreshResultSchema),
   'account:sign-out': invokeContract(noArgs, videorcAccountSnapshotSchema),
   'account:callback-ack': invokeContract(tupleSchema([boundedIdentifier])),
   'account:callbacks-list': invokeContract(noArgs),

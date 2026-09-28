@@ -37,6 +37,7 @@ import type {
   CommentsSendOperation,
   CompositorStatus,
   DeviceList,
+  Device,
   HealthEvent,
   LayoutSettings,
   LiveChatMessage,
@@ -59,6 +60,7 @@ import type {
   SessionSummary,
   StreamOutputTopologyProbeResult,
   StreamScreen,
+  VideorcAccountRefreshResult,
   VideorcAccountSnapshot,
   VideorcApi
 } from '../../../shared/backend'
@@ -10347,6 +10349,159 @@ describe('real StudioProvider lifecycle', () => {
     expect(observations.at(-1)?.core.lastError).toBeNull()
   })
 
+  async function mountSignedInWithAccountRefresh(
+    refreshAccount: VideorcApi['refreshAccount']
+  ): Promise<{ backend: StudioBackend; latest: () => StudioObservation | undefined }> {
+    const backend = new StudioBackend()
+    backend.accountSnapshot = signedInAccount
+    TestWebSocket.backend = backend
+    vi.stubGlobal('WebSocket', TestWebSocket)
+    const api = createVideorcApi({
+      acknowledge: async () => true,
+      pending: async () => [],
+      acknowledgeProvider: async () => true,
+      pendingProvider: async () => [],
+      refreshAccount
+    })
+    const testDom = installProviderTestEnvironment(api)
+    restoreEnvironment = testDom.restore
+    const observations: StudioObservation[] = []
+    root = await mountStudioProvider(testDom.container, (value) => {
+      observations.push(value)
+    })
+    const latest = (): StudioObservation | undefined => observations.at(-1)
+    await waitForObservation(
+      () =>
+        latest()?.core.wsStatus === 'connected' && latest()?.core.account?.status === 'signed-in'
+    )
+    return { backend, latest }
+  }
+
+  function emitRecordingStatus(backend: StudioBackend, status: RecordingStatus): void {
+    backend.sockets[0]?.onmessage?.({
+      data: JSON.stringify({ event: 'recording.status', payload: status })
+    })
+  }
+
+  const cameraConnectedMidSession: Device = {
+    id: 'camera:connected-mid-session',
+    name: 'Camera connected mid-session',
+    kind: 'camera',
+    status: 'available'
+  }
+
+  it('commits a live Refresh even though Main defers the account refresh (plan 073)', async () => {
+    const refreshAccount = vi.fn(async () => ({ outcome: 'deferred' as const }))
+    const { backend, latest } = await mountSignedInWithAccountRefresh(refreshAccount)
+    await waitForObservation(() => refreshAccount.mock.calls.length >= 1)
+    const accountBefore = latest()?.core.account
+    toastSpies.error.mockClear()
+
+    backend.deviceList = {
+      ...backend.deviceList,
+      devices: [...backend.deviceList.devices, cameraConnectedMidSession]
+    }
+    const callsBefore = refreshAccount.mock.calls.length
+    await act(async () => {
+      await latest()!.core.refreshBackend({ fresh: true })
+    })
+
+    expect(refreshAccount.mock.calls.length).toBeGreaterThan(callsBefore)
+    expect(latest()?.core.deviceList.devices).toContainEqual(cameraConnectedMidSession)
+    expect(latest()?.core.account).toBe(accountBefore)
+    expect(latest()?.core.lastError).toBeNull()
+    expect(toastSpies.error).not.toHaveBeenCalled()
+  })
+
+  it('commits a Refresh when the account refresh fails, then reports the failure', async () => {
+    const refreshAccount = vi.fn<VideorcApi['refreshAccount']>(async () => ({
+      outcome: 'refreshed',
+      snapshot: signedInAccount
+    }))
+    const { backend, latest } = await mountSignedInWithAccountRefresh(refreshAccount)
+    await waitForObservation(() => refreshAccount.mock.calls.length >= 1)
+    refreshAccount.mockRejectedValue(new Error('Account provider is offline.'))
+
+    backend.deviceList = {
+      ...backend.deviceList,
+      devices: [...backend.deviceList.devices, cameraConnectedMidSession]
+    }
+    await act(async () => {
+      await latest()!.core.refreshBackend({ fresh: true })
+    })
+
+    expect(latest()?.core.deviceList.devices).toContainEqual(cameraConnectedMidSession)
+    expect(latest()?.core.account).toEqual(signedInAccount)
+    expect(latest()?.core.lastError).toBe('Account provider is offline.')
+  })
+
+  it('replays one deferred account refresh when the live session goes idle', async () => {
+    let mainCaptureActive = false
+    const refreshedAfterSession: VideorcAccountSnapshot = {
+      ...signedInAccount,
+      displayName: 'Provider Test Upgraded Mid-Stream'
+    }
+    const refreshAccount = vi.fn<VideorcApi['refreshAccount']>(
+      async (): Promise<VideorcAccountRefreshResult> =>
+        mainCaptureActive
+          ? { outcome: 'deferred' }
+          : {
+              outcome: 'refreshed',
+              snapshot:
+                refreshAccount.mock.calls.length === 1 ? signedInAccount : refreshedAfterSession
+            }
+    )
+    const { backend, latest } = await mountSignedInWithAccountRefresh(refreshAccount)
+    await waitForObservation(() => refreshAccount.mock.calls.length >= 1)
+    const startedAt = new Date().toISOString()
+
+    await act(async () => {
+      mainCaptureActive = true
+      emitRecordingStatus(backend, {
+        state: 'recording',
+        sessionId: 'session-073',
+        startedAt,
+        message: 'Recording.'
+      })
+      await Promise.resolve()
+    })
+    await waitForObservation(() => latest()?.recording.recording.state === 'recording')
+    const callsBeforeFocus = refreshAccount.mock.calls.length
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'))
+      await Promise.resolve()
+    })
+    await waitForObservation(() => refreshAccount.mock.calls.length === callsBeforeFocus + 1)
+    expect(latest()?.core.account).toEqual(signedInAccount)
+
+    await act(async () => {
+      mainCaptureActive = false
+      emitRecordingStatus(backend, { state: 'idle', message: 'Ready.' })
+      await Promise.resolve()
+    })
+    await waitForObservation(
+      () => latest()?.core.account?.displayName === refreshedAfterSession.displayName
+    )
+    expect(refreshAccount).toHaveBeenCalledTimes(callsBeforeFocus + 2)
+
+    // A later session with nothing deferred owes no replay.
+    await act(async () => {
+      emitRecordingStatus(backend, {
+        state: 'recording',
+        sessionId: 'session-073-b',
+        startedAt,
+        message: 'Recording.'
+      })
+      await Promise.resolve()
+    })
+    await waitForObservation(() => latest()?.recording.recording.state === 'recording')
+    await act(async () => {
+      emitRecordingStatus(backend, { state: 'idle', message: 'Ready.' })
+      await new Promise((resolve) => setTimeout(resolve, 1_500))
+    })
+    expect(refreshAccount).toHaveBeenCalledTimes(callsBeforeFocus + 2)
+  })
+
   it('does not let Settings overwrite a newer Main-owned account refresh', async () => {
     const backend = new StudioBackend()
     backend.accountSnapshot = signedInAccount
@@ -10361,9 +10516,10 @@ describe('real StudioProvider lifecycle', () => {
     const providerRefresh = new Promise<VideorcAccountSnapshot>((resolve) => {
       resolveProviderRefresh = resolve
     })
-    const refreshAccount = vi.fn(async () =>
-      refreshAccount.mock.calls.length === 1 ? signedInAccount : providerRefresh
-    )
+    const refreshAccount = vi.fn(async () => ({
+      outcome: 'refreshed' as const,
+      snapshot: await (refreshAccount.mock.calls.length === 1 ? signedInAccount : providerRefresh)
+    }))
     const api = createVideorcApi({
       acknowledge: async () => true,
       pending: async () => [],

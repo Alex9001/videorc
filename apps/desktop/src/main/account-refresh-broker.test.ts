@@ -19,15 +19,17 @@ describe('AccountRefreshBroker', () => {
     expect(request).toHaveBeenCalledTimes(1)
 
     resolveRequest('account')
-    await expect(first).resolves.toBe('account')
-    await expect(second).resolves.toBe('account')
+    await expect(first).resolves.toEqual({ outcome: 'refreshed', snapshot: 'account' })
+    await expect(second).resolves.toEqual({ outcome: 'refreshed', snapshot: 'account' })
   })
 
   it('defers maintenance while capture is active without opening an admin request', async () => {
     const request = vi.fn(async () => 'account')
     const broker = new AccountRefreshBroker(() => true, request)
 
-    await expect(broker.refresh()).rejects.toThrow(/deferred/)
+    // Deferral is an answer, not an error: nothing reaches the renderer's
+    // error toast, and no admin request is opened during capture.
+    await expect(broker.refresh()).resolves.toEqual({ outcome: 'deferred' })
     expect(request).not.toHaveBeenCalled()
   })
 
@@ -39,7 +41,7 @@ describe('AccountRefreshBroker', () => {
     const broker = new AccountRefreshBroker(() => false, request)
 
     await expect(broker.refresh()).rejects.toThrow('offline')
-    await expect(broker.refresh()).resolves.toBe('account')
+    await expect(broker.refresh()).resolves.toEqual({ outcome: 'refreshed', snapshot: 'account' })
     expect(request).toHaveBeenCalledTimes(2)
   })
 })
