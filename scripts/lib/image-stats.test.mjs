@@ -7,6 +7,7 @@ import {
   contrastRatio,
   decodePng,
   laplacianVariance,
+  oklchLightness,
   parseHexColor,
   regionMean,
   relativeLuminance
@@ -138,4 +139,11 @@ test('contrast helpers match WCAG reference values', () => {
   assert.ok(Math.abs(contrastRatio(parseHexColor('#767676'), white) - 4.54) < 0.01)
   assert.equal(Math.round(colorDistance(white, black)), 442)
   assert.throws(() => parseHexColor('red'), /RRGGBB/)
+})
+
+test('oklchLightness matches the OKLCH reference values', () => {
+  assert.ok(Math.abs(oklchLightness(parseHexColor('#FFFFFF')) - 1) < 1e-3)
+  assert.equal(oklchLightness(parseHexColor('#000000')), 0)
+  // Mid grey #808080 is oklch(0.5999 0 0).
+  assert.ok(Math.abs(oklchLightness(parseHexColor('#808080')) - 0.5999) < 1e-3)
 })

@@ -184,3 +184,17 @@ export function parseHexColor(hex) {
   const value = Number.parseInt(match[1], 16)
   return { r: (value >> 16) & 0xff, g: (value >> 8) & 0xff, b: value & 0xff }
 }
+
+/**
+ * OKLCH lightness (0–1) of an sRGB colour: the axis the design tokens are
+ * written in, so a measured surface compares directly with `oklch(L …)`.
+ */
+export function oklchLightness({ r, g, b }) {
+  const lr = linearChannel(r)
+  const lg = linearChannel(g)
+  const lb = linearChannel(b)
+  const l = Math.cbrt(0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb)
+  const m = Math.cbrt(0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb)
+  const s = Math.cbrt(0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb)
+  return 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s
+}
