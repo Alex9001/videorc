@@ -583,6 +583,60 @@ impl SystemAudioFailureSlot {
     }
 }
 
+/// A single bad SCK buffer (no valid PTS, an unreadable buffer list, a format
+/// that cannot convert) is counted and dropped, not a terminal loss (PR #477
+/// review). Only a sustained run of bad buffers with no good one between them
+/// fails the capture: this many in a row (about 1 s of 20 ms buffers), or a
+/// run of at least two that has lasted [`BAD_BUFFER_LOSS_AFTER`].
+pub(crate) const BAD_BUFFER_LOSS_COUNT: u32 = 50;
+pub(crate) const BAD_BUFFER_LOSS_AFTER: Duration = Duration::from_secs(1);
+
+/// The current run of consecutive bad buffers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BadBufferRun {
+    consecutive: u32,
+    since: Option<Instant>,
+}
+
+impl BadBufferRun {
+    /// A buffer converted (or was empty): the run is over.
+    pub(crate) fn good(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Counts a bad buffer that arrived at `now`. Returns true once the run
+    /// is sustained enough to be a loss.
+    pub(crate) fn bad(&mut self, now: Instant) -> bool {
+        self.consecutive = self.consecutive.saturating_add(1);
+        let since = *self.since.get_or_insert(now);
+        self.consecutive >= BAD_BUFFER_LOSS_COUNT
+            || (self.consecutive >= 2
+                && now.saturating_duration_since(since) >= BAD_BUFFER_LOSS_AFTER)
+    }
+}
+
+/// What a `startCapture` completion does. The owner waits a bounded time for
+/// it; once that wait gave up (the start was abandoned), a late success must
+/// stop the stream itself, or it would keep capturing with nobody reading it
+/// (Off must mean not captured, decision 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartCompletion {
+    /// The owner is still waiting: hand it the result.
+    Report,
+    /// Abandoned, but the stream started: stop it.
+    StopStream,
+    /// Abandoned and the start failed: nothing is running.
+    Ignore,
+}
+
+pub(crate) fn start_completion(abandoned: bool, started: bool) -> StartCompletion {
+    match (abandoned, started) {
+        (false, _) => StartCompletion::Report,
+        (true, true) => StartCompletion::StopStream,
+        (true, false) => StartCompletion::Ignore,
+    }
+}
+
 /// Snapshot of the producer counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SystemAudioCaptureStats {
@@ -670,6 +724,7 @@ mod capture {
         sender: Mutex<Option<mpsc::SyncSender<AudioFrame>>>,
         stats: Arc<AudioCaptureStats>,
         rejected_buffers: AtomicU64,
+        bad_buffers: Mutex<BadBufferRun>,
         failure: SystemAudioFailureSlot,
         /// Set before a deliberate stop so late callbacks are ignored and a
         /// stop error is not reported as loss.
@@ -739,11 +794,30 @@ mod capture {
                     return;
                 }
                 match audio_frame_from_sample_buffer(sample_buffer, &shared.anchor) {
-                    Ok(Some(frame)) => shared.push(frame),
-                    Ok(None) => {}
+                    Ok(frame) => {
+                        shared
+                            .bad_buffers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .good();
+                        if let Some(frame) = frame {
+                            shared.push(frame);
+                        }
+                    }
                     Err(error) => {
-                        shared.rejected_buffers.fetch_add(1, Ordering::Relaxed);
-                        shared.fail(SystemAudioFailure::UnsupportedFormat(error));
+                        // One bad buffer is dropped and counted; only a
+                        // sustained run is a loss.
+                        let rejected = shared.rejected_buffers.fetch_add(1, Ordering::Relaxed);
+                        let sustained = shared
+                            .bad_buffers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .bad(Instant::now());
+                        if sustained {
+                            shared.fail(SystemAudioFailure::UnsupportedFormat(error));
+                        } else if rejected == 0 {
+                            tracing::warn!(reason = %error, "System audio dropped a bad buffer");
+                        }
                     }
                 }
             }
@@ -901,6 +975,7 @@ mod capture {
                 sender: Mutex::new(Some(sender)),
                 stats: Arc::new(AudioCaptureStats::default()),
                 rejected_buffers: AtomicU64::new(0),
+                bad_buffers: Mutex::new(BadBufferRun::default()),
                 failure: SystemAudioFailureSlot::default(),
                 stopping: AtomicBool::new(false),
                 anchor: host_clock::sample_anchor(timebase),
@@ -1216,19 +1291,50 @@ mod capture {
             .map(|content| content.0)
     }
 
-    fn start_capture(stream: &SCStream) -> Result<(), SystemAudioFailure> {
+    fn start_capture(stream: &Retained<SCStream>) -> Result<(), SystemAudioFailure> {
         let (tx, rx) = mpsc::channel();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let handler_abandoned = Arc::clone(&abandoned);
+        // The handler holds its own reference, so a start that completes
+        // after the owner gave up can still stop the stream it started.
+        let handler_stream = Retained::clone(stream);
         let handler = RcBlock::new(move |error: *mut NSError| {
-            let result = match unsafe { error.as_ref() } {
-                Some(error) => Err(failure_from_ns_error(SystemAudioPhase::Starting, error)),
-                None => Ok(()),
-            };
-            let _ = tx.send(result);
+            let error = unsafe { error.as_ref() };
+            match start_completion(handler_abandoned.load(Ordering::Acquire), error.is_none()) {
+                StartCompletion::Report => {
+                    let _ = tx.send(match error {
+                        Some(error) => {
+                            Err(failure_from_ns_error(SystemAudioPhase::Starting, error))
+                        }
+                        None => Ok(()),
+                    });
+                }
+                StartCompletion::StopStream => {
+                    tracing::warn!(
+                        "System audio startCapture completed after its timeout; stopping it."
+                    );
+                    // Fire and forget: nothing waits on this thread, and the
+                    // delegate already ignores its buffers (`stopping`).
+                    unsafe { handler_stream.stopCaptureWithCompletionHandler(None) };
+                }
+                StartCompletion::Ignore => {}
+            }
         });
         unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
-        rx.recv_timeout(START_CAPTURE_TIMEOUT).map_err(|_| {
-            SystemAudioFailure::StartFailed("ScreenCaptureKit startCapture timed out".into())
-        })?
+        match rx.recv_timeout(START_CAPTURE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => {
+                // Mark it before the caller's stopCapture: a completion that
+                // lands after that stop (which then had nothing to stop)
+                // stops the stream itself.
+                abandoned.store(true, Ordering::Release);
+                // A completion that raced the timeout already reported: the
+                // stream is running, and the caller's stopCapture stops it.
+                Err(SystemAudioFailure::StartFailed(
+                    "ScreenCaptureKit startCapture timed out".into(),
+                ))
+            }
+        }
     }
 
     fn stop_capture(stream: &SCStream) -> Result<(), String> {
@@ -1610,6 +1716,69 @@ mod tests {
             assert_eq!(failure.health_kind(), kind, "{failure:?}");
             assert_eq!(failure.device_status(), status, "{failure:?}");
         }
+    }
+
+    #[test]
+    fn system_audio_a_single_bad_buffer_is_dropped_not_a_loss() {
+        let start = Instant::now();
+        let mut run = BadBufferRun::default();
+        // One bad buffer between good ones, over and over, for a minute.
+        for index in 0..3_000_u64 {
+            let now = start + Duration::from_millis(index * 20);
+            if index % 10 == 0 {
+                assert!(!run.bad(now), "a lone bad buffer at {index} is not a loss");
+            } else {
+                run.good();
+            }
+        }
+        // A lone bad buffer followed by silence (no buffers at all) is not
+        // a loss either, however long the silence lasts.
+        let mut run = BadBufferRun::default();
+        assert!(!run.bad(start));
+        assert_eq!(run.consecutive, 1);
+    }
+
+    #[test]
+    fn system_audio_sustained_bad_buffers_become_a_loss() {
+        let start = Instant::now();
+        let mut run = BadBufferRun::default();
+        let terminal = (0..BAD_BUFFER_LOSS_COUNT)
+            .map(|index| run.bad(start + Duration::from_millis(u64::from(index))))
+            .collect::<Vec<_>>();
+        assert!(terminal[..terminal.len() - 1].iter().all(|lost| !lost));
+        assert!(
+            terminal[terminal.len() - 1],
+            "{BAD_BUFFER_LOSS_COUNT} in a row"
+        );
+        // A slower run: 20 ms buffers, all bad, lose after about 1 s.
+        let mut run = BadBufferRun::default();
+        let lost_at = (0..100_u64)
+            .find(|index| run.bad(start + Duration::from_millis(index * 20)))
+            .expect("a sustained run is a loss");
+        assert_eq!(lost_at, 49, "at 980 ms the count rule fires first");
+        let mut run = BadBufferRun::default();
+        assert!(!run.bad(start));
+        assert!(
+            run.bad(start + BAD_BUFFER_LOSS_AFTER),
+            "a run of two lasting 1 s is sustained"
+        );
+        run.good();
+        assert!(
+            !run.bad(start + Duration::from_secs(5)),
+            "a good buffer resets it"
+        );
+    }
+
+    #[test]
+    fn system_audio_a_start_completing_after_its_timeout_stops_the_stream() {
+        assert_eq!(start_completion(false, true), StartCompletion::Report);
+        assert_eq!(start_completion(false, false), StartCompletion::Report);
+        assert_eq!(
+            start_completion(true, true),
+            StartCompletion::StopStream,
+            "an abandoned start that succeeds must not keep capturing"
+        );
+        assert_eq!(start_completion(true, false), StartCompletion::Ignore);
     }
 
     #[test]

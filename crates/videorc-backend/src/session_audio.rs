@@ -696,6 +696,22 @@ const MICROPHONE_OPEN_BUDGET: Duration = if cfg!(target_os = "windows") {
 } else {
     Duration::from_secs(5)
 };
+/// How long opening a system-audio capture may take (PR #477 review). The
+/// macOS start (`SystemAudioCapture::start`) may take up to its 12 s start
+/// budget, and a start that gives up then spends up to its 3 s stop budget
+/// closing what it opened, all inside `open`. The owner must be given both,
+/// or a slow first start reads as unavailable while its capture still holds
+/// the one system pool slot, and the retry then fails as `ProducerPoolBusy`.
+const SYSTEM_AUDIO_OPEN_BUDGET: Duration = Duration::from_secs(15);
+
+impl SourceRole {
+    const fn open_budget(self) -> Duration {
+        match self {
+            Self::Microphone => MICROPHONE_OPEN_BUDGET,
+            Self::System => SYSTEM_AUDIO_OPEN_BUDGET,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct PreparationCleanupPending(String);
@@ -801,13 +817,13 @@ async fn prepare_producer_in(
         drop(owner);
     }))?;
     let result: anyhow::Result<ManagedProducer> = async {
-        tokio::time::timeout(MICROPHONE_OPEN_BUDGET, opened_rx)
+        tokio::time::timeout(role.open_budget(), opened_rx)
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
                     "{} opening exceeded {}s; its owner is still responsible for cleanup.",
                     role.label(),
-                    MICROPHONE_OPEN_BUDGET.as_secs()
+                    role.open_budget().as_secs()
                 )
             })???;
         let producer = tokio::time::timeout(Duration::from_secs(2), ready_rx)
@@ -955,6 +971,30 @@ pub struct AudioSwitchHandle {
     shared: Arc<std::sync::Mutex<AudioShared>>,
     producer_count: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    /// When `request_stop` was first called; the bus drains up to it.
+    stop_requested_at: Arc<OnceLock<Instant>>,
+    /// How long a microphone handoff may take from admission to commit on
+    /// this bus ([`handoff_budget`]).
+    handoff_budget: Duration,
+}
+
+/// A microphone hot-swap's budget from admission to commit with no bus delay.
+const HANDOFF_BASE_BUDGET: Duration = Duration::from_secs(1);
+
+/// How long a microphone handoff may take from admission to commit (PR #477
+/// review). A positive microphone offset is a bus delay D (plan 069 decision
+/// 8): the candidate's first sample lands D after it was captured, and the
+/// cursor reaches it one playout delay after that. So a candidate can cover
+/// the cutover only after admission + D + playout. Every deadline on the
+/// handoff (the bus's own and the caller's receipt wait) extends by both, or
+/// an offset near +850 ms would cancel every hot-swap.
+fn handoff_budget(microphone_delay_frames: u64, playout_delay: Duration) -> Duration {
+    HANDOFF_BASE_BUDGET
+        + Duration::from_nanos(
+            microphone_delay_frames.saturating_mul(1_000_000_000)
+                / u64::from(NATIVE_AUDIO_SAMPLE_RATE),
+        )
+        + playout_delay
 }
 
 enum HandoffPurpose {
@@ -1247,6 +1287,8 @@ impl SessionAudio {
             .pop_front()
     }
     pub fn request_stop(&self) {
+        // The instant first, so a bus that sees the flag drains to it.
+        let _ = self.handle.stop_requested_at.set(Instant::now());
         self.handle.stop.store(true, Ordering::Release);
         let stats = self.stats();
         stats.mark_stopped();
@@ -1334,7 +1376,7 @@ impl AudioSwitchHandle {
                 HandoffPurpose::Release { closed: closed_tx },
             )
             .await?;
-            let receipts = tokio::time::timeout(Duration::from_secs(1), closed_rx)
+            let receipts = tokio::time::timeout(self.handoff_budget, closed_rx)
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!("Previous microphone release was not acknowledged.")
@@ -1460,7 +1502,7 @@ impl AudioSwitchHandle {
                     "The session audio writer is unavailable or already changing sources."
                 )
             })?;
-        let result = tokio::time::timeout(Duration::from_secs(1), receipt).await;
+        let result = tokio::time::timeout(self.handoff_budget, receipt).await;
         if !release
             && let Some(receipt) = self.status().last_commit
             && receipt.session_id == request.session_id
@@ -1587,11 +1629,14 @@ pub fn attach_prepared_with(
     let producer_count = source
         .as_ref()
         .map_or_else(|| Arc::new(AtomicU64::new(0)), InitialAudioSource::count);
+    let stop_requested_at = Arc::new(OnceLock::new());
     let handle = AudioSwitchHandle {
         commands,
         shared: shared.clone(),
         producer_count: producer_count.clone(),
         stop: stop.clone(),
+        stop_requested_at: stop_requested_at.clone(),
+        handoff_budget: handoff_budget(options.microphone_delay_frames, options.playout_delay),
     };
     let system_settings = AudioProcessingSettingsHandle::new(AudioProcessingSettings {
         gain_db: crate::protocol::clamp_system_audio_gain_db(options.system_gain_db),
@@ -1639,6 +1684,7 @@ pub fn attach_prepared_with(
                         settings: &writer_settings,
                         system_settings: &system_settings,
                         stop: &stop,
+                        stop_requested_at: &stop_requested_at,
                         source_stall_timeout,
                         timing,
                         shared: &shared,
@@ -1682,14 +1728,41 @@ pub fn attach_prepared_with(
 }
 
 fn valid_fresh_frame(frame: &AudioFrame, now: Instant) -> bool {
+    valid_frame_shape(frame)
+        && frame.captured_at <= now
+        && now.duration_since(frame.captured_at) <= MAX_FRAME_AGE
+}
+
+fn valid_frame_shape(frame: &AudioFrame) -> bool {
     frame.sample_rate == NATIVE_AUDIO_SAMPLE_RATE
         && frame.channels == NATIVE_AUDIO_CHANNELS
         && !frame.samples.is_empty()
         && frame.samples.len().is_multiple_of(2)
         && frame.samples.iter().all(|sample| sample.is_finite())
-        && frame.captured_at <= now
-        && now.duration_since(frame.captured_at) <= MAX_FRAME_AGE
 }
+
+/// System-audio freshness is judged by arrival, not by the PTS-derived
+/// `captured_at` (PR #477 review). The PTS comes from the output device's
+/// clock; a clock that runs fast puts `captured_at` in the future, which the
+/// microphone rule reads as stale, and every buffer would then be dropped in
+/// silence. A buffer that just arrived is fresh; its PTS still places it. Only
+/// a PTS further than [`MAX_FRAME_AGE`] from its arrival, either way, cannot
+/// be placed and is stale.
+fn valid_system_frame(frame: &AudioFrame, arrived_at: Instant) -> bool {
+    let skew = if frame.captured_at >= arrived_at {
+        frame.captured_at.duration_since(arrived_at)
+    } else {
+        arrived_at.duration_since(frame.captured_at)
+    };
+    valid_frame_shape(frame) && skew <= MAX_FRAME_AGE
+}
+
+/// A system source whose buffers keep arriving but none of which can be
+/// placed in the mix (stale by arrival, before the epoch, behind the cursor,
+/// beyond the ahead cap, duplicate timestamps) for this long is lost, not
+/// silent: it fills the loss path (`system-audio-lost`) instead of dropping
+/// out unseen. A startup burst trims for well under a second.
+const SYSTEM_UNPLAYABLE_LOSS_AFTER: Duration = Duration::from_secs(2);
 
 /// Drains every pending producer frame into the timeline. Returns `true` when
 /// the producer channel is disconnected. Called from the pacing loop and from
@@ -1966,7 +2039,7 @@ impl PendingHandoff {
         let mut pcm = AudioTimeline::new();
         pcm.cursor = cutover;
         pcm.select_generation(generation);
-        let deadline = command.admitted_at + Duration::from_secs(1);
+        let deadline = command.admitted_at + HANDOFF_BASE_BUDGET;
         Self {
             command,
             generation,
@@ -1981,10 +2054,13 @@ impl PendingHandoff {
     }
 
     /// The candidate microphone lands on the same bus delay as the one it
-    /// replaces (plan 069 decision 8).
-    fn with_delay(mut self, delay_frames: u64) -> Self {
+    /// replaces (plan 069 decision 8), so it can cover the cutover only D
+    /// plus one playout delay after admission: the deadline extends by both
+    /// ([`handoff_budget`]).
+    fn with_delay(mut self, delay_frames: u64, playout_delay: Duration) -> Self {
         self.delay_frames = delay_frames;
         self.pcm.ahead_limit = MAX_BUFFERED_FRAMES.saturating_add(delay_frames);
+        self.deadline = self.command.admitted_at + handoff_budget(delay_frames, playout_delay);
         self
     }
 
@@ -2508,6 +2584,12 @@ struct SourceSlot {
     ramp: EnableRamp,
     accounted: AudioBusCounters,
     exit: Option<SlotExit>,
+    /// Arrival of the first buffer in the current run of buffers that
+    /// placed no sample; `None` once one did.
+    unplayable_since: Option<Instant>,
+    /// That run lasted [`SYSTEM_UNPLAYABLE_LOSS_AFTER`]: a sticky loss, like
+    /// a failure or EOF.
+    unplayable_lost: bool,
 }
 impl SourceSlot {
     fn new(
@@ -2541,42 +2623,36 @@ impl SourceSlot {
             ramp: EnableRamp::default(),
             accounted: AudioBusCounters::default(),
             exit: None,
+            unplayable_since: None,
+            unplayable_lost: false,
         }
     }
 
     /// Drains every pending frame into the slot timeline: stale and pre-epoch
     /// frames are discarded, and a first burst whose early frames already lie
     /// behind the cursor is trimmed as overlap, never queued late. Returns the
-    /// loss reason once the platform reported a failure or the stream ended.
-    /// Silence, including no buffers at all, is never loss (decision 11).
+    /// loss reason once the platform reported a failure, the stream ended, or
+    /// buffers kept arriving that could not be placed for
+    /// [`SYSTEM_UNPLAYABLE_LOSS_AFTER`]. Silence, including no buffers at all,
+    /// is never loss (decision 11).
     fn ingest(&mut self, epoch: Instant) -> Option<String> {
+        self.ingest_at(epoch, Instant::now())
+    }
+
+    /// [`Self::ingest`] with every drained buffer arriving at `now`.
+    fn ingest_at(&mut self, epoch: Instant, now: Instant) -> Option<String> {
         let mut disconnected = false;
         loop {
             match self.receiver.try_recv() {
                 Ok(frame) => {
-                    if !valid_fresh_frame(&frame, Instant::now()) {
-                        let frames = frame.frame_count() as u64;
-                        self.timeline.counters.discarded_frames += frames;
-                        self.timeline.losses.discarded_stale += frames;
-                        continue;
+                    let placed = self.place(frame, epoch, now);
+                    if placed {
+                        self.unplayable_since = None;
+                    } else {
+                        let since = *self.unplayable_since.get_or_insert(now);
+                        self.unplayable_lost |=
+                            now.saturating_duration_since(since) >= SYSTEM_UNPLAYABLE_LOSS_AFTER;
                     }
-                    let trimmed = crate::audio::trim_audio_frame_before_epoch(frame, epoch);
-                    self.timeline.counters.discarded_frames += trimmed.discarded_frames;
-                    self.timeline.losses.discarded_before_epoch += trimmed.discarded_frames;
-                    let Some(frame) = trimmed.frame else {
-                        continue;
-                    };
-                    let delay_frames = self.delay_frames;
-                    let clock = self.clock.get_or_insert_with(|| {
-                        SourceClock::new(&frame, epoch).with_delay(delay_frames)
-                    });
-                    let Some((start, frames)) = clock.interval(&frame) else {
-                        let frames = frame.frame_count() as u64;
-                        self.timeline.counters.discarded_frames += frames;
-                        self.timeline.losses.discarded_duplicate += frames;
-                        continue;
-                    };
-                    self.timeline.push(0, start, resample_frame(frame, frames));
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -2589,9 +2665,50 @@ impl SourceSlot {
             .failure
             .as_ref()
             .and_then(|failure| failure.lock().unwrap_or_else(|p| p.into_inner()).clone());
-        failure.or_else(|| {
-            disconnected.then(|| format!("{} stopped delivering audio.", self.role.label()))
-        })
+        failure
+            .or_else(|| {
+                disconnected.then(|| format!("{} stopped delivering audio.", self.role.label()))
+            })
+            .or_else(|| {
+                self.unplayable_lost.then(|| {
+                    format!(
+                        "{} timestamps drifted out of range; no buffer could be placed for {}s.",
+                        self.role.label(),
+                        SYSTEM_UNPLAYABLE_LOSS_AFTER.as_secs()
+                    )
+                })
+            })
+    }
+
+    /// Places one buffer; `false` when none of its samples reached the mix.
+    fn place(&mut self, frame: AudioFrame, epoch: Instant, now: Instant) -> bool {
+        let fresh = match self.role {
+            SourceRole::System => valid_system_frame(&frame, now),
+            SourceRole::Microphone => valid_fresh_frame(&frame, now),
+        };
+        if !fresh {
+            let frames = frame.frame_count() as u64;
+            self.timeline.counters.discarded_frames += frames;
+            self.timeline.losses.discarded_stale += frames;
+            return false;
+        }
+        let trimmed = crate::audio::trim_audio_frame_before_epoch(frame, epoch);
+        self.timeline.counters.discarded_frames += trimmed.discarded_frames;
+        self.timeline.losses.discarded_before_epoch += trimmed.discarded_frames;
+        let Some(frame) = trimmed.frame else {
+            return false;
+        };
+        let delay_frames = self.delay_frames;
+        let clock = self
+            .clock
+            .get_or_insert_with(|| SourceClock::new(&frame, epoch).with_delay(delay_frames));
+        let Some((start, frames)) = clock.interval(&frame) else {
+            let frames = frame.frame_count() as u64;
+            self.timeline.counters.discarded_frames += frames;
+            self.timeline.losses.discarded_duplicate += frames;
+            return false;
+        };
+        self.timeline.push(0, start, resample_frame(frame, frames))
     }
 
     fn account_producer_drops(&mut self) {
@@ -2686,11 +2803,15 @@ fn accept_system_commands(
     }
 }
 
+/// Retires a system slot. Its close ticket goes to `system_retired`, never
+/// the microphone's list: a microphone release waits on every microphone
+/// ticket, and must never wait on (or fail because of) a closing system
+/// capture (PR #477 review; decision 11).
 fn retire_system_slot(
     slot: SourceSlot,
     shared: &std::sync::Mutex<AudioShared>,
     system_stats: &AudioCaptureStats,
-    retired: &mut Vec<CompletionTicket>,
+    system_retired: &mut Vec<CompletionTicket>,
     diagnostics: &BusDiagnostics,
 ) {
     let SourceSlot {
@@ -2701,7 +2822,7 @@ fn retire_system_slot(
     } = slot;
     log_bus_summary(&timeline, diagnostics, "system source retired");
     let device_name = producer.device_name.clone();
-    retired.push(producer.retire());
+    system_retired.push(producer.retire());
     system_stats.record_live_peak(0.0);
     {
         let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
@@ -2729,6 +2850,52 @@ fn retire_system_slot(
     }
 }
 
+/// A stopping bus keeps writing until its cursor reaches the stop instant
+/// (PR #477 review). The cursor trails the wall clock by the playout delay,
+/// so exiting on the stop flag would drop the last 50 ms (150 ms with system
+/// audio) of captured audio and FFmpeg would pad that tail with silence.
+/// Chunks still owed are flushed once their audio has had
+/// [`STOP_DRAIN_ARRIVAL`] to arrive, not at their paced time, and the whole
+/// drain is bounded by [`STOP_DRAIN_MARGIN`] past the playout delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StopDrain {
+    /// The bus sample at the stop instant.
+    target: u64,
+    /// Owed chunks render from here on without pacing.
+    flush_at: Instant,
+    /// Past this the drain gives up and the bus exits at once.
+    deadline: Instant,
+}
+/// Covers a microphone callback (about 11 ms) and a system buffer's 22 to
+/// 52 ms delivery lag (S0).
+const STOP_DRAIN_ARRIVAL: Duration = Duration::from_millis(60);
+const STOP_DRAIN_MARGIN: Duration = Duration::from_millis(100);
+impl StopDrain {
+    fn new(stop_at: Instant, epoch: Instant, playout_delay: Duration) -> Self {
+        let target = (stop_at.saturating_duration_since(epoch).as_nanos()
+            * u128::from(NATIVE_AUDIO_SAMPLE_RATE))
+        .div_ceil(1_000_000_000) as u64;
+        Self {
+            target,
+            flush_at: stop_at + STOP_DRAIN_ARRIVAL.min(playout_delay),
+            deadline: stop_at + playout_delay + STOP_DRAIN_MARGIN,
+        }
+    }
+    fn at(stop_requested_at: &OnceLock<Instant>, epoch: Instant, playout_delay: Duration) -> Self {
+        Self::new(
+            stop_requested_at
+                .get()
+                .copied()
+                .unwrap_or_else(Instant::now),
+            epoch,
+            playout_delay,
+        )
+    }
+    fn done(&self, cursor: u64, now: Instant) -> bool {
+        cursor >= self.target || now >= self.deadline
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct BusTiming {
     playout_delay: Duration,
@@ -2740,6 +2907,7 @@ struct BusContext<'a> {
     settings: &'a AudioProcessingSettingsHandle,
     system_settings: &'a AudioProcessingSettingsHandle,
     stop: &'a AtomicBool,
+    stop_requested_at: &'a OnceLock<Instant>,
     source_stall_timeout: Duration,
     timing: BusTiming,
     shared: &'a std::sync::Mutex<AudioShared>,
@@ -2754,6 +2922,7 @@ fn run_bus(
     context: BusContext<'_>,
 ) -> io::Result<()> {
     let mut retired = Vec::new();
+    let mut system_retired = Vec::new();
     let shared = context.shared;
     let result = run_bus_owned(
         &mut producer,
@@ -2763,6 +2932,7 @@ fn run_bus(
         &system_commands,
         context,
         &mut retired,
+        &mut system_retired,
     );
     // Early exits (stop before the epoch, a failed transport) drop an
     // attached slot, which closes its capture; never report it attached.
@@ -2792,9 +2962,18 @@ fn run_bus(
             tracing::warn!("Microphone owner terminated unexpectedly during close.");
         }
     }
+    for completion in system_retired {
+        if matches!(
+            completion.closed.try_recv(),
+            Ok(ProducerCompletion::Panicked)
+        ) {
+            tracing::warn!("System audio owner terminated unexpectedly during close.");
+        }
+    }
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bus_owned(
     producer: &mut Option<ManagedProducer>,
     path: &std::path::Path,
@@ -2803,11 +2982,13 @@ fn run_bus_owned(
     system_commands: &mpsc::Receiver<SystemCommand>,
     context: BusContext<'_>,
     retired: &mut Vec<CompletionTicket>,
+    system_retired: &mut Vec<CompletionTicket>,
 ) -> io::Result<()> {
     let BusContext {
         settings,
         system_settings,
         stop,
+        stop_requested_at,
         source_stall_timeout,
         timing,
         shared,
@@ -2894,7 +3075,17 @@ fn run_bus_owned(
     let mut previous_producer_drops = producer_stats
         .as_ref()
         .map_or(0, |stats| stats.dropped_frames());
-    while !stop.load(Ordering::Acquire) {
+    // Writes stop on this, not on `stop`: a stopping bus drains first.
+    let write_stop = AtomicBool::new(false);
+    let mut drain: Option<StopDrain> = None;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            let drain =
+                drain.get_or_insert_with(|| StopDrain::at(stop_requested_at, epoch, playout_delay));
+            if drain.done(timeline.cursor(), Instant::now()) {
+                break;
+            }
+        }
         accept_system_commands(
             system_commands,
             &mut system,
@@ -2914,7 +3105,7 @@ fn run_bus_owned(
                     epoch,
                     Instant::now(),
                 )
-                .with_delay(timing.microphone_delay_frames),
+                .with_delay(timing.microphone_delay_frames, playout_delay),
             );
         }
         if let Some(pending) = pending.as_mut() {
@@ -3002,6 +3193,7 @@ fn run_bus_owned(
                 (timeline.cursor() + CHUNK_FRAMES as u64) * 1_000_000_000
                     / u64::from(NATIVE_AUDIO_SAMPLE_RATE),
             );
+        let next = drain.map_or(next, |drain| next.min(drain.flush_at));
         if let Some(remaining) = next.checked_duration_since(Instant::now()) {
             thread::sleep(remaining.min(Duration::from_millis(2)));
             continue;
@@ -3202,6 +3394,12 @@ fn run_bus_owned(
         let mixing = system_raw.is_some() || !limiter.idle();
         let write_started = Instant::now();
         let mut wait = || {
+            // A stop that arrives mid-write drains too, until its deadline.
+            if stop.load(Ordering::Acquire)
+                && StopDrain::at(stop_requested_at, epoch, playout_delay).done(0, Instant::now())
+            {
+                write_stop.store(true, Ordering::Release);
+            }
             // The FIFO reader is behind. Keep ingesting so a bursty reader
             // never pushes the microphone into the timeline's drop path.
             if let Some(receiver) = receiver.as_ref() {
@@ -3239,7 +3437,7 @@ fn run_bus_owned(
                 system_samples,
                 system_settings,
                 limiter,
-                stop,
+                &write_stop,
                 Instant::now,
                 &mut wait,
             )
@@ -3249,7 +3447,7 @@ fn run_bus_owned(
                 &mut file,
                 &raw.samples,
                 settings,
-                stop,
+                &write_stop,
                 Instant::now,
                 &mut wait,
             )
@@ -3383,12 +3581,13 @@ fn run_bus_owned(
         }
         if system.as_ref().is_some_and(|slot| slot.ramp.closed()) {
             let slot = system.take().expect("closed system slot");
-            retire_system_slot(slot, shared, &system_stats, retired, &diagnostics);
+            retire_system_slot(slot, shared, &system_stats, system_retired, &diagnostics);
         }
         retired.retain(CompletionTicket::running);
+        system_retired.retain(CompletionTicket::running);
     }
     if let Some(slot) = system.take() {
-        retire_system_slot(slot, shared, &system_stats, retired, &diagnostics);
+        retire_system_slot(slot, shared, &system_stats, system_retired, &diagnostics);
     }
     log_bus_summary(&timeline, &diagnostics, "stopped");
 
@@ -5864,6 +6063,462 @@ mod mix_tests {
         let position = cutover + 4_800;
         assert!((samples[position * 2] - 0.5).abs() < 1.0e-6);
         assert!((samples[position * 2 + 1] - -0.1).abs() < 1.0e-6);
+    }
+
+    // ---- PR #477 review --------------------------------------------------
+
+    fn microphone_switch(
+        id: &str,
+        target: &str,
+    ) -> (
+        crate::live_source_switch::SourceSwitchParams,
+        Arc<std::sync::Mutex<crate::live_source_switch::SourceSwitchCoordinator>>,
+        Arc<AtomicBool>,
+    ) {
+        let mut initial = crate::live_source_switch::SourceSwitchCoordinator::default();
+        initial.start(
+            "test-session".into(),
+            crate::protocol::SourceSelection {
+                screen_id: None,
+                window_id: None,
+                camera_id: None,
+                microphone_id: None,
+                test_pattern: false,
+            },
+        );
+        initial.enable_microphone();
+        let request = crate::live_source_switch::SourceSwitchParams {
+            session_id: "test-session".into(),
+            request_id: id.into(),
+            expected_source_revision: initial.snapshot("test-session").unwrap().source_revision,
+            kind: crate::live_source_switch::SourceKind::Microphone,
+            device_id: Some(target.into()),
+            protected_overlay_window_ids: vec![],
+        };
+        initial.admit(&request).unwrap();
+        let cancelled = initial.cancellation(&request).unwrap();
+        (request, Arc::new(std::sync::Mutex::new(initial)), cancelled)
+    }
+
+    /// A microphone that starts capturing when it opens: a constant level in
+    /// 480-frame packets, released in real time.
+    async fn open_live_microphone(
+        id: String,
+        count: Arc<AtomicU64>,
+        level: f32,
+    ) -> anyhow::Result<ManagedProducer> {
+        prepare_producer_with(
+            move || {
+                let origin = Instant::now();
+                Ok(timed_source(
+                    &id,
+                    signal_packets(origin, 0, 480_000, 480, move |_| (level, level)),
+                    None,
+                ))
+            },
+            Arc::new(AtomicBool::new(false)),
+            count,
+            spawn_owner,
+            |_| {},
+            true,
+        )
+        .await
+    }
+
+    /// Finding 1: a positive microphone offset is a bus delay D, so a hot-swap
+    /// candidate covers the cutover only after admission + D + playout. At
+    /// +1000 ms (48 000 frames) every swap used to cancel at the 1 s deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_microphone_hot_swap_commits_behind_a_one_second_microphone_bus_delay() {
+        for delay in [0_u64, 48_000] {
+            let epoch = Instant::now();
+            let bus = start_bus(
+                epoch,
+                None,
+                AudioProcessingSettings::default(),
+                SessionAudioOptions {
+                    playout_delay: SYSTEM_AUDIO_PLAYOUT_DELAY,
+                    microphone_delay_frames: delay,
+                    ..SessionAudioOptions::default()
+                },
+            )
+            .await;
+            bus.wait_for_frames(4_800).await;
+            let (request, coordinator, cancelled) =
+                microphone_switch(&format!("swap-{delay}"), "microphone:coreaudio:7");
+            let count = bus.session.handle.producer_count.clone();
+            let admitted = Instant::now();
+            let receipt = bus
+                .session
+                .switch_handle()
+                .replace_with(request, coordinator, cancelled, move |id| {
+                    open_live_microphone(id, count.clone(), 0.2)
+                })
+                .await
+                .unwrap_or_else(|error| panic!("delay {delay}: the hot-swap failed: {error}"));
+            let took = admitted.elapsed();
+            let cutover = receipt.cutover_sample as usize;
+            bus.wait_for_frames(cutover + 9_600).await;
+            let (bytes, _) = bus.finish();
+            let samples = decode(&bytes);
+            assert!(
+                samples[..cutover * 2].iter().all(|sample| *sample == 0.0),
+                "delay {delay}: nothing before the cutover"
+            );
+            assert!(
+                samples[(cutover + RAMP_FRAMES as usize) * 2..(cutover + 9_600) * 2]
+                    .iter()
+                    .all(|sample| (*sample - 0.2).abs() < 1.0e-6),
+                "delay {delay}: the new microphone plays from the cutover"
+            );
+            if delay == 0 {
+                assert!(
+                    took < Duration::from_secs(1),
+                    "delay 0 swaps as before: {took:?}"
+                );
+            }
+        }
+    }
+
+    /// Finding 3: a system-audio start may take its 12 s start budget plus a
+    /// 3 s stop, far past the microphone's 5 s open budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_system_audio_start_gets_its_own_open_budget() {
+        #[cfg(target_os = "macos")]
+        assert!(
+            SourceRole::System.open_budget()
+                >= crate::system_audio_capture::SYSTEM_AUDIO_START_BUDGET
+                    + crate::system_audio_capture::SYSTEM_AUDIO_STOP_BUDGET
+        );
+        assert_eq!(SourceRole::Microphone.open_budget(), MICROPHONE_OPEN_BUDGET);
+        let count = Arc::new(AtomicU64::new(0));
+        let producer = prepare_system_audio_in(
+            || {
+                // A slow first startCapture: past the microphone budget.
+                thread::sleep(MICROPHONE_OPEN_BUDGET + Duration::from_millis(500));
+                let (frames, receiver) = mpsc::channel::<AudioFrame>();
+                Ok(ProducerSource::system(
+                    "system-audio:default".into(),
+                    "System audio".into(),
+                    receiver,
+                    Arc::new(AudioCaptureStats::default()),
+                    quiet_failure(),
+                    Box::new(frames),
+                ))
+            },
+            Arc::new(AtomicBool::new(false)),
+            count.clone(),
+        )
+        .await
+        .expect("a slow system audio start is not unavailable");
+        assert_eq!(count.load(Ordering::Acquire), 1);
+        drop(producer);
+        wait_until(
+            || count.load(Ordering::Acquire) == 0,
+            "system capture close",
+        )
+        .await;
+    }
+
+    /// Finding 4: the bus cursor trails the wall clock by the playout delay;
+    /// a stop must still write the captured audio up to the stop instant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_writes_real_microphone_audio_up_to_the_stop_instant() {
+        for playout_delay in [PLAYOUT_DELAY, SYSTEM_AUDIO_PLAYOUT_DELAY] {
+            let epoch = Instant::now() + Duration::from_millis(100);
+            let microphone = signal_packets(epoch, 0, 480_000, 512, |_| (0.2, 0.2));
+            let bus = start_bus(
+                epoch,
+                Some(microphone),
+                AudioProcessingSettings::default(),
+                SessionAudioOptions {
+                    playout_delay,
+                    ..SessionAudioOptions::default()
+                },
+            )
+            .await;
+            bus.wait_for_frames(24_000).await;
+            let stopped = Instant::now();
+            let (bytes, status) = bus.finish();
+            let drained = stopped.elapsed();
+            let samples = decode(&bytes);
+            let stop_sample =
+                (stopped.duration_since(epoch).as_nanos() * 48_000 / 1_000_000_000) as usize;
+            let written = samples.len() / 2;
+            assert!(
+                written >= stop_sample,
+                "{playout_delay:?}: the bus wrote {written} frames, the stop was at {stop_sample}"
+            );
+            let tail = (stop_sample - 24_000)..stop_sample;
+            assert!(
+                samples[tail.start * 2..tail.end * 2]
+                    .iter()
+                    .all(|sample| (*sample - 0.2).abs() < 1.0e-6),
+                "{playout_delay:?}: real microphone samples up to the stop ({:?})",
+                status.counters
+            );
+            assert!(
+                drained < playout_delay + STOP_DRAIN_MARGIN + Duration::from_millis(250),
+                "{playout_delay:?}: the drain is bounded ({drained:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stop_drain_targets_the_stop_instant_and_is_bounded() {
+        let epoch = Instant::now();
+        let stop_at = epoch + Duration::from_millis(1_000);
+        let drain = StopDrain::new(stop_at, epoch, SYSTEM_AUDIO_PLAYOUT_DELAY);
+        assert_eq!(drain.target, 48_000);
+        assert_eq!(drain.flush_at, stop_at + STOP_DRAIN_ARRIVAL);
+        assert_eq!(
+            drain.deadline,
+            stop_at + SYSTEM_AUDIO_PLAYOUT_DELAY + STOP_DRAIN_MARGIN
+        );
+        assert!(!drain.done(47_520, stop_at));
+        assert!(drain.done(48_000, stop_at));
+        assert!(drain.done(0, drain.deadline), "never past the deadline");
+        let short = StopDrain::new(stop_at, epoch, PLAYOUT_DELAY);
+        assert_eq!(
+            short.flush_at,
+            stop_at + PLAYOUT_DELAY,
+            "never later than paced"
+        );
+        assert_eq!(StopDrain::new(epoch, stop_at, PLAYOUT_DELAY).target, 0);
+    }
+
+    /// Finding 5: the output device's clock can run PTS ahead of the host
+    /// clock. Those buffers just arrived; they are fresh, and PTS places them.
+    #[test]
+    fn a_system_clock_running_ahead_of_arrival_is_still_mixed() {
+        let epoch = Instant::now() - Duration::from_secs(5);
+        let (mut slot, sender, _failure) = test_slot(0);
+        slot.timeline.cursor = 48_000;
+        // Ten 20 ms buffers stamped 40 to 220 ms after they arrive.
+        for packet in signal_packets(epoch, 48_000, 9_600, 960, system_signal) {
+            sender.send(packet).unwrap();
+        }
+        let arrived = epoch + Duration::from_millis(980);
+        assert_eq!(slot.ingest_at(epoch, arrived), None);
+        assert_eq!(slot.timeline.losses().discarded_stale, 0);
+        slot.ramp.joined = true;
+        slot.ramp.level = RAMP_FRAMES;
+        let chunk = slot.render();
+        assert!(chunk.captured.iter().all(|captured| *captured));
+        let (left, right) = system_signal(48_000);
+        assert_eq!(chunk.samples[..2], [left, right]);
+    }
+
+    #[test]
+    fn system_buffers_that_cannot_be_placed_for_two_seconds_are_a_loss() {
+        let epoch = Instant::now() - Duration::from_secs(20);
+        let (mut slot, sender, _failure) = test_slot(0);
+        let base = epoch + Duration::from_secs(1);
+        let mut timestamp = 7_000_000_000_u64;
+        // A buffer stamped `ahead` past its arrival.
+        let mut feed = |slot: &mut SourceSlot, arrival: Instant, ahead: Duration| {
+            let mut packet = signal_packets(epoch, 0, 960, 960, system_signal).remove(0);
+            packet.timestamp_micros = timestamp;
+            timestamp += 20_000;
+            packet.captured_at = arrival + ahead;
+            sender.send(packet).unwrap();
+            slot.ingest_at(epoch, arrival)
+        };
+        let far = Duration::from_secs(5);
+        // 1.5 s of buffers stamped 5 s ahead: unplaceable, not yet a loss.
+        for index in 0..75_u64 {
+            let arrival = base + Duration::from_millis(index * 20);
+            assert_eq!(feed(&mut slot, arrival, far), None, "buffer {index}");
+        }
+        // One buffer that places resets the run.
+        let good = base + Duration::from_millis(1_500);
+        slot.timeline.cursor =
+            (good.duration_since(epoch).as_nanos() * 48_000 / 1_000_000_000) as u64 - 4_800;
+        assert_eq!(feed(&mut slot, good, Duration::ZERO), None);
+        assert!(slot.timeline.counters.discarded_frames > 0);
+        let restart = good + Duration::from_millis(20);
+        for index in 0..100_u64 {
+            let arrival = restart + Duration::from_millis(index * 20);
+            assert_eq!(feed(&mut slot, arrival, far), None, "run 2, buffer {index}");
+        }
+        let reason = feed(&mut slot, restart + Duration::from_secs(2), far)
+            .expect("2 s of unplaceable buffers is a loss");
+        assert!(reason.contains("drifted out of range"), "{reason}");
+        assert!(
+            slot.ingest_at(epoch, restart + Duration::from_secs(3))
+                .is_some(),
+            "sticky"
+        );
+    }
+
+    /// Finding 6: a closing system capture never holds up (or fails) the
+    /// release a microphone retry waits on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_closing_system_capture_never_holds_up_a_microphone_release() {
+        struct HeldOwner {
+            closing: Option<tokio::sync::oneshot::Sender<()>>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Drop for HeldOwner {
+            fn drop(&mut self) {
+                if let Some(closing) = self.closing.take() {
+                    let _ = closing.send(());
+                }
+                let _ = self.release.recv_timeout(Duration::from_secs(15));
+            }
+        }
+        let count = Arc::new(AtomicU64::new(0));
+        let (pcm_tx, pcm_rx) = mpsc::channel::<AudioFrame>();
+        let (mic_closing_tx, mic_closing) = tokio::sync::oneshot::channel();
+        let (mic_release, mic_release_rx) = mpsc::channel();
+        let initial = prepare_producer_with(
+            move || {
+                Ok(ProducerSource {
+                    device_id: "microphone:coreaudio:7".into(),
+                    device_name: "A".into(),
+                    receiver: pcm_rx,
+                    stats: Arc::new(AudioCaptureStats::default()),
+                    failure: None,
+                    _owner: Box::new(HeldOwner {
+                        closing: Some(mic_closing_tx),
+                        release: mic_release_rx,
+                    }),
+                    #[cfg(debug_assertions)]
+                    caption_injector: None,
+                })
+            },
+            Arc::new(AtomicBool::new(false)),
+            count.clone(),
+            spawn_owner,
+            |_| {},
+            false,
+        )
+        .await
+        .unwrap();
+        let path =
+            crate::audio::native_audio_fifo_path(&format!("release-bus-{}", uuid::Uuid::new_v4()));
+        crate::audio::create_native_audio_fifo(&path).unwrap();
+        let (reader, progress) = spawn_fifo_reader(path.clone());
+        let session = attach_prepared_with(
+            Some(InitialAudioSource {
+                source: InitialInput::Owned {
+                    producer: initial,
+                    count: count.clone(),
+                },
+            }),
+            path,
+            None,
+            AudioProcessingSettings::default(),
+            Duration::from_millis(200),
+            system_options(),
+        );
+        let bus = Bus {
+            session,
+            reader,
+            progress,
+        };
+        bus.wait_for_frames(4_800).await;
+        // A system capture whose close takes as long as the test says.
+        let system = bus.session.system_audio();
+        let (system_closing_tx, system_closing) = tokio::sync::oneshot::channel();
+        let (system_release, system_release_rx) = mpsc::channel();
+        let producer = system
+            .prepare(
+                move || {
+                    let (frames, receiver) = mpsc::channel::<AudioFrame>();
+                    Ok(ProducerSource::system(
+                        "system-audio:default".into(),
+                        "System audio".into(),
+                        receiver,
+                        Arc::new(AudioCaptureStats::default()),
+                        quiet_failure(),
+                        Box::new((
+                            frames,
+                            HeldOwner {
+                                closing: Some(system_closing_tx),
+                                release: system_release_rx,
+                            },
+                        )),
+                    ))
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        bus.session.attach_system(producer).await.unwrap();
+        bus.session.detach_system().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), system_closing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            system.owned_producer_count(),
+            1,
+            "the system capture is still closing"
+        );
+        // The microphone is lost; its owner then blocks inside its close.
+        drop(pcm_tx);
+        tokio::time::timeout(Duration::from_secs(2), mic_closing)
+            .await
+            .unwrap()
+            .unwrap();
+        let (request, coordinator, cancelled) = {
+            let (request, coordinator, cancelled) =
+                microphone_switch("retry", "microphone:coreaudio:7");
+            let mut coord = coordinator.lock().unwrap();
+            coord.stop("test-session");
+            coord.start(
+                "test-session".into(),
+                crate::protocol::SourceSelection {
+                    microphone_id: request.device_id.clone(),
+                    screen_id: None,
+                    window_id: None,
+                    camera_id: None,
+                    test_pattern: false,
+                },
+            );
+            coord.enable_microphone();
+            let mut request = request;
+            request.expected_source_revision =
+                coord.snapshot("test-session").unwrap().source_revision;
+            coord.admit(&request).unwrap();
+            let cancelled_now = coord.cancellation(&request).unwrap();
+            drop(cancelled);
+            drop(coord);
+            (request, coordinator, cancelled_now)
+        };
+        let handle = bus.session.switch_handle();
+        let open_count = count.clone();
+        let task = tokio::spawn(async move {
+            handle
+                .replace_with(request, coordinator, cancelled, move |id| {
+                    open_live_microphone(id, open_count.clone(), 0.3)
+                })
+                .await
+        });
+        wait_until(
+            || bus.session.status().generation > 0,
+            "the exclusive release",
+        )
+        .await;
+        mic_release.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("the retry never waits on the closing system capture")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            system.owned_producer_count(),
+            1,
+            "the system capture was still closing throughout"
+        );
+        system_release.send(()).unwrap();
+        wait_until(
+            || system.owned_producer_count() == 0,
+            "system capture close",
+        )
+        .await;
+        let _ = bus.finish();
     }
 
     // ---- Pure mixer pieces ---------------------------------------------------

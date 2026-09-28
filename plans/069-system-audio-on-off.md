@@ -228,6 +228,12 @@ placeholder is still on the wire.
     `didStopWithError`, or the WASAPI device-invalidated result. It has its
     own producer pool (limit 1) and its own cleanup counter, so it never
     blocks mic admission or mic hot-swap.
+    - PR #477 review: its freshness is judged by arrival, not by its PTS (an
+      output clock that runs fast must not drop every buffer in silence).
+      Buffers that keep arriving but can't be placed for 2 s are a loss
+      (`system-audio-lost`), and one bad SCK buffer is dropped, not a loss.
+    - Its close ticket is kept apart from the mic's, so a mic retry never
+      waits on a closing system capture.
 12. **It never slows Record.** System audio attaches late:
     - the session starts on the mic timeline exactly as now;
     - the system source joins when its first buffer arrives, usually
@@ -252,6 +258,12 @@ placeholder is still on the wire.
       and S4 proves `smoke:record-latency:gate` stays green.
     - Measured `o_sys = 0 ms` (S0: system audio trails the screen by
       +5.6 ms on average at capture level). S7 re-measures it end to end.
+    - PR #477 review: on stop the bus keeps writing until its cursor reaches
+      the stop instant (flushed 60 ms after stop, bounded at playout +
+      100 ms), so the playout delay costs no tail audio. stop→idle stayed
+      in budget (`smoke:record-latency:gate` warm p95 116 ms).
+    - A positive mic offset is a bus delay D, so a mic hot-swap may take
+      up to 1 s + D + playout before it cancels.
 
 ## Slices
 
