@@ -16282,6 +16282,10 @@ fn bridge_compositor_split_output_ffmpeg_args(
         screen_overlay_input_index: None,
         audio_inputs,
         microphone_graph_gain: microphone_needs_graph_gain(capture.microphone.as_ref()),
+        microphone_is_linux_pulse: matches!(
+            capture.microphone,
+            Some(MicrophoneInput::LinuxPulse { .. })
+        ),
     };
 
     if let Some(output_path) = output_path {
@@ -16312,6 +16316,7 @@ fn bridge_compositor_split_output_ffmpeg_args(
         screen_overlay_input_index: None,
         audio_inputs: input_layout.audio_inputs.clone(),
         microphone_graph_gain: input_layout.microphone_graph_gain,
+        microphone_is_linux_pulse: input_layout.microphone_is_linux_pulse,
     };
     let mut stream_routes = Vec::new();
     let mut uses_recording_stream_input = false;
@@ -16366,6 +16371,7 @@ fn bridge_compositor_split_output_ffmpeg_args(
                 screen_overlay_input_index: None,
                 audio_inputs: input_layout.audio_inputs.clone(),
                 microphone_graph_gain: input_layout.microphone_graph_gain,
+                microphone_is_linux_pulse: input_layout.microphone_is_linux_pulse,
             };
             append_bridge_copy_flv_output(
                 &mut args,
@@ -16525,6 +16531,10 @@ fn append_bridge_recording_input_args(
         screen_overlay_input_index: None,
         audio_inputs,
         microphone_graph_gain: microphone_needs_graph_gain(capture.microphone.as_ref()),
+        microphone_is_linux_pulse: matches!(
+            capture.microphone,
+            Some(MicrophoneInput::LinuxPulse { .. })
+        ),
     }
 }
 
@@ -16916,6 +16926,9 @@ struct InputLayout {
     /// Gain/mute must ride the ffmpeg filter graph (ffmpeg-owned mic capture,
     /// e.g. Windows dshow) instead of the in-process native audio path.
     microphone_graph_gain: bool,
+    /// Pulse supplies small, variable-size live PCM frames. Its local recording
+    /// output needs a bounded shortest queue before the startup deadline.
+    microphone_is_linux_pulse: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17047,6 +17060,10 @@ fn append_input_args(
         screen_overlay_input_index,
         audio_inputs,
         microphone_graph_gain: microphone_needs_graph_gain(capture.microphone.as_ref()),
+        microphone_is_linux_pulse: matches!(
+            capture.microphone,
+            Some(MicrophoneInput::LinuxPulse { .. })
+        ),
     }
 }
 
@@ -17319,6 +17336,15 @@ fn append_audio_encoding_with_video_clock(
         .any(|input| input.track.source == AudioTrackSource::Microphone);
     if preserve_bridge_shortest || microphone_is_padded {
         args.push("-shortest".to_string());
+        if input_layout.microphone_is_linux_pulse && !streaming {
+            // Live Pulse PCM and raw video can stall FFmpeg's pre-encode sync
+            // queue after the first audio packets. Its default 10-second
+            // buffering window outlasts our 8-second output-progress deadline.
+            // These are dense live A/V streams, not sparse subtitle inputs:
+            // bound the queue to 250 ms so its overflow heartbeat can advance
+            // the lagging stream, retaining PCM audio, apad and video-owned EOF.
+            args.extend(["-shortest_buf_duration".to_string(), "0.25".to_string()]);
+        }
     }
 }
 
@@ -26687,6 +26713,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_pulse_pcm_recording_bounds_shortest_buffer_below_startup_deadline() {
+        for (microphone, pulse) in [
+            (
+                Some(MicrophoneInput::LinuxPulse {
+                    source_name: "test-pulse-source".into(),
+                }),
+                true,
+            ),
+            (
+                Some(MicrophoneInput::WindowsDshow {
+                    device_name: "test-directshow-source".into(),
+                }),
+                false,
+            ),
+            (None, false),
+        ] {
+            let capture = CaptureInputs {
+                video: VideoInput::TestPattern,
+                camera_index: None,
+                microphone,
+            };
+            for streaming in [false, true] {
+                let params = base_params(true, streaming);
+                let mut args = Vec::new();
+                let layout = append_bridge_recording_input_args(
+                    &mut args,
+                    &capture,
+                    &params,
+                    Path::new("/tmp/test-pulse-startup.yuv"),
+                    EncoderBridgeVideoOutput::RawYuv420p,
+                );
+                append_audio_encoding_with_video_clock(
+                    &mut args,
+                    &layout,
+                    &params.audio,
+                    streaming,
+                    true,
+                );
+
+                let bound = arg_value(&args, "-shortest_buf_duration");
+                if pulse && !streaming {
+                    let seconds: f64 = bound
+                        .expect("live PCM needs a bounded queue")
+                        .parse()
+                        .unwrap();
+                    assert!(seconds > 0.0 && seconds < FFMPEG_OUTPUT_STARTUP_TIMEOUT.as_secs_f64());
+                    assert_eq!(arg_value(&args, "-c:a"), Some("pcm_s16le"));
+                    assert!(arg_value(&args, "-af").unwrap().ends_with(",apad"));
+                    let bound_index = args
+                        .iter()
+                        .position(|arg| arg == "-shortest_buf_duration")
+                        .unwrap();
+                    let last_input = args.iter().rposition(|arg| arg == "-i").unwrap();
+                    assert!(bound_index > last_input, "the bound belongs to the output");
+                } else {
+                    assert_eq!(
+                        bound, None,
+                        "other device paths and AAC retain their policy"
+                    );
+                }
+                assert!(args.iter().any(|arg| arg == "-shortest"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn camera_only_resolves_windows_camera_as_primary_video_input() {
         let mut params = base_params(true, false);
@@ -29131,6 +29223,7 @@ mod tests {
                 channels: NATIVE_AUDIO_CHANNELS,
             }],
             microphone_graph_gain,
+            microphone_is_linux_pulse: false,
         }
     }
 
@@ -31477,6 +31570,7 @@ mod tests {
                 screen_overlay_input_index: None,
                 audio_inputs: Vec::new(),
                 microphone_graph_gain: false,
+                microphone_is_linux_pulse: false,
             },
             &params,
             false,
@@ -31533,6 +31627,7 @@ mod tests {
                 screen_overlay_input_index: None,
                 audio_inputs: Vec::new(),
                 microphone_graph_gain: false,
+                microphone_is_linux_pulse: false,
             },
             &params,
             false,
@@ -31589,6 +31684,7 @@ mod tests {
                     screen_overlay_input_index: None,
                     audio_inputs: Vec::new(),
                     microphone_graph_gain: false,
+                    microphone_is_linux_pulse: false,
                 },
                 &params,
                 false,
@@ -32041,6 +32137,7 @@ mod tests {
             screen_overlay_input_index: None,
             audio_inputs: Vec::new(),
             microphone_graph_gain: false,
+            microphone_is_linux_pulse: false,
         };
         let mut args = Vec::new();
 
@@ -32512,6 +32609,7 @@ mod tests {
             screen_overlay_input_index: None,
             audio_inputs: Vec::new(),
             microphone_graph_gain: false,
+            microphone_is_linux_pulse: false,
         };
         let recording_filter = recording_video_filter(&capture, &input_layout, &recording, true);
         let preview_session = live_preview_session_params(
@@ -32745,6 +32843,7 @@ mod tests {
             screen_overlay_input_index: None,
             audio_inputs: Vec::new(),
             microphone_graph_gain: false,
+            microphone_is_linux_pulse: false,
         };
         let recording = recording_video_filter(&capture, &input_layout, &params, false);
         let preview_session = live_preview_session_params(
